@@ -419,7 +419,8 @@ class LLMProxy < Sinatra::Base
 
         results.each do |p_name, m|
           selector.update_metrics(p_name, m[:ttft], m[:tps])
-          logger.info("[#{model_name}] Probe #{p_name}: ttft=#{m[:ttft]}s tps=#{m[:tps]}")
+          tps_str = m[:tps] ? m[:tps].to_s : "N/A"
+          logger.info("[#{model_name}] Probe #{p_name}: ttft=#{m[:ttft]}s tps=#{tps_str}")
         end
 
         selector.evaluate_and_select(logger)
@@ -456,6 +457,7 @@ class LLMProxy < Sinatra::Base
     last_thinking_time = nil
     first_content_time = nil
     last_content_time = nil
+    last_any_token_time = nil
     usage_data = nil
     error = nil
 
@@ -473,12 +475,14 @@ class LLMProxy < Sinatra::Base
 
         if cr.has_thinking
           last_thinking_time = now
+          last_any_token_time = now
           first_thinking_time ||= now
           first_token_time ||= now
         end
 
         if cr.has_content
           last_content_time = now
+          last_any_token_time = now
           first_content_time ||= now
           first_token_time ||= now
         end
@@ -496,6 +500,7 @@ class LLMProxy < Sinatra::Base
         last_thinking_time: last_thinking_time,
         first_content_time: first_content_time,
         last_content_time: last_content_time,
+        last_any_token_time: last_any_token_time,
         usage_data: usage_data,
         request_start: request_start
       }
@@ -503,6 +508,7 @@ class LLMProxy < Sinatra::Base
   end
 
   def self.probe_provider(provider_config, path, body, body_model, incoming_headers, logger:)
+    pname = provider_config["provider"]
     uri, request = build_upstream_request(provider_config, path, body, body_model, incoming_headers, stream: true)
 
     begin
@@ -511,24 +517,50 @@ class LLMProxy < Sinatra::Base
 
       request_start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
       result = stream_response(http, request, request_start)
+      stream_end = Process.clock_gettime(Process::CLOCK_MONOTONIC)
 
       if result[:error]
-        logger.warn("[probe] #{provider_config['provider']}: #{result[:error]}")
-        return { ttft: Float::INFINITY, tps: 0 }
+        logger.warn("[probe] #{pname}: #{result[:error]}")
+        return { ttft: Float::INFINITY, tps: nil }
       end
 
       ttft = result[:first_token_time] ? (result[:first_token_time] - request_start).round(3) : Float::INFINITY
-      tps = if result[:usage_data] && result[:first_content_time] && result[:last_content_time]
-              tokens = extract_token_counts(result[:usage_data])
-              compute_tps(tokens[:content], result[:first_content_time], result[:last_content_time]) || 0
-            else
-              0
-            end
+
+      unless result[:usage_data]
+        logger.debug("[probe] #{pname}: usage_data absent (provider ignored stream_options)")
+        return { ttft: ttft, tps: nil }
+      end
+
+      tokens = extract_token_counts(result[:usage_data])
+      completion_tokens = tokens[:completion] || 0
+
+      tps = compute_tps(tokens[:content], result[:first_content_time], result[:last_content_time])
+
+      if tps.nil?
+        tps = compute_tps(completion_tokens, result[:first_token_time], result[:last_any_token_time])
+      end
+
+      if tps.nil? && result[:first_token_time]
+        elapsed = stream_end - result[:first_token_time]
+        if elapsed > 0 && completion_tokens > 0
+          tps = (completion_tokens / elapsed).round(1)
+        end
+      end
+
+      if tps.nil? || tps == 0
+        diag = []
+        diag << "completion_tokens=#{completion_tokens}"
+        diag << "content_tokens=#{tokens[:content]}"
+        diag << "first_token_time=#{result[:first_token_time] ? format("%.3f", result[:first_token_time]) : "nil"}"
+        diag << "last_any=#{result[:last_any_token_time] ? format("%.3f", result[:last_any_token_time]) : "nil"}"
+        diag << "stream_end=#{format("%.3f", stream_end)}"
+        logger.debug("[probe] #{pname}: TPS=0 diag: #{diag.join(", ")}")
+      end
 
       { ttft: ttft, tps: tps }
     rescue => e
-      logger.debug("[probe] #{provider_config['provider']}: #{e.message}")
-      { ttft: Float::INFINITY, tps: 0 }
+      logger.debug("[probe] #{pname}: #{e.message}")
+      { ttft: Float::INFINITY, tps: nil }
     end
   end
 

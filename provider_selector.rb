@@ -74,7 +74,9 @@ class ProviderSelector
       now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
       samples = (@samples[provider_name] ||= [])
       prune_stale_samples!(samples, now)
-      samples << { ttft: ttft.to_f, tps: (tps || 0).to_f, timestamp: now }
+      sample = { ttft: ttft.to_f, timestamp: now }
+      sample[:tps] = tps.to_f if tps
+      samples << sample
       samples.shift if samples.length > MAX_SAMPLES
     end
   end
