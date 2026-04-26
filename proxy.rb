@@ -147,6 +147,12 @@ class LLMProxy < Sinatra::Base
 
   def parse_request(allowed_headers: ["Authorization", "OpenAI-Organization", "OpenAI-Beta"])
     body = JSON.parse(request.body.read)
+
+    if body["messages"]
+      body["messages"].reject! { |m| m["content"].nil? || m["content"].to_s.strip.empty? }
+      halt json_error(status: 400, message: "Validation error: message content cannot be empty") if body["messages"].empty?
+    end
+
     model_name = body["model"]
     halt json_error(status: 400, message: "Missing 'model' in request body") unless model_name
 
