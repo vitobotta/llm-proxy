@@ -1,0 +1,11 @@
+services:
+  llm-proxy:
+    build: .
+    ports:
+      - "9234:4567"
+    volumes:
+      # Mount config from host - edit config.yaml locally
+      - ./config.yaml:/app/config.yaml
+    restart: unless-stopped
+    environment:
+      - RUBY_ENV=production

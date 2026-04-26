@@ -1,0 +1,118 @@
+# LLM Proxy Configuration Example
+# Copy this file to config.yaml and add your API keys
+
+server:
+  bind: "0.0.0.0"
+
+# Retry settings
+retries:
+  max_attempts: 2
+  backoff_base: 1
+
+# Timeout settings (seconds)
+timeouts:
+  open: 30
+  read: 300
+  write: 60
+
+# Provider definitions (referenced by name in models)
+# Each provider needs at least base_url and api_key
+# Optional: headers (merged into every request to this provider)
+providers:
+  openai:
+    base_url: "https://api.openai.com/v1"
+    api_key: "YOUR_OPENAI_API_KEY"
+
+  anthropic:
+    base_url: "https://api.anthropic.com/v1"
+    api_key: "YOUR_ANTHROPIC_API_KEY"
+    headers:
+      anthropic-version: "2023-06-01"
+
+  fireworks:
+    base_url: "https://api.fireworks.ai/inference/v1"
+    api_key: "YOUR_FIREWORKS_API_KEY"
+
+  alibaba:
+    base_url: "https://coding-intl.dashscope.aliyuncs.com/v1"
+    api_key: "YOUR_ALIBABA_API_KEY"
+
+  groq:
+    base_url: "https://api.groq.com/openapi/v1"
+    api_key: "YOUR_GROQ_API_KEY"
+
+  openrouter:
+    base_url: "https://openrouter.ai/api/v1"
+    api_key: "YOUR_OPENROUTER_API_KEY"
+    headers:
+      HTTP-Referer: "https://your-site.com"
+      X-Title: "Your App Name"
+
+  neuralwatt:
+    base_url: "https://api.neuralwatt.com/v1"
+    api_key: "YOUR_NEURAL_WATT_API_KEY"
+
+  wafer:
+    base_url: "https://pass.wafer.ai/v1"
+    api_key: "YOUR_WAFER_API_KEY"
+
+  canopy_wave:
+    base_url: "https://inference.canopywave.io/v1"
+    api_key: "YOUR_CANOPY_WAVE_API_KEY"
+
+
+# Model definitions
+# Each model has a list of providers. The proxy auto-selects the best one
+# based on real-time TTFT and TPS metrics.
+# The first provider in the list is used for the initial request.
+# Optional: headers on a provider entry override/extend the provider's headers
+models:
+- name: glm-5.1
+  providers:
+  - provider: wafer
+    model: GLM-5.1
+    primary: true
+  - provider: neuralwatt
+    model: zai-org/GLM-5.1-FP8
+- name: glm-5.1-fast
+  providers:
+  - provider: wafer
+    model: GLM-5.1
+  - provider: neuralwatt
+    model: glm-5.1-fast
+    primary: true
+- name: qwen3.5
+  providers:
+  - provider: wafer
+    model: Qwen3.5-397B-A17B
+    primary: true
+  - provider: neuralwatt
+    model: Qwen/Qwen3.5-397B-A17B-FP8
+- name: kimi-k2.6
+  providers:
+  - provider: neuralwatt
+    model: moonshotai/Kimi-K2.6
+    primary: true
+  - provider: canopy_wave
+    model: moonshotai/kimi-k2.6
+- name: qwen3.6-35b
+  providers:
+  - provider: neuralwatt
+    model: Qwen/Qwen3.6-35B-A3B
+    primary: true
+  - provider: wafer
+    model: Qwen3.5-397B-A17B
+
+# Logging
+logging:
+  level: "info"       # debug, info, warn, error
+  format: "json"      # json or text (default: text)
+
+# Performance tracking (disable for zero-overhead passthrough)
+tracking:
+  enabled: true       # set false to skip TPS calculation and token counting
+
+# Performance tuning
+performance:
+  prewarm_connections: true   # Pre-warm HTTP connections at boot
+  probe_interval: 3           # Run background probe every N requests
