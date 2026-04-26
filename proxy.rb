@@ -85,6 +85,8 @@ class LLMProxy < Sinatra::Base
   MODELS.freeze
   SELECTORS.freeze
 
+  AUTO_SWITCH = CONFIG.dig("performance", "auto_switch") == true
+
   PROBE_INTERVAL = CONFIG.dig("performance", "probe_interval") || 3
 
   MAX_ATTEMPTS = CONFIG.dig("retries", "max_attempts") || 3
@@ -423,7 +425,7 @@ class LLMProxy < Sinatra::Base
           logger.info("[#{model_name}] Probe #{p_name}: ttft=#{m[:ttft]}s tps=#{tps_str}")
         end
 
-        selector.evaluate_and_select(logger)
+        selector.evaluate_and_select(logger, auto_switch: AUTO_SWITCH)
       rescue => e
         logger.error("[#{model_name}] Background probe error: #{e.message}")
       ensure

@@ -81,7 +81,7 @@ class ProviderSelector
     end
   end
 
-  def evaluate_and_select(logger)
+  def evaluate_and_select(logger, auto_switch: true)
     scored = @lock.synchronize do
       @providers.each_with_index.map do |p, i|
         avg = average_metrics(p["provider"])
@@ -107,15 +107,19 @@ class ProviderSelector
         return unless best_score > active_score * (1.0 + HYSTERESIS)
       end
 
-      @lock.synchronize do
-        old_name = @providers[@active_index]["provider"]
-        @active_index = best_index
-        new_name = @providers[@active_index]["provider"]
-        logger.info("[#{@model_name}] Switched to #{new_name} (avg_ttft=#{best_avg[:avg_ttft].round(3)}s, avg_tps=#{best_avg[:avg_tps].round(1)}, n=#{best_avg[:sample_count]}) from #{old_name} (avg_ttft=#{active_avg&.dig(:avg_ttft)&.round(3)}s, avg_tps=#{active_avg&.dig(:avg_tps)&.round(1)}, n=#{active_avg&.dig(:sample_count)})")
-        Notifier.notify("LLM Proxy Switch", "#{@model_name}: #{old_name} → #{new_name}")
-      end
+      old_name = @lock.synchronize { @providers[@active_index]["provider"] }
+      new_name = @providers[best_index]["provider"]
 
-      self.class.persist_active_provider(@model_name, best_index)
+      if auto_switch
+        @lock.synchronize do
+          @active_index = best_index
+          logger.info("[#{@model_name}] Switched to #{new_name} (avg_ttft=#{best_avg[:avg_ttft].round(3)}s, avg_tps=#{best_avg[:avg_tps].round(1)}, n=#{best_avg[:sample_count]}) from #{old_name} (avg_ttft=#{active_avg&.dig(:avg_ttft)&.round(3)}s, avg_tps=#{active_avg&.dig(:avg_tps)&.round(1)}, n=#{active_avg&.dig(:sample_count)})")
+          Notifier.notify("LLM Proxy Switch", "#{@model_name}: #{old_name} \u2192 #{new_name}")
+        end
+        self.class.persist_active_provider(@model_name, best_index)
+      else
+        logger.info("[#{@model_name}] Suggest switch to #{new_name} (avg_ttft=#{best_avg[:avg_ttft].round(3)}s, avg_tps=#{best_avg[:avg_tps].round(1)}, n=#{best_avg[:sample_count]}) from #{old_name} (avg_ttft=#{active_avg&.dig(:avg_ttft)&.round(3)}s, avg_tps=#{active_avg&.dig(:avg_tps)&.round(1)}, n=#{active_avg&.dig(:sample_count)})")
+      end
     end
   end
 
