@@ -85,7 +85,9 @@ class LLMProxy < Sinatra::Base
   MODELS.freeze
   SELECTORS.freeze
 
-  AUTO_SWITCH = CONFIG.dig("performance", "auto_switch") == true
+  PROBING_ENABLED = CONFIG.dig("performance", "probing_enabled") != false
+
+  AUTO_SWITCH = PROBING_ENABLED && CONFIG.dig("performance", "auto_switch") == true
 
   PROBE_INTERVAL = CONFIG.dig("performance", "probe_interval") || 3
 
@@ -380,8 +382,10 @@ class LLMProxy < Sinatra::Base
   def with_auto_select(model:, model_name:, path:, body:, headers:)
     selector = SELECTORS[model_name]
 
+    providers = PROBING_ENABLED ? selector.ordered_providers : selector.providers
+
     result = nil
-    selector.ordered_providers.each_with_index do |provider_config, i|
+    providers.each_with_index do |provider_config, i|
       p_name = provider_config["provider"]
       p_model = provider_config["model"]
       settings.logger.info("[#{model_name}] #{i == 0 ? 'Using' : 'Fallback to'} #{p_name} (#{p_model})")
@@ -389,13 +393,13 @@ class LLMProxy < Sinatra::Base
       log_prefix = "[#{model_name}/#{p_name}]"
       result = yield(provider_config, path, body, p_model, headers, log_prefix)
       if result&.dig(:success)
-        record_metrics(selector, p_name, result)
+        record_metrics(selector, p_name, result) if PROBING_ENABLED
         Notifier.notify("LLM Proxy Fallback", "#{model_name} → #{p_name}") if i > 0
         break
       end
     end
 
-    if selector.record_and_maybe_probe(PROBE_INTERVAL)
+    if PROBING_ENABLED && selector.record_and_maybe_probe(PROBE_INTERVAL)
       launch_background_probe(selector, model_name, path, headers)
     end
 

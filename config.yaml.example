@@ -115,4 +115,6 @@ tracking:
 # Performance tuning
 performance:
   prewarm_connections: true   # Pre-warm HTTP connections at boot
-  probe_interval: 3           # Run background probe every N requests
+  probing_enabled: true       # Set false to disable background probing; always use primary with fallback on failure
+  auto_switch: true           # Auto-switch to best provider after probe (only when probing_enabled)
+  probe_interval: 3           # Run background probe every N requests (only when probing_enabled)
