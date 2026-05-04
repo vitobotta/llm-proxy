@@ -284,8 +284,6 @@ class LLMProxy < Sinatra::Base
         m["content"].nil? || m["content"].to_s.strip.empty?
       end
 
-      self.class.repair_messages!(body["messages"], logger: settings.logger)
-
       halt json_error(status: 400, message: "Validation error: message content cannot be empty") if body["messages"].empty?
     end
 
@@ -725,6 +723,10 @@ class LLMProxy < Sinatra::Base
   # ---- Request handlers ----
 
   def try_stream(provider_config, path, body, body_model, incoming_headers, out:, log_prefix:)
+    if provider_config["provider"].to_s.downcase.include?("deepseek")
+      self.class.repair_messages!(body["messages"], logger: settings.logger)
+    end
+
     uri, request = self.class.build_upstream_request(provider_config, path, body, body_model, incoming_headers, stream: true)
 
     try_with_retries(log_prefix: log_prefix, body_model: body_model) do
@@ -766,6 +768,10 @@ class LLMProxy < Sinatra::Base
   end
 
   def try_single_request(provider_config, path, body, body_model, incoming_headers, log_prefix:)
+    if provider_config["provider"].to_s.downcase.include?("deepseek")
+      self.class.repair_messages!(body["messages"], logger: settings.logger)
+    end
+
     uri, request = self.class.build_upstream_request(provider_config, path, body, body_model, incoming_headers, stream: false)
 
     try_with_retries(log_prefix: log_prefix, body_model: body_model) do
