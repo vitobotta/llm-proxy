@@ -740,8 +740,7 @@ class LLMProxy < Sinatra::Base
       }
       usage_data = nil
       stream_result = nil
-      needs_repair = provider_config["provider"].to_s.downcase.include?("deepseek")
-      accumulated = needs_repair ? +"" : nil
+      accumulated = +""
 
       http.request(request) do |response|
         if response.is_a?(Net::HTTPSuccess)
@@ -757,7 +756,13 @@ class LLMProxy < Sinatra::Base
             end
           end
 
-          self.class.cache_reasoning_from_response(accumulated, streamed: true) if accumulated
+          self.class.cache_reasoning_from_response(accumulated, streamed: true)
+
+          unless usage_data
+            fallback = self.class.parse_chunk(accumulated)
+            usage_data = fallback.usage if fallback.usage
+          end
+
           stream_result = build_stream_result(log_prefix, timers, usage_data)
         else
           handle_upstream_error(response, log_prefix)
