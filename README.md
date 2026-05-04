@@ -39,7 +39,7 @@ Prov A  Prov B  Prov C  Prov D
 ```
 
 - `proxy.rb` — Sinatra app handling routing, retry logic, streaming, chunk parsing, metrics tracking.
-- `provider_selector.rb` — per-model scorer. Maintains rolling samples (TTFT + TPS), prunes older than 10 min. After `probe_interval` requests, sends test prompt to non-active providers, scores all, switches if a better provider exceeds current by hysteresis (`10%`). Writes `primary: true` back to `config.yaml`.
+- `provider_selector.rb` — per-model scorer. Maintains rolling samples (TTFT + TPS), prunes older than 10 min. When `probing_enabled` is true: after every `probe_interval` requests, sends a test prompt to non-active providers, scores all, switches if a better provider exceeds current by hysteresis (`10%`). Writes `primary: true` back to `config.yaml`.
 - `ChunkResult` struct — fast string-match parsing of SSE chunks. No `JSON.parse` except for `usage` blocks. When tracking is off, parsing is skipped entirely.
 
 ## Quick Start
@@ -132,7 +132,7 @@ timeouts:
 ```yaml
 retries:
   max_attempts: 3
-  backoff_base: 1      # seconds (1, 2, 4, ...)
+  backoff_base: 2      # seconds (2, 4, 8, ...)
 ```
 
 Retry behaviour:
@@ -163,6 +163,8 @@ When `enabled: false` the proxy skips all chunk parsing — no string matching, 
 ```yaml
 performance:
   prewarm_connections: true   # background connection warming at boot
+  probing_enabled: true       # enable/disable background probing and auto-selection (default: true)
+  auto_switch: false          # auto-switch active provider when better one found (requires probing_enabled)
   probe_interval: 3           # run background probe every N requests
 ```
 
@@ -171,7 +173,7 @@ performance:
 | Variable | Default | Description |
 |---|---|---|
 | `PORT` | `4567` | Sinatra listen port |
-| `BIND` | `0.0.0.0` | Sinatra bind address |
+| `PUMA_BIND` | `tcp://0.0.0.0` | Puma bind address |
 | `PUMA_MIN_THREADS` | `1` | Puma thread pool minimum |
 | `PUMA_MAX_THREADS` | `16` | Puma thread pool maximum |
 | `RACK_ENV` | `production` | Rack environment |

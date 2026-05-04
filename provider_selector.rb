@@ -1,8 +1,10 @@
 # frozen_string_literal: true
 
 class ProviderSelector
-  TTFT_THRESHOLD = 4.0
-  TPS_WEIGHT = 0.005
+  TTFT_SATURATION = 4.0
+  TPS_REFERENCE   = 100.0
+  TTFT_WEIGHT = 0.5
+  TPS_WEIGHT  = 0.5
   SAMPLE_WINDOW = 600
   MAX_SAMPLES = 100
   MIN_SAMPLES = 2
@@ -86,17 +88,13 @@ class ProviderSelector
       @providers.each_with_index.map do |p, i|
         avg = average_metrics(p["provider"])
         next nil unless avg && avg[:sample_count] >= MIN_SAMPLES
-        meets_ttft = avg[:avg_ttft] <= TTFT_THRESHOLD
-        [i, avg, meets_ttft]
+        [i, avg]
       end.compact
     end
 
-    ttft_eligible = scored.select { |_, _, meets| meets }
-    candidate_pool = ttft_eligible.empty? ? scored : ttft_eligible
+    return if scored.empty?
 
-    return if candidate_pool.empty?
-
-    best_index, best_avg, = candidate_pool.max_by { |_, avg, _| score_from_avg(avg) }
+    best_index, best_avg = scored.max_by { |_, avg| score_from_avg(avg) }
 
     active_avg = @lock.synchronize { average_metrics(@providers[@active_index]["provider"]) }
 
@@ -164,8 +162,13 @@ class ProviderSelector
 
   def score_from_avg(avg)
     return -Float::INFINITY unless avg
-    ttft_score = avg[:avg_ttft] > 0 ? (1.0 / avg[:avg_ttft]) : 0
-    tps_score = avg[:avg_tps] || 0
-    (ttft_score * 0.5) + (tps_score * TPS_WEIGHT)
+    ttft = avg[:avg_ttft]
+    tps  = avg[:avg_tps] || 0
+
+    ttft_score = ttft > 0 ? [TTFT_SATURATION / ttft, 1.0].min : 0
+
+    tps_score = [tps / TPS_REFERENCE, 3.0].min
+
+    ttft_score * TTFT_WEIGHT + tps_score * TPS_WEIGHT
   end
 end
