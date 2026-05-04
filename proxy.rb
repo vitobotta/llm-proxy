@@ -109,6 +109,10 @@ class LLMProxy < Sinatra::Base
   URI_CACHE = {}
   URI_CACHE_LOCK = Mutex.new
 
+  REASONING_CACHE = {}
+  REASONING_CACHE_LOCK = Mutex.new
+  MAX_REASONING_CACHE_SIZE = 1000
+
   SSE_HEADERS = {
     "Content-Type" => "text/event-stream",
     "Cache-Control" => "no-cache",
@@ -147,11 +151,141 @@ class LLMProxy < Sinatra::Base
     sleep(BACKOFF_BASE * (2**attempt))
   end
 
+  def self.cache_reasoning_from_response(response_body, streamed: false)
+    tool_call_ids = []
+    reasoning_content = nil
+
+    if streamed
+      response_body.scan(/^data:\s*(.+)$/).each do |raw|
+        line = raw.first.strip
+        next if line == "[DONE]" || line.empty?
+        begin
+          data = JSON.parse(line)
+          delta = data.dig("choices", 0, "delta")
+          next unless delta
+
+          if delta.key?("reasoning_content")
+            reasoning_content = (reasoning_content || +"") + delta["reasoning_content"].to_s
+          end
+
+          if delta.key?("tool_calls")
+            delta["tool_calls"].each do |tc|
+              tool_call_ids << tc["id"] if tc["id"]
+            end
+          end
+        rescue JSON::ParserError
+          next
+        end
+      end
+    else
+      begin
+        data = JSON.parse(response_body)
+        message = data.dig("choices", 0, "message")
+        if message
+          reasoning_content = message["reasoning_content"]
+          tool_call_ids = (message["tool_calls"] || []).map { |tc| tc["id"] }.compact
+        end
+      rescue JSON::ParserError
+        return
+      end
+    end
+
+    return if tool_call_ids.empty?
+
+    REASONING_CACHE_LOCK.synchronize do
+      tool_call_ids.each { |id| REASONING_CACHE[id] = reasoning_content }
+      REASONING_CACHE.shift while REASONING_CACHE.size > MAX_REASONING_CACHE_SIZE
+    end
+  end
+
+  def self.repair_messages!(messages, logger: nil)
+    return unless messages.is_a?(Array)
+    return if messages.empty?
+
+    messages.each do |msg|
+      next unless msg["role"] == "assistant" && msg["tool_calls"].is_a?(Array) && !msg["tool_calls"].empty?
+      next if msg.key?("reasoning_content") && !msg["reasoning_content"].nil?
+
+      msg["tool_calls"].each do |tc|
+        cached = REASONING_CACHE_LOCK.synchronize { REASONING_CACHE[tc["id"]] }
+        next unless cached
+        msg["reasoning_content"] = cached
+        logger&.debug("[repair] Restored reasoning_content from cache via tool_call_id: #{tc['id']}")
+        break
+      end
+    end
+
+    i = 0
+    while i < messages.length
+      msg = messages[i]
+      if msg["role"] == "assistant" && msg["tool_calls"].is_a?(Array) && !msg["tool_calls"].empty?
+        expected_ids = msg["tool_calls"].map { |tc| tc.is_a?(Hash) ? tc["id"] : nil }.compact
+        j = i + 1
+        actual_ids = {}
+        while j < messages.length && messages[j]["role"] == "tool"
+          actual_ids[messages[j]["tool_call_id"]] = j if messages[j]["tool_call_id"]
+          j += 1
+        end
+
+        missing_ids = expected_ids.reject { |id| actual_ids.key?(id) }
+        missing_ids.each do |id|
+          messages.insert(j, { "role" => "tool", "tool_call_id" => id, "content" => " " })
+          j += 1
+          logger&.debug("[repair] Inserted placeholder tool message for missing tool_call_id: #{id}")
+        end
+
+        ((i + 1)...j).each do |k|
+          m = messages[k]
+          if m["content"].nil? || m["content"].to_s.strip.empty?
+            m["content"] = " "
+            logger&.debug("[repair] Filled empty content for tool message (tool_call_id: #{m['tool_call_id']})")
+          end
+        end
+
+        i = j
+      else
+        i += 1
+      end
+    end
+
+    i = 0
+    while i < messages.length
+      if messages[i]["role"] == "tool"
+        found = false
+        j = i - 1
+        while j >= 0
+          if messages[j]["role"] == "assistant" && messages[j]["tool_calls"].is_a?(Array)
+            if messages[j]["tool_calls"].any? { |tc| tc["id"] == messages[i]["tool_call_id"] }
+              found = true
+            end
+            break
+          elsif messages[j]["role"] == "tool"
+            j -= 1
+          else
+            break
+          end
+        end
+        unless found
+          logger&.debug("[repair] Removed orphaned tool message (tool_call_id: #{messages[i]['tool_call_id']})")
+          messages.delete_at(i)
+          next
+        end
+      end
+      i += 1
+    end
+  end
+
   def parse_request(allowed_headers: ["Authorization", "OpenAI-Organization", "OpenAI-Beta"])
     body = JSON.parse(request.body.read)
 
     if body["messages"]
-      body["messages"].reject! { |m| m["content"].nil? || m["content"].to_s.strip.empty? }
+      body["messages"].reject! do |m|
+        next false if m["role"] == "assistant" && m["tool_calls"].is_a?(Array) && !m["tool_calls"].empty?
+        m["content"].nil? || m["content"].to_s.strip.empty?
+      end
+
+      self.class.repair_messages!(body["messages"], logger: settings.logger)
+
       halt json_error(status: 400, message: "Validation error: message content cannot be empty") if body["messages"].empty?
     end
 
@@ -604,11 +738,14 @@ class LLMProxy < Sinatra::Base
       }
       usage_data = nil
       stream_result = nil
+      needs_repair = provider_config["provider"].to_s.downcase.include?("deepseek")
+      accumulated = needs_repair ? +"" : nil
 
       http.request(request) do |response|
         if response.is_a?(Net::HTTPSuccess)
           response.read_body do |chunk|
             out << chunk
+            accumulated << chunk if accumulated
 
             if TRACKING_ENABLED
               now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
@@ -618,6 +755,7 @@ class LLMProxy < Sinatra::Base
             end
           end
 
+          self.class.cache_reasoning_from_response(accumulated, streamed: true) if accumulated
           stream_result = build_stream_result(log_prefix, timers, usage_data)
         else
           handle_upstream_error(response, log_prefix)
@@ -636,6 +774,9 @@ class LLMProxy < Sinatra::Base
       response = http.request(request)
 
       if response.is_a?(Net::HTTPSuccess)
+        if provider_config["provider"].to_s.downcase.include?("deepseek")
+          self.class.cache_reasoning_from_response(response.body, streamed: false)
+        end
         settings.logger.info("#{log_prefix} Success")
         { success: true, response: [response.code.to_i, { "Content-Type" => "application/json" }, [response.body]] }
       else
