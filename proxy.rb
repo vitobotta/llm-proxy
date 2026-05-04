@@ -579,6 +579,27 @@ class LLMProxy < Sinatra::Base
 
   # ---- Token / TPS helpers ----
 
+  def self.extract_sse_content(accumulated)
+    content_len = 0
+    thinking_len = 0
+
+    accumulated.scan(/^data:\s*(.+)$/).each do |raw|
+      line = raw.first.strip
+      next if line == "[DONE]" || line.empty?
+      begin
+        data = JSON.parse(line)
+        delta = data.dig("choices", 0, "delta")
+        next unless delta
+        content_len += delta["content"].to_s.length if delta["content"]
+        thinking_len += delta["reasoning_content"].to_s.length if delta["reasoning_content"]
+      rescue JSON::ParserError
+        next
+      end
+    end
+
+    { content_len: content_len, thinking_len: thinking_len }
+  end
+
   def self.extract_token_counts(usage_data)
     completion = usage_data.dig("completion_tokens") || usage_data.dig("output_tokens")
     thinking = usage_data.dig("completion_tokens_details", "reasoning_tokens") ||
@@ -761,6 +782,17 @@ class LLMProxy < Sinatra::Base
           unless usage_data
             fallback = self.class.parse_chunk(accumulated)
             usage_data = fallback.usage if fallback.usage
+          end
+
+          unless usage_data
+            counts = self.class.extract_sse_content(accumulated)
+            total = counts[:content_len] + counts[:thinking_len]
+            if total > 0
+              usage_data = {
+                "completion_tokens" => total,
+                "completion_tokens_details" => { "reasoning_tokens" => counts[:thinking_len] }
+              }
+            end
           end
 
           stream_result = build_stream_result(log_prefix, timers, usage_data)
