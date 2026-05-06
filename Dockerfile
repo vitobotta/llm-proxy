@@ -8,6 +8,7 @@ COPY Gemfile Gemfile.lock* ./
 RUN bundle install --jobs 4 --retry 3 && bundle lock
 
 COPY proxy.rb provider_selector.rb config.ru puma.rb ./
+COPY lib/ lib/
 
 EXPOSE 4567
 

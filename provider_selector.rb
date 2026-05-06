@@ -38,6 +38,7 @@ class ProviderSelector
     @samples = {}
     @lock = Mutex.new
     @probing = false
+    @cached_ordered = nil
   end
 
   def active_provider_name
@@ -46,10 +47,12 @@ class ProviderSelector
 
   def ordered_providers
     @lock.synchronize do
-      active = @providers[@active_index]
-      others = @providers.reject.with_index { |_, i| i == @active_index }
-                         .sort_by { |p| -score_provider(p["provider"]) }
-      [active, *others]
+      @cached_ordered ||= begin
+        active = @providers[@active_index]
+        others = @providers.reject.with_index { |_, i| i == @active_index }
+                          .sort_by { |p| -score_provider(p["provider"]) }
+        [active, *others]
+      end
     end
   end
 
@@ -67,7 +70,10 @@ class ProviderSelector
   end
 
   def probe_finished
-    @lock.synchronize { @probing = false }
+    @lock.synchronize do
+      @probing = false
+      @cached_ordered = nil
+    end
   end
 
   def update_metrics(provider_name, ttft, tps)
@@ -80,6 +86,7 @@ class ProviderSelector
       sample[:tps] = tps.to_f if tps
       samples << sample
       samples.shift if samples.length > MAX_SAMPLES
+      @cached_ordered = nil
     end
   end
 
@@ -111,14 +118,21 @@ class ProviderSelector
       if auto_switch
         @lock.synchronize do
           @active_index = best_index
+          @cached_ordered = nil
           logger.info("[#{@model_name}] Switched to #{new_name} (avg_ttft=#{best_avg[:avg_ttft].round(3)}s, avg_tps=#{best_avg[:avg_tps].round(1)}, n=#{best_avg[:sample_count]}) from #{old_name} (avg_ttft=#{active_avg&.dig(:avg_ttft)&.round(3)}s, avg_tps=#{active_avg&.dig(:avg_tps)&.round(1)}, n=#{active_avg&.dig(:sample_count)})")
-          Notifier.notify("LLM Proxy Switch", "#{@model_name}: #{old_name} \u2192 #{new_name}")
+          if defined?(Notifier) && Notifier.respond_to?(:notify)
+            Notifier.notify("LLM Proxy Switch", "#{@model_name}: #{old_name} \u2192 #{new_name}")
+          end
         end
-        self.class.persist_active_provider(@model_name, best_index)
       else
         logger.info("[#{@model_name}] Suggest switch to #{new_name} (avg_ttft=#{best_avg[:avg_ttft].round(3)}s, avg_tps=#{best_avg[:avg_tps].round(1)}, n=#{best_avg[:sample_count]}) from #{old_name} (avg_ttft=#{active_avg&.dig(:avg_ttft)&.round(3)}s, avg_tps=#{active_avg&.dig(:avg_tps)&.round(1)}, n=#{active_avg&.dig(:sample_count)})")
       end
     end
+  end
+
+  def persist_active_index
+    idx = @lock.synchronize { @active_index }
+    self.class.persist_active_provider(@model_name, idx)
   end
 
   def other_providers
