@@ -97,6 +97,14 @@ class LLMProxy < Sinatra::Base
     }.freeze
   end
 
+  PROBING_ENABLED = CONFIG.dig("performance", "probing_enabled") != false
+
+  AUTO_SWITCH = PROBING_ENABLED && CONFIG.dig("performance", "auto_switch") == true
+
+  PROBE_INTERVAL = CONFIG.dig("performance", "probe_interval") || 3
+
+  SAMPLE_WINDOW = CONFIG.dig("performance", "sample_window") || ProviderSelector::DEFAULT_SAMPLE_WINDOW
+
   MODELS = {}
   SELECTORS = {}
 
@@ -104,17 +112,11 @@ class LLMProxy < Sinatra::Base
     provider_list = m["providers"].map { |p| resolve_provider(p["provider"], p["model"], p["headers"]) }
     model_entry = { "name" => m["name"], "providers" => provider_list.freeze }.freeze
     MODELS[m["name"]] = model_entry
-    SELECTORS[m["name"]] = ProviderSelector.new(m["name"], provider_list, model_config: m)
+    SELECTORS[m["name"]] = ProviderSelector.new(m["name"], provider_list, model_config: m, sample_window: SAMPLE_WINDOW)
   end
 
   MODELS.freeze
   SELECTORS.freeze
-
-  PROBING_ENABLED = CONFIG.dig("performance", "probing_enabled") != false
-
-  AUTO_SWITCH = PROBING_ENABLED && CONFIG.dig("performance", "auto_switch") == true
-
-  PROBE_INTERVAL = CONFIG.dig("performance", "probe_interval") || 3
 
   set :max_attempts, CONFIG.dig("retries", "max_attempts") || 3
   set :backoff_base, CONFIG.dig("retries", "backoff_base") || 2

@@ -176,11 +176,22 @@ class TestProviderSelector < Minitest::Test
   end
 
   def test_prune_stale_samples
-    selector.update_metrics("prov_a", 1.0, 50.0)
-    samples = selector.instance_variable_get(:@samples)["prov_a"]
+    s = ProviderSelector.new("test-model", @providers, model_config: @model_config, sample_window: 300)
+    s.update_metrics("prov_a", 1.0, 50.0)
+    samples = s.instance_variable_get(:@samples)["prov_a"]
     samples[0][:timestamp] = Process.clock_gettime(Process::CLOCK_MONOTONIC) - 700
-    selector.update_metrics("prov_a", 2.0, 60.0)
-    samples = selector.instance_variable_get(:@samples)["prov_a"]
+    s.update_metrics("prov_a", 2.0, 60.0)
+    samples = s.instance_variable_get(:@samples)["prov_a"]
+    assert_equal 1, samples.length
+  end
+
+  def test_sample_window_configurable
+    s = ProviderSelector.new("test-model", @providers, model_config: @model_config, sample_window: 120)
+    s.update_metrics("prov_a", 1.0, 50.0)
+    samples = s.instance_variable_get(:@samples)["prov_a"]
+    samples[0][:timestamp] = Process.clock_gettime(Process::CLOCK_MONOTONIC) - 200
+    s.update_metrics("prov_a", 2.0, 60.0)
+    samples = s.instance_variable_get(:@samples)["prov_a"]
     assert_equal 1, samples.length
   end
 

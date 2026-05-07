@@ -5,7 +5,7 @@ class ProviderSelector
   TPS_REFERENCE   = 100.0
   TTFT_WEIGHT = 0.5
   TPS_WEIGHT  = 0.5
-  SAMPLE_WINDOW = 600
+  DEFAULT_SAMPLE_WINDOW = 300
   MAX_SAMPLES = 100
   MIN_SAMPLES = 2
   HYSTERESIS = 0.1
@@ -30,7 +30,7 @@ class ProviderSelector
     nil
   end
 
-  def initialize(model_name, providers, model_config:)
+  def initialize(model_name, providers, model_config:, sample_window: DEFAULT_SAMPLE_WINDOW)
     @model_name = model_name
     @providers = providers
     @active_index = find_initial_active_index(model_config)
@@ -39,6 +39,7 @@ class ProviderSelector
     @lock = Mutex.new
     @probing = false
     @cached_ordered = nil
+    @sample_window = sample_window
   end
 
   def active_provider_name
@@ -156,7 +157,7 @@ class ProviderSelector
   end
 
   def prune_stale_samples!(samples, now)
-    samples.delete_if { |s| now - s[:timestamp] > SAMPLE_WINDOW }
+    samples.delete_if { |s| now - s[:timestamp] > @sample_window }
   end
 
   def average_metrics(provider_name)
