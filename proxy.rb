@@ -65,6 +65,9 @@ class LLMProxy < Sinatra::Base
         errors << "Model entry missing 'name'"
         next
       end
+      if m.key?("context_length") && (!m["context_length"].is_a?(Integer) || m["context_length"] <= 0)
+        errors << "Model '#{m['name']}' has invalid context_length (must be positive integer)"
+      end
       unless m["providers"]&.any?
         errors << "Model '#{m['name']}' has no providers"
         next
@@ -110,7 +113,7 @@ class LLMProxy < Sinatra::Base
 
   CONFIG["models"].each do |m|
     provider_list = m["providers"].map { |p| resolve_provider(p["provider"], p["model"], p["headers"]) }
-    model_entry = { "name" => m["name"], "providers" => provider_list.freeze }.freeze
+    model_entry = { "name" => m["name"], "providers" => provider_list.freeze, "context_length" => m["context_length"] }.compact.freeze
     MODELS[m["name"]] = model_entry
     SELECTORS[m["name"]] = ProviderSelector.new(m["name"], provider_list, model_config: m, sample_window: SAMPLE_WINDOW)
   end
@@ -455,7 +458,7 @@ class LLMProxy < Sinatra::Base
     content_type :json
     {
       object: "list",
-      data: MODELS.keys.map { |name| { id: name, object: "model", owned_by: "proxy" } }
+      data: MODELS.keys.map { |name| { id: name, object: "model", owned_by: "proxy", context_length: MODELS[name]["context_length"] }.compact }
     }.to_json
   end
 
@@ -468,8 +471,9 @@ class LLMProxy < Sinatra::Base
       id: model["name"],
       object: "model",
       owned_by: "proxy",
+      context_length: model["context_length"],
       providers: model["providers"].map { |p| { provider: p["provider"], model: p["model"] } }
-    }.to_json
+    }.compact.to_json
   end
 
   error do

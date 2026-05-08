@@ -68,6 +68,7 @@ providers:
 # Optional: headers on a provider entry override/extend the provider's headers
 models:
 - name: glm-5.1
+  context_length: 131072
   providers:
   - provider: wafer
     model: GLM-5.1

@@ -136,9 +136,11 @@ module HTTPSupport
     %w[INT TERM].each do |sig|
       Signal.trap(sig) do
         logger.info("\nShutting down gracefully...")
-        cleanup_all_connections!
-        selectors.each { |_, s| s.persist_active_index }
-        exit(0)
+        Thread.new do
+          cleanup_all_connections!
+          selectors.each { |_, s| s.persist_active_index }
+          exit(0)
+        end
       end
     end
 
