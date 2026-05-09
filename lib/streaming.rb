@@ -10,6 +10,43 @@ module Streaming
 
   ChunkResult = Struct.new(:usage, :has_thinking, :has_content, :has_tool_call)
 
+  class TimerTracker
+    attr_reader :first_token, :first_thinking, :last_thinking,
+                :first_content, :last_content, :last_any_token,
+                :thinking_detected, :content_detected
+
+    def initialize
+      @first_token = nil
+      @first_thinking = nil
+      @last_thinking = nil
+      @first_content = nil
+      @last_content = nil
+      @last_any_token = nil
+      @thinking_detected = false
+      @content_detected = false
+    end
+
+    def record_thinking(now)
+      @last_thinking = now
+      @last_any_token = now
+      unless @thinking_detected
+        @thinking_detected = true
+        @first_thinking ||= now
+        @first_token ||= now
+      end
+    end
+
+    def record_content(now)
+      @last_content = now
+      @last_any_token = now
+      unless @content_detected
+        @content_detected = true
+        @first_content ||= now
+        @first_token ||= now
+      end
+    end
+  end
+
   def self.parse_chunk(chunk)
     result = ChunkResult.new(nil, false, false, false)
 
@@ -77,12 +114,7 @@ module Streaming
   end
 
   def self.stream_response(http, request, request_start, on_chunk: nil)
-    first_token_time = nil
-    first_thinking_time = nil
-    last_thinking_time = nil
-    first_content_time = nil
-    last_content_time = nil
-    last_any_token_time = nil
+    timers = TimerTracker.new
     usage_data = nil
     error = nil
 
@@ -98,19 +130,8 @@ module Streaming
 
         usage_data = cr.usage if cr.usage
 
-        if cr.has_thinking
-          last_thinking_time = now
-          last_any_token_time = now
-          first_thinking_time ||= now
-          first_token_time ||= now
-        end
-
-        if cr.has_content
-          last_content_time = now
-          last_any_token_time = now
-          first_content_time ||= now
-          first_token_time ||= now
-        end
+        timers.record_thinking(now) if cr.has_thinking
+        timers.record_content(now) if cr.has_content
 
         on_chunk&.call(chunk, cr, now)
       end
@@ -120,45 +141,30 @@ module Streaming
       { error: error }
     else
       {
-        first_token_time: first_token_time,
-        first_thinking_time: first_thinking_time,
-        last_thinking_time: last_thinking_time,
-        first_content_time: first_content_time,
-        last_content_time: last_content_time,
-        last_any_token_time: last_any_token_time,
+        first_token_time: timers.first_token,
+        first_thinking_time: timers.first_thinking,
+        last_thinking_time: timers.last_thinking,
+        first_content_time: timers.first_content,
+        last_content_time: timers.last_content,
+        last_any_token_time: timers.last_any_token,
         usage_data: usage_data,
         request_start: request_start
       }
     end
   end
 
-  def track_chunk!(chunk_result, now, timers)
-    if chunk_result.has_thinking
-      timers[:last_thinking] = now
-      if !timers[:thinking_detected]
-        timers[:thinking_detected] = true
-        timers[:first_thinking] ||= now
-        timers[:first_token] ||= now
-      end
-    end
-
-    if chunk_result.has_content
-      timers[:last_content] = now
-      if !timers[:content_detected]
-        timers[:content_detected] = true
-        timers[:first_content] ||= now
-        timers[:first_token] ||= now
-      end
-    end
+  def track_chunk!(chunk_result, now, tracker)
+    tracker.record_thinking(now) if chunk_result.has_thinking
+    tracker.record_content(now) if chunk_result.has_content
   end
 
-  def build_stream_result(log_prefix, timers, usage_data)
-    ttft = timers[:first_token] ? (timers[:first_token] - @request_start).round(3) : nil
+  def build_stream_result(log_prefix, tracker, usage_data)
+    ttft = tracker.first_token ? (tracker.first_token - @request_start).round(3) : nil
 
     if usage_data
       tokens = Streaming.extract_token_counts(usage_data)
-      content_tps = Streaming.compute_tps(tokens[:content], timers[:first_content], timers[:last_content])
-      thinking_tps = Streaming.compute_tps(tokens[:thinking], timers[:first_thinking], timers[:last_thinking])
+      content_tps = Streaming.compute_tps(tokens[:content], tracker.first_content, tracker.last_content)
+      thinking_tps = Streaming.compute_tps(tokens[:thinking], tracker.first_thinking, tracker.last_thinking)
 
       log_parts = []
       log_parts << "content=#{tokens[:content]}" if tokens[:content]&.positive?

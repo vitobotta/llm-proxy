@@ -109,6 +109,14 @@ logging:
   level: "info"       # debug, info, warn, error
   format: "json"      # json or text (default: text)
 
+# Limits
+limits:
+  max_request_body: 10485760  # Max incoming request body size in bytes (default: 10MB)
+
+# Optional authentication for incoming requests
+# auth:
+#   token: "your-secret-token"   # Clients must send Authorization: Bearer <token>
+
 # Performance tracking (disable for zero-overhead passthrough)
 tracking:
   enabled: true       # set false to skip TPS calculation and token counting

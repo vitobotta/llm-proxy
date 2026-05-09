@@ -9,6 +9,13 @@ require_relative "../lib/streaming"
 require_relative "../lib/http_support"
 require_relative "../provider_selector"
 
+class NullLogger
+  def info(_msg); end
+  def warn(_msg); end
+  def error(_msg); end
+  def debug(_msg); end
+end
+
 MOCK_CONFIG = {
   "providers" => {
     "prov_a" => { "base_url" => "https://a.example.com/v1", "api_key" => "key_a" },

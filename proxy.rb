@@ -10,20 +10,12 @@ require "logger"
 require "securerandom"
 require_relative "lib/streaming"
 require_relative "lib/http_support"
+require_relative "lib/notifier"
+require_relative "lib/config_validator"
+require_relative "lib/probe_manager"
+require_relative "lib/request_handler"
+require_relative "lib/metrics"
 require_relative "provider_selector"
-
-MACOS = RUBY_PLATFORM.match?(/darwin/)
-
-module Notifier
-  def self.notify(title, message)
-    return unless MACOS
-
-    Thread.new do
-      script = "display notification #{message.inspect} with title #{title.inspect}"
-      system("osascript", "-e", script)
-    end
-  end
-end
 
 CONFIG = YAML.unsafe_load_file(File.join(__dir__, "config.yaml"))
 CONFIG.freeze
@@ -31,6 +23,7 @@ CONFIG.freeze
 class LLMProxy < Sinatra::Base
   helpers Streaming
   helpers HTTPSupport
+  helpers RequestHandler
 
   LOG_LEVELS = {
     "debug" => Logger::DEBUG,
@@ -55,37 +48,7 @@ class LLMProxy < Sinatra::Base
 
   PROVIDERS = (CONFIG["providers"] || {}).transform_values(&:freeze).freeze
 
-  def self.validate_config!(config, log)
-    errors = []
-    errors << "Missing 'models' in config" unless config["models"]&.any?
-    errors << "Missing 'providers' in config" unless config["providers"]&.any?
-
-    (config["models"] || []).each do |m|
-      unless m["name"]
-        errors << "Model entry missing 'name'"
-        next
-      end
-      if m.key?("context_length") && (!m["context_length"].is_a?(Integer) || m["context_length"] <= 0)
-        errors << "Model '#{m['name']}' has invalid context_length (must be positive integer)"
-      end
-      unless m["providers"]&.any?
-        errors << "Model '#{m['name']}' has no providers"
-        next
-      end
-      m["providers"].each do |p|
-        unless p["provider"]
-          errors << "Model '#{m['name']}' has a provider entry missing 'provider' key"
-        end
-      end
-    end
-
-    unless errors.empty?
-      errors.each { |e| log.error("Config error: #{e}") }
-      abort("Invalid configuration, exiting")
-    end
-  end
-
-  validate_config!(CONFIG, logger)
+  ConfigValidator.validate!(CONFIG, logger)
 
   def self.resolve_provider(provider_name, model_id, model_headers = nil)
     provider = PROVIDERS[provider_name]
@@ -132,22 +95,34 @@ class LLMProxy < Sinatra::Base
 
   TRACKING_ENABLED = CONFIG.dig("tracking", "enabled") != false
 
-  MAX_BODY_SIZE = 10 * 1024 * 1024
+  AUTH_TOKEN = CONFIG.dig("auth", "token")
+
+  MAX_BODY_SIZE = CONFIG.dig("limits", "max_request_body") || 10 * 1024 * 1024
 
   before do
     @request_id = SecureRandom.uuid[0..7]
     @request_start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
     settings.logger.info("[#{@request_id}] #{request.request_method} #{request.path}")
+
+    if AUTH_TOKEN
+      auth_header = request.env["HTTP_AUTHORIZATION"].to_s
+      token = auth_header.start_with?("Bearer ") ? auth_header[7..] : auth_header
+      unless token && token == AUTH_TOKEN
+        halt json_error(status: 401, message: "Unauthorized", type: "authentication_error")
+      end
+    end
   end
 
   after do
     elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - @request_start
     settings.logger.info("[#{@request_id}] Completed #{response.status} in #{elapsed.round(3)}s")
+    Metrics.increment(:requests_total, labels: { status: response.status })
+    Metrics.observe(:request_duration_seconds, elapsed)
   end
 
-  def json_error(status:, message:, detail: nil)
+  def json_error(status:, message:, detail: nil, type: "proxy_error")
     content_type :json
-    body = { error: { message: message, type: "proxy_error" } }
+    body = { error: { message: message, type: type } }
     body[:error].merge!(detail: detail) if detail
     [status, body.to_json]
   end
@@ -155,15 +130,15 @@ class LLMProxy < Sinatra::Base
   def parse_request(allowed_headers: ["Authorization", "OpenAI-Organization", "OpenAI-Beta"])
     body_raw = request.body.read
     if body_raw.bytesize > MAX_BODY_SIZE
-      halt json_error(status: 413, message: "Request body too large (max 10MB)")
+      halt json_error(status: 413, message: "Request body too large (max #{MAX_BODY_SIZE / 1024 / 1024}MB)", type: "request_too_large")
     end
     body = JSON.parse(body_raw)
 
     model_name = body["model"]
-    halt json_error(status: 400, message: "Missing 'model' in request body") unless model_name
+    halt json_error(status: 400, message: "Missing 'model' in request body", type: "invalid_request") unless model_name
 
     model = MODELS[model_name]
-    halt json_error(status: 404, message: "Model '#{model_name}' not found in configuration") unless model
+    halt json_error(status: 404, message: "Model '#{model_name}' not found in configuration", type: "model_not_found") unless model
 
     incoming_headers = {}
     allowed_headers.each do |h|
@@ -173,244 +148,13 @@ class LLMProxy < Sinatra::Base
 
     { body: body, model: model, model_name: model_name, headers: incoming_headers }
   rescue JSON::ParserError
-    halt json_error(status: 400, message: "Invalid JSON body")
-  end
-
-  # ---- Provider selection ----
-
-  def with_auto_select(model:, model_name:, path:, body:, headers:)
-    selector = SELECTORS[model_name]
-
-    providers = PROBING_ENABLED ? selector.ordered_providers : selector.providers
-
-    result = nil
-    providers.each_with_index do |provider_config, i|
-      p_name = provider_config["provider"]
-      p_model = provider_config["model"]
-      settings.logger.info("[#{@request_id}/#{model_name}] #{i == 0 ? 'Using' : 'Fallback to'} #{p_name} (#{p_model})")
-
-      log_prefix = "[#{@request_id}/#{model_name}/#{p_name}]"
-      result = yield(provider_config, path, body, p_model, headers, log_prefix)
-      if result&.dig(:success)
-        record_metrics(selector, p_name, result) if PROBING_ENABLED
-        Notifier.notify("LLM Proxy Fallback", "#{model_name} \u2192 #{p_name}") if i > 0
-        break
-      end
-    end
-
-    if PROBING_ENABLED && selector.record_and_maybe_probe(PROBE_INTERVAL)
-      launch_background_probe(selector, model_name, path, headers)
-    end
-
-    result || { success: false, error: "All providers failed" }
-  end
-
-  def record_metrics(selector, provider_name, result)
-    selector.update_metrics(provider_name, result[:ttft], result[:content_tps]) if result[:ttft]
-  end
-
-  PROBE_BODY = {
-    "messages" => [{ "role" => "user", "content" => "Write a brief paragraph about the weather" }],
-    "max_tokens" => 100
-  }.freeze
-
-  def launch_background_probe(selector, model_name, path, headers)
-    logger = settings.logger
-    probe_id = SecureRandom.uuid[0..7]
-
-    Thread.new do
-      begin
-        threads = []
-        results = {}
-
-        selector.other_providers.each do |provider_config|
-          p_name = provider_config["provider"]
-          threads << Thread.new do
-            metrics = LLMProxy.probe_provider(provider_config, path, PROBE_BODY, provider_config["model"], headers, logger: logger)
-            results[p_name] = metrics
-          end
-        end
-
-        threads.each(&:join)
-
-        results.each do |p_name, m|
-          selector.update_metrics(p_name, m[:ttft], m[:tps])
-          tps_str = m[:tps] ? m[:tps].to_s : "N/A"
-          logger.info("[probe:#{probe_id}] #{model_name}/#{p_name}: ttft=#{m[:ttft]}s tps=#{tps_str}")
-        end
-
-        selector.evaluate_and_select(logger, auto_switch: AUTO_SWITCH)
-      rescue => e
-        logger.error("[probe:#{probe_id}] #{model_name} error: #{e.message}")
-      ensure
-        HTTPSupport.cleanup_thread_connections!
-        selector.probe_finished
-      end
-    end
-  end
-
-  # ---- Probe provider (class method — runs outside request) ----
-
-  def self.probe_provider(provider_config, path, body, body_model, incoming_headers, logger:)
-    pname = provider_config["provider"]
-    uri, request = HTTPSupport.build_upstream_request(provider_config, path, body, body_model, incoming_headers, stream: true)
-
-    begin
-      http = HTTPSupport.create_http(uri, timeouts: TIMEOUTS)
-      http.start unless http.started?
-
-      request_start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-      result = Streaming.stream_response(http, request, request_start)
-      stream_end = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-
-      if result[:error]
-        logger.warn("[probe] #{pname}: #{result[:error]}")
-        return { ttft: Float::INFINITY, tps: nil }
-      end
-
-      ttft = result[:first_token_time] ? (result[:first_token_time] - request_start).round(3) : Float::INFINITY
-
-      unless result[:usage_data]
-        logger.debug("[probe] #{pname}: usage_data absent (provider ignored stream_options)")
-        return { ttft: ttft, tps: nil }
-      end
-
-      tokens = Streaming.extract_token_counts(result[:usage_data])
-      completion_tokens = tokens[:completion] || 0
-
-      tps = Streaming.compute_tps(tokens[:content], result[:first_content_time], result[:last_content_time])
-
-      if tps.nil?
-        tps = Streaming.compute_tps(completion_tokens, result[:first_token_time], result[:last_any_token_time])
-      end
-
-      if tps.nil? && result[:first_token_time]
-        elapsed = stream_end - result[:first_token_time]
-        if elapsed > 0 && completion_tokens > 0
-          tps = (completion_tokens / elapsed).round(1)
-        end
-      end
-
-      if tps.nil? || tps == 0
-        diag = []
-        diag << "completion_tokens=#{completion_tokens}"
-        diag << "content_tokens=#{tokens[:content]}"
-        diag << "first_token_time=#{result[:first_token_time] ? format("%.3f", result[:first_token_time]) : "nil"}"
-        diag << "last_any=#{result[:last_any_token_time] ? format("%.3f", result[:last_any_token_time]) : "nil"}"
-        diag << "stream_end=#{format("%.3f", stream_end)}"
-        logger.debug("[probe] #{pname}: TPS=0 diag: #{diag.join(", ")}")
-      end
-
-      { ttft: ttft, tps: tps }
-    rescue => e
-      logger.debug("[probe] #{pname}: #{e.message}")
-      { ttft: Float::INFINITY, tps: nil }
-    end
-  end
-
-  # ---- Request handlers ----
-
-  def try_stream(provider_config, path, body, body_model, incoming_headers, out:, log_prefix:)
-    uri, request = HTTPSupport.build_upstream_request(provider_config, path, body, body_model, incoming_headers, stream: true)
-
-    try_with_retries(log_prefix: log_prefix, body_model: body_model) do
-      http = HTTPSupport.create_http(uri, timeouts: TIMEOUTS)
-      http.start unless http.started?
-
-      timers = {
-        first_token: nil, first_thinking: nil, last_thinking: nil,
-        first_content: nil, last_content: nil,
-        thinking_detected: false, content_detected: false
-      }
-      usage_data = nil
-      stream_result = nil
-      accumulated = TRACKING_ENABLED ? +"" : nil
-
-      http.request(request) do |response|
-        if response.is_a?(Net::HTTPSuccess)
-          response.read_body do |chunk|
-            begin
-              out << chunk
-            rescue Errno::EPIPE, IOError
-              raise HTTPSupport::ClientDisconnected
-            end
-
-            if TRACKING_ENABLED
-              accumulated << chunk if accumulated
-              now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-              cr = Streaming.parse_chunk(chunk)
-              if cr.usage
-                usage_data = cr.usage
-                accumulated = nil
-              end
-              track_chunk!(cr, now, timers)
-            end
-          end
-
-          if TRACKING_ENABLED
-            unless usage_data
-              fallback = Streaming.parse_chunk(accumulated.to_s) if accumulated
-              usage_data = fallback.usage if fallback&.usage
-            end
-
-            unless usage_data
-              if accumulated
-                counts = Streaming.extract_sse_content(accumulated.to_s)
-                total = counts[:content_len] + counts[:thinking_len]
-                if total > 0
-                  usage_data = {
-                    "completion_tokens" => total,
-                    "completion_tokens_details" => { "reasoning_tokens" => counts[:thinking_len] }
-                  }
-                end
-              end
-            end
-
-            stream_result = build_stream_result(log_prefix, timers, usage_data)
-          else
-            stream_result = { success: true }
-          end
-        else
-          stream_result = handle_upstream_error(response, log_prefix)
-        end
-      end
-      stream_result
-    end
-  end
-
-  def try_single_request(provider_config, path, body, body_model, incoming_headers, log_prefix:)
-    uri, request = HTTPSupport.build_upstream_request(provider_config, path, body, body_model, incoming_headers, stream: false)
-
-    try_with_retries(log_prefix: log_prefix, body_model: body_model) do
-      http = HTTPSupport.create_http(uri, timeouts: TIMEOUTS)
-      http.start unless http.started?
-      response = http.request(request)
-
-      if response.is_a?(Net::HTTPSuccess)
-        settings.logger.info("#{log_prefix} Success")
-        { success: true, response: [response.code.to_i, { "Content-Type" => "application/json" }, [response.body]] }
-      else
-        handle_upstream_error(response, log_prefix)
-      end
-    end
-  end
-
-  def handle_non_stream_result(result)
-    if result[:success]
-      status result[:response][0]
-      result[:response][1].each { |k, v| headers[k] = v }
-      result[:response][2].first
-    else
-      err_status = result[:status] || 502
-      status err_status
-      json_error(status: err_status, message: result[:error], detail: result[:detail])
-    end
+    halt json_error(status: 400, message: "Invalid JSON body", type: "invalid_request")
   end
 
   %w[chat/completions completions].each do |endpoint|
     post "/v1/#{endpoint}" do
       req = parse_request
-      stream_requested = req[:body].key?("stream") ? req[:body].delete("stream") != false : true
+      stream_requested = req[:body].key?("stream") ? req[:body]["stream"] != false : true
 
       if stream_requested
         HTTPSupport::SSE_HEADERS.each { |k, v| headers[k] = v }
@@ -448,10 +192,16 @@ class LLMProxy < Sinatra::Base
       metrics = selector.active_metrics
       provider_status[name] = {
         active_provider: selector.active_provider_name,
-        metrics: metrics
+        metrics: metrics,
+        providers: selector.provider_stats
       }
     end
     { status: "ok", models: MODELS.keys, providers: provider_status, timestamp: Time.now.iso8601 }.to_json
+  end
+
+  get "/metrics" do
+    content_type "text/plain; version=0.0.4"
+    Metrics.to_prometheus
   end
 
   get "/v1/models" do
@@ -465,7 +215,7 @@ class LLMProxy < Sinatra::Base
   get "/v1/models/:name" do
     content_type :json
     model = MODELS[params[:name]]
-    return json_error(status: 404, message: "Model '#{params[:name]}' not found") unless model
+    halt json_error(status: 404, message: "Model '#{params[:name]}' not found", type: "model_not_found") unless model
 
     {
       id: model["name"],
@@ -480,7 +230,7 @@ class LLMProxy < Sinatra::Base
     e = env["sinatra.error"]
     settings.logger.error("[#{@request_id}] Unhandled error: #{e.class}: #{e.message}")
     settings.logger.error(e.backtrace[0..10].join("\n")) if e.backtrace
-    json_error(status: 500, message: "Internal server error", detail: e.message)
+    json_error(status: 500, message: "Internal server error", detail: e.message, type: "internal_error")
   end
 end
 

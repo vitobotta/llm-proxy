@@ -2,13 +2,6 @@
 
 require_relative "test_helper"
 
-class NullLogger
-  def info(_msg); end
-  def warn(_msg); end
-  def error(_msg); end
-  def debug(_msg); end
-end
-
 class TestRetryLogic < Minitest::Test
   class MockApp
     include HTTPSupport

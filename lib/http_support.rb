@@ -8,10 +8,28 @@ require "securerandom"
 module HTTPSupport
   class RetryableError < StandardError; end
   class ClientDisconnected < StandardError; end
+  class RateLimitedError < RetryableError
+    attr_reader :retry_after
+
+    def initialize(retry_after)
+      @retry_after = retry_after
+      super("Rate limited, Retry-After: #{retry_after}s")
+    end
+  end
 
   RETRYABLE_CODES = [429, 500, 502, 503, 504].freeze
 
   TIMEOUT_EXCEPTIONS = [Net::OpenTimeout, Net::ReadTimeout, Net::WriteTimeout].freeze
+
+  MAX_EOF_RETRIES = 2
+  MAX_RETRY_AFTER = 60
+  KEEP_ALIVE_TIMEOUT = 30
+  MAX_UPSTREAM_BODY_SIZE = 5 * 1024 * 1024
+  JITTER_FACTOR = 0.5
+  MAX_CONNECTION_AGE = 300
+  CONNECTION_IDLE_TIMEOUT = 60
+
+  PoolEntry = Struct.new(:http, :created_at, :last_used_at, keyword_init: true)
 
   SSE_HEADERS = {
     "Content-Type" => "text/event-stream",
@@ -69,13 +87,24 @@ module HTTPSupport
   def self.create_http(uri, timeouts:)
     key = "#{uri.scheme}://#{uri.host}:#{uri.port}"
     thread_pool = (Thread.current[:http_connections] ||= {})
+    now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
 
     ALL_POOLS_LOCK.synchronize do
       ALL_CONNECTION_POOLS << thread_pool unless ALL_CONNECTION_POOLS.include?(thread_pool)
     end
 
-    if (http = thread_pool[key])
-      return http if http.started?
+    if (entry = thread_pool[key])
+      age = now - entry.created_at
+      idle = now - entry.last_used_at
+      if entry.http.started? && age < MAX_CONNECTION_AGE && idle < CONNECTION_IDLE_TIMEOUT
+        entry.last_used_at = now
+        return entry.http
+      end
+      begin
+        entry.http.finish if entry.http.started?
+      rescue StandardError
+        nil
+      end
       thread_pool.delete(key)
     end
 
@@ -84,15 +113,17 @@ module HTTPSupport
     http.open_timeout = timeouts[:open]
     http.read_timeout = timeouts[:read]
     http.write_timeout = timeouts[:write]
-    http.keep_alive_timeout = 30
-    thread_pool[key] = http
+    http.keep_alive_timeout = KEEP_ALIVE_TIMEOUT
+    thread_pool[key] = PoolEntry.new(http: http, created_at: now, last_used_at: now)
+    http
   end
 
   def self.cleanup_thread_connections!
     thread_pool = Thread.current[:http_connections]
     return unless thread_pool
 
-    thread_pool.each_value do |http|
+    thread_pool.each_value do |entry|
+      http = entry.is_a?(PoolEntry) ? entry.http : entry
       http.finish if http.started?
     rescue StandardError
       nil
@@ -103,7 +134,8 @@ module HTTPSupport
   def self.cleanup_all_connections!
     ALL_POOLS_LOCK.synchronize do
       ALL_CONNECTION_POOLS.each do |pool|
-        pool.each_value do |http|
+        pool.each_value do |entry|
+          http = entry.is_a?(PoolEntry) ? entry.http : entry
           http.finish if http.started?
         rescue StandardError
           nil
@@ -123,7 +155,6 @@ module HTTPSupport
           uri = URI.parse(base_url)
           http = create_http(uri, timeouts: timeouts)
           http.start unless http.started?
-          http.finish
           logger.info("  \u2713 #{base_url}")
         rescue StandardError => e
           logger.warn("  \u2717 #{base_url} (#{e.class}: #{e.message})")
@@ -149,7 +180,7 @@ module HTTPSupport
 
   def backoff(attempt)
     base = settings.backoff_base * (2**attempt)
-    sleep(base * (0.5 + rand))
+    sleep(base * (JITTER_FACTOR + rand * JITTER_FACTOR))
   end
 
   def maybe_retry(attempts)
@@ -176,13 +207,17 @@ module HTTPSupport
       begin
         return block.call
       rescue RetryableError => e
+        if e.is_a?(RateLimitedError)
+          settings.logger.info("#{log_prefix} Waiting #{e.retry_after}s before retry...")
+          sleep(e.retry_after)
+        end
         return retry_or_fail(log_prefix, error_label: "Failed", detail: e.message) unless maybe_retry(attempts)
       rescue ClientDisconnected
         settings.logger.info("#{log_prefix} Client disconnected")
         return { success: false, error: "Client disconnected" }
       rescue EOFError
         eof_retries += 1
-        if eof_retries <= 2
+        if eof_retries <= MAX_EOF_RETRIES
           settings.logger.warn("#{log_prefix} EOF on stale connection (retry #{eof_retries}/2, not counting against attempts)")
           flush_stale_connections
           next
@@ -202,29 +237,30 @@ module HTTPSupport
   def flush_stale_connections
     thread_pool = Thread.current[:http_connections]
     return unless thread_pool
-    thread_pool.delete_if { |_, http| !http.started? }
+    thread_pool.delete_if do |_, entry|
+      http = entry.is_a?(PoolEntry) ? entry.http : entry
+      !http.started?
+    end
   end
 
   def handle_upstream_error(response, log_prefix)
     code = response.code.to_i
-    error_msg = "HTTP #{code}: #{response.body}"
+    error_body = response.body
+    if error_body && error_body.bytesize > MAX_UPSTREAM_BODY_SIZE
+      error_body = error_body.byteslice(0, MAX_UPSTREAM_BODY_SIZE) + "... (truncated)"
+    end
+    error_msg = "HTTP #{code}: #{error_body}"
     settings.logger.warn("#{log_prefix} Failed: #{error_msg}")
 
     if RETRYABLE_CODES.include?(code)
       if code == 429 && response["Retry-After"]
-        delay = response["Retry-After"].to_f
+        delay = [response["Retry-After"].to_f, MAX_RETRY_AFTER].min
         settings.logger.warn("#{log_prefix} Rate limited, Retry-After: #{delay}s")
-        sleep(delay)
+        raise RateLimitedError.new(delay)
       end
       raise RetryableError, error_msg
     end
 
     { success: false, error: error_msg, status: code }
-  end
-
-  def handle_streaming_error(result, out)
-    return if result[:success]
-    out << streaming_error(result[:error], detail: result[:detail])
-    out << "data: [DONE]\n\n"
   end
 end

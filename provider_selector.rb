@@ -10,6 +10,11 @@ class ProviderSelector
   MIN_SAMPLES = 2
   HYSTERESIS = 0.1
 
+  CIRCUIT_FAILURE_THRESHOLD = 3
+  CIRCUIT_COOLDOWN = 60
+
+  CircuitState = Struct.new(:failures, :opened_at, keyword_init: true)
+
   attr_reader :providers
 
   CONFIG_PATH = File.join(__dir__, "config.yaml")
@@ -30,7 +35,8 @@ class ProviderSelector
     nil
   end
 
-  def initialize(model_name, providers, model_config:, sample_window: DEFAULT_SAMPLE_WINDOW)
+  def initialize(model_name, providers, model_config:, sample_window: DEFAULT_SAMPLE_WINDOW,
+                 circuit_failure_threshold: CIRCUIT_FAILURE_THRESHOLD, circuit_cooldown: CIRCUIT_COOLDOWN)
     @model_name = model_name
     @providers = providers
     @active_index = find_initial_active_index(model_config)
@@ -40,6 +46,11 @@ class ProviderSelector
     @probing = false
     @cached_ordered = nil
     @sample_window = sample_window
+    @circuit_failure_threshold = circuit_failure_threshold
+    @circuit_cooldown = circuit_cooldown
+    @circuits = providers.each_with_object({}) { |p, h| h[p["provider"]] = CircuitState.new(failures: 0, opened_at: nil) }
+    @error_counts = providers.each_with_object({}) { |p, h| h[p["provider"]] = 0 }
+    @total_requests = providers.each_with_object({}) { |p, h| h[p["provider"]] = 0 }
   end
 
   def active_provider_name
@@ -51,6 +62,7 @@ class ProviderSelector
       @cached_ordered ||= begin
         active = @providers[@active_index]
         others = @providers.reject.with_index { |_, i| i == @active_index }
+                          .reject { |p| circuit_open?(p["provider"]) }
                           .sort_by { |p| -score_provider(p["provider"]) }
         [active, *others]
       end
@@ -136,6 +148,29 @@ class ProviderSelector
     self.class.persist_active_provider(@model_name, idx)
   end
 
+  def record_failure(provider_name)
+    @lock.synchronize do
+      @error_counts[provider_name] = (@error_counts[provider_name] || 0) + 1
+      circuit = @circuits[provider_name]
+      return unless circuit
+      circuit.failures += 1
+      if circuit.failures >= @circuit_failure_threshold
+        circuit.opened_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        @cached_ordered = nil
+      end
+    end
+  end
+
+  def record_success(provider_name)
+    @lock.synchronize do
+      @total_requests[provider_name] = (@total_requests[provider_name] || 0) + 1
+      circuit = @circuits[provider_name]
+      return unless circuit
+      circuit.failures = 0
+      circuit.opened_at = nil
+    end
+  end
+
   def other_providers
     @lock.synchronize { @providers.reject.with_index { |_, i| i == @active_index } }
   end
@@ -148,7 +183,41 @@ class ProviderSelector
     end
   end
 
+  def circuit_states
+    @lock.synchronize do
+      @circuits.transform_values do |c|
+        { failures: c.failures, open: !c.opened_at.nil? }
+      end
+    end
+  end
+
+  def provider_stats
+    @lock.synchronize do
+      @providers.each_with_object({}) do |p, h|
+        name = p["provider"]
+        h[name] = {
+          errors: @error_counts[name] || 0,
+          successes: @total_requests[name] || 0,
+          circuit_open: !@circuits[name]&.opened_at.nil?
+        }
+      end
+    end
+  end
+
   private
+
+  def circuit_open?(provider_name)
+    circuit = @circuits[provider_name]
+    return false unless circuit&.opened_at
+    now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    if now - circuit.opened_at > @circuit_cooldown
+      circuit.opened_at = nil
+      circuit.failures = 0
+      false
+    else
+      true
+    end
+  end
 
   def find_initial_active_index(model_config)
     return 0 unless model_config && model_config["providers"]
