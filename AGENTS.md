@@ -16,13 +16,13 @@ docker compose up -d                 # listens on :9234
 Minitest — no RSpec. Run a single file:
 
 ```bash
-bundle exec ruby test/test_provider_selector.rb
+bundle exec ruby -I. test/test_provider_selector.rb
 ```
 
 Or all:
 
 ```bash
-bundle exec ruby -I. test/test_provider_selector.rb test/test_streaming.rb test/test_http_support.rb test/test_retry.rb
+source /opt/homebrew/opt/chruby/share/chruby/chruby.sh && chruby ruby-4.0.1 && bundle exec ruby -I. test/test_provider_selector.rb test/test_streaming.rb test/test_http_support.rb test/test_retry.rb
 ```
 
 No CI workflows. No linter, no formatter, no typechecker.
@@ -73,6 +73,7 @@ curl -s http://localhost:9234/v1/models | python3 -m json.tool
 - **Prometheus metrics** at `/metrics` — request counts/durations, per-provider success/failure counters.
 - **Config hot-reload** — `ConfigWatcher` polls `config.yaml` mtime every 2s (configurable via `config_poll_interval`). Also supports `kill -USR1 <pid>` for manual reload. Invalid config on reload is skipped (keeps last good config, logs errors).
 - **`ConfigStore`** replaces frozen constants — all config reads go through thread-safe accessors (`ConfigStore.providers`, `ConfigStore.model(name)`, `ConfigStore.selector(name)`, etc.). Selector state (circuit breaker, metrics) is preserved across reloads when provider lists match.
+- **Per-model probe/autoswitch overrides** — each model entry can set `probing_enabled`, `auto_switch`, and `probe_interval` to override the global `performance.*` values. When omitted, falls back to global defaults.
 - **`ConfigWatcher.expecting_write!`** — `ProviderSelector` calls this before writing `config.yaml` so the watcher ignores its own write.
 
 ## Gotchas
@@ -88,3 +89,4 @@ curl -s http://localhost:9234/v1/models | python3 -m json.tool
 - **Background probing** uses a fixed `PROBE_BODY` ("Write a brief paragraph about the weather", max_tokens: 100) and skips providers already being probed.
 - **Incoming auth** optional via `auth.token` in config — clients must send `Authorization: Bearer <token>`.
 - **`accumulated` string** is nil'd after usage data found OR after exceeding 512KB — always nil-check before use.
+- **`probing_enabled: false` disables auto_switch** — per-model `auto_switch` is forced false when `probing_enabled` is false, matching the global behaviour.

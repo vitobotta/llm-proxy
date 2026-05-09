@@ -46,6 +46,15 @@ module ConfigValidator
           errors << "Model '#{m['name']}' has a provider entry missing 'provider' key"
         end
       end
+      if m.key?("probing_enabled") && ![true, false].include?(m["probing_enabled"])
+        errors << "Model '#{m['name']}' has invalid probing_enabled (must be true or false)"
+      end
+      if m.key?("auto_switch") && ![true, false].include?(m["auto_switch"])
+        errors << "Model '#{m['name']}' has invalid auto_switch (must be true or false)"
+      end
+      if m.key?("probe_interval") && (!m["probe_interval"].is_a?(Integer) || m["probe_interval"] <= 0)
+        errors << "Model '#{m['name']}' has invalid probe_interval (must be positive integer)"
+      end
     end
 
     unless config["providers"]&.any?

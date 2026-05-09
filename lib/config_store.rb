@@ -83,7 +83,17 @@ module ConfigStore
     selectors = {}
     raw["models"].each do |m|
       provider_list = m["providers"].map { |p| resolve_provider(providers, p["provider"], p["model"], p["headers"]) }
-      model_entry = { "name" => m["name"], "providers" => provider_list.freeze, "context_length" => m["context_length"] }.compact.freeze
+      m_probing = m.key?("probing_enabled") ? (m["probing_enabled"] != false) : probing_enabled
+      m_auto_switch = m_probing && (m.key?("auto_switch") ? m["auto_switch"] == true : auto_switch)
+      m_probe_interval = m["probe_interval"] || probe_interval
+      model_entry = {
+        "name" => m["name"],
+        "providers" => provider_list.freeze,
+        "context_length" => m["context_length"],
+        "probing_enabled" => m_probing,
+        "auto_switch" => m_auto_switch,
+        "probe_interval" => m_probe_interval
+      }.compact.freeze
       models[m["name"]] = model_entry
       selectors[m["name"]] = ProviderSelector.new(m["name"], provider_list, model_config: m, sample_window: sample_window)
     end

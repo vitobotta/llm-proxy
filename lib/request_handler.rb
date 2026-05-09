@@ -3,8 +3,13 @@
 module RequestHandler
   def with_auto_select(model:, model_name:, path:, body:, headers:)
     selector = ConfigStore.selector(model_name)
+    model_entry = ConfigStore.model(model_name)
 
-    providers = ConfigStore.probing_enabled ? selector.ordered_providers : selector.providers
+    probing = model_entry&.dig("probing_enabled") != false
+    auto_switch = model_entry&.dig("auto_switch") == true
+    probe_interval = model_entry&.dig("probe_interval") || ConfigStore.probe_interval
+
+    providers = probing ? selector.ordered_providers : selector.providers
 
     deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + REQUEST_DEADLINE
 
@@ -21,7 +26,7 @@ module RequestHandler
       log_prefix = "[#{@request_id}/#{model_name}/#{p_name}]"
       result = yield(provider_config, path, body, p_model, headers, log_prefix)
       if result&.dig(:success)
-        record_metrics(selector, p_name, result) if ConfigStore.probing_enabled
+        record_metrics(selector, p_name, result) if probing
         selector.record_success(p_name)
         Metrics.increment(:provider_success, labels: { provider: p_name, model: model_name })
         Notifier.notify("LLM Proxy Fallback", "#{model_name} \u2192 #{p_name}") if i > 0
@@ -32,8 +37,8 @@ module RequestHandler
       end
     end
 
-    if ConfigStore.probing_enabled && selector.record_and_maybe_probe(ConfigStore.probe_interval)
-      ProbeManager.launch(selector, model_name, path, headers, timeouts: ConfigStore.timeouts, auto_switch: ConfigStore.auto_switch, logger: settings.logger)
+    if probing && selector.record_and_maybe_probe(probe_interval)
+      ProbeManager.launch(selector, model_name, path, headers, timeouts: ConfigStore.timeouts, auto_switch: auto_switch, logger: settings.logger)
     end
 
     result || { success: false, error: "All providers failed" }
