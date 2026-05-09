@@ -35,12 +35,8 @@ Ruby-based multi-provider LLM proxy with automatic provider selection, streaming
    ┌───┴───┬───┬────────┐
    │       │   │        │
    ▼       ▼   ▼        ▼
-Prov A  Prov B  Prov C  Prov D
+ Prov A  Prov B  Prov C  Prov D
 ```
-
-- `proxy.rb` — Sinatra app handling routing, retry logic, streaming, chunk parsing, metrics tracking.
-- `provider_selector.rb` — per-model scorer. Maintains rolling samples (TTFT + TPS), prunes older than `sample_window` (default 5 min). When `probing_enabled` is true: after every `probe_interval` requests, sends a test prompt to non-active providers, scores all, switches if a better provider exceeds current by hysteresis (`10%`). Writes `primary: true` back to `config.yaml`.
-- `ChunkResult` struct — fast string-match parsing of SSE chunks. No `JSON.parse` except for `usage` blocks. When tracking is off, parsing is skipped entirely.
 
 ## Quick Start
 
@@ -239,3 +235,7 @@ Editable fields:
 - `ports` — change left side to remap host port.
 - `volumes` — mount your `config.yaml` from host.
 - `environment` — add any env vars from the table above (e.g. `PUMA_MAX_THREADS=32`).
+
+---
+
+For developer internals, key files, architecture notes, and testing — see [CONTRIBUTING.md](CONTRIBUTING.md).
