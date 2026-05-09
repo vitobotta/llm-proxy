@@ -2,6 +2,27 @@
 
 module ConfigValidator
   def self.validate!(config, log)
+    errors, warnings = run_checks(config)
+
+    warnings.each { |w| log.warn("Config warning: #{w}") }
+
+    unless errors.empty?
+      errors.each { |e| log.error("Config error: #{e}") }
+      abort("Invalid configuration, exiting")
+    end
+
+    warnings
+  end
+
+  def self.validate(config, log)
+    errors, warnings = run_checks(config)
+    warnings.each { |w| log.warn("Config warning: #{w}") }
+    [errors, warnings]
+  end
+
+  private
+
+  def self.run_checks(config)
     errors = []
     warnings = []
 
@@ -39,13 +60,6 @@ module ConfigValidator
       warnings << "max_attempts > 5 may cause long retry loops"
     end
 
-    warnings.each { |w| log.warn("Config warning: #{w}") }
-
-    unless errors.empty?
-      errors.each { |e| log.error("Config error: #{e}") }
-      abort("Invalid configuration, exiting")
-    end
-
-    warnings
+    [errors, warnings]
   end
 end

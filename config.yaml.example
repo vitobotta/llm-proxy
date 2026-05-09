@@ -127,3 +127,4 @@ performance:
   probing_enabled: true       # Set false to disable background probing; always use primary with fallback on failure
   auto_switch: true           # Auto-switch to best provider after probe (only when probing_enabled)
   probe_interval: 3           # Run background probe every N requests (only when probing_enabled)
+  config_poll_interval: 2     # Seconds between config.yaml change checks (set 0 to disable hot-reload)

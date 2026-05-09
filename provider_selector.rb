@@ -29,6 +29,7 @@ class ProviderSelector
       model_entry["providers"].each { |p| p.delete("primary") }
       model_entry["providers"][provider_index]["primary"] = true
 
+      ConfigWatcher.expecting_write! if defined?(ConfigWatcher)
       File.write(CONFIG_PATH, YAML.dump(raw))
     end
   rescue => e

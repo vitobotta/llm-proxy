@@ -27,6 +27,17 @@ bundle exec ruby -I. test/test_provider_selector.rb test/test_streaming.rb test/
 
 No CI workflows. No linter, no formatter, no typechecker.
 
+**ALWAYS start the containers and perform integration tests after making changes** — unit tests alone are not sufficient. Rebuild and restart Docker, then hit the proxy endpoints to verify it works:
+
+```bash
+docker compose up -d --build
+sleep 3
+# Verify health endpoint
+curl -s http://localhost:9234/health | python3 -m json.tool
+# Verify models endpoint
+curl -s http://localhost:9234/v1/models | python3 -m json.tool
+```
+
 ## Key files
 
 | File | Role |
@@ -37,7 +48,9 @@ No CI workflows. No linter, no formatter, no typechecker.
 | `lib/http_support.rb` | HTTP connection pooling (`PoolEntry` with age/idle tracking), retry logic, graceful shutdown |
 | `lib/request_handler.rb` | Sinatra helper: `with_auto_select`, `try_stream`, `try_single_request`, deadline enforcement |
 | `lib/notifier.rb` | macOS desktop notifications via osascript |
-| `lib/config_validator.rb` | Config validation (errors abort, warnings log) |
+| `lib/config_validator.rb` | Config validation (errors abort on boot, return errors on reload) |
+| `lib/config_store.rb` | Thread-safe mutable config store — replaces frozen constants, supports hot-reload |
+| `lib/config_watcher.rb` | Polls config.yaml mtime + SIGUSR1 handler, triggers `ConfigStore.reload!` |
 | `lib/probe_manager.rb` | Background probe logic |
 | `lib/metrics.rb` | Lightweight Prometheus-compatible counters/histograms |
 | `config.yaml.example` | Template config — reference for all valid keys |
@@ -58,6 +71,9 @@ No CI workflows. No linter, no formatter, no typechecker.
 - **Request deadline** — 600s overall limit across all provider fallback attempts.
 - **Connection lifecycle** — `PoolEntry` tracks creation time and last-used time. Connections evicted after 300s age or 60s idle.
 - **Prometheus metrics** at `/metrics` — request counts/durations, per-provider success/failure counters.
+- **Config hot-reload** — `ConfigWatcher` polls `config.yaml` mtime every 2s (configurable via `config_poll_interval`). Also supports `kill -USR1 <pid>` for manual reload. Invalid config on reload is skipped (keeps last good config, logs errors).
+- **`ConfigStore`** replaces frozen constants — all config reads go through thread-safe accessors (`ConfigStore.providers`, `ConfigStore.model(name)`, `ConfigStore.selector(name)`, etc.). Selector state (circuit breaker, metrics) is preserved across reloads when provider lists match.
+- **`ConfigWatcher.expecting_write!`** — `ProviderSelector` calls this before writing `config.yaml` so the watcher ignores its own write.
 
 ## Gotchas
 

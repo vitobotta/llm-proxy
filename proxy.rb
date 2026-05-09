@@ -12,102 +12,57 @@ require_relative "lib/streaming"
 require_relative "lib/http_support"
 require_relative "lib/notifier"
 require_relative "lib/config_validator"
+require_relative "lib/config_store"
+require_relative "lib/config_watcher"
 require_relative "lib/probe_manager"
 require_relative "lib/request_handler"
 require_relative "lib/metrics"
 require_relative "provider_selector"
 
-CONFIG = YAML.unsafe_load_file(File.join(__dir__, "config.yaml"))
-CONFIG.freeze
+CONFIG_PATH = File.join(__dir__, "config.yaml")
+RAW_CONFIG = YAML.unsafe_load_file(CONFIG_PATH)
+
+BOOT_LOGGER = Logger.new($stdout)
+LOG_LEVELS = {
+  "debug" => Logger::DEBUG,
+  "info"  => Logger::INFO,
+  "warn"  => Logger::WARN,
+  "error" => Logger::ERROR
+}.freeze
+BOOT_LOGGER.level = LOG_LEVELS.fetch(RAW_CONFIG.dig("logging", "level"), Logger::INFO)
+
+if RAW_CONFIG.dig("logging", "format") == "json"
+  BOOT_LOGGER.formatter = proc do |severity, datetime, _progname, msg|
+    { timestamp: datetime.iso8601, level: severity, message: msg }.to_json + "\n"
+  end
+else
+  BOOT_LOGGER.formatter = proc do |severity, datetime, _progname, msg|
+    "[#{datetime.iso8601}] #{severity}: #{msg}\n"
+  end
+end
 
 class LLMProxy < Sinatra::Base
   helpers Streaming
   helpers HTTPSupport
   helpers RequestHandler
 
-  LOG_LEVELS = {
-    "debug" => Logger::DEBUG,
-    "info"  => Logger::INFO,
-    "warn"  => Logger::WARN,
-    "error" => Logger::ERROR
-  }.freeze
+  set :logger, BOOT_LOGGER
 
-  logger = Logger.new($stdout)
-  logger.level = LOG_LEVELS.fetch(CONFIG.dig("logging", "level"), Logger::INFO)
+  ConfigStore.load!(RAW_CONFIG, logger: BOOT_LOGGER)
 
-  if CONFIG.dig("logging", "format") == "json"
-    logger.formatter = proc do |severity, datetime, _progname, msg|
-      { timestamp: datetime.iso8601, level: severity, message: msg }.to_json + "\n"
-    end
-  else
-    logger.formatter = proc do |severity, datetime, _progname, msg|
-      "[#{datetime.iso8601}] #{severity}: #{msg}\n"
-    end
-  end
-  set :logger, logger
-
-  PROVIDERS = (CONFIG["providers"] || {}).transform_values(&:freeze).freeze
-
-  ConfigValidator.validate!(CONFIG, logger)
-
-  def self.resolve_provider(provider_name, model_id, model_headers = nil)
-    provider = PROVIDERS[provider_name]
-    raise "Unknown provider '#{provider_name}'" unless provider
-
-    {
-      "provider" => provider_name,
-      "base_url" => provider["base_url"],
-      "api_key"  => provider["api_key"],
-      "model"    => model_id,
-      "headers"  => provider["headers"]&.merge(model_headers || {}) || model_headers || {}
-    }.freeze
-  end
-
-  PROBING_ENABLED = CONFIG.dig("performance", "probing_enabled") != false
-
-  AUTO_SWITCH = PROBING_ENABLED && CONFIG.dig("performance", "auto_switch") == true
-
-  PROBE_INTERVAL = CONFIG.dig("performance", "probe_interval") || 3
-
-  SAMPLE_WINDOW = CONFIG.dig("performance", "sample_window") || ProviderSelector::DEFAULT_SAMPLE_WINDOW
-
-  MODELS = {}
-  SELECTORS = {}
-
-  CONFIG["models"].each do |m|
-    provider_list = m["providers"].map { |p| resolve_provider(p["provider"], p["model"], p["headers"]) }
-    model_entry = { "name" => m["name"], "providers" => provider_list.freeze, "context_length" => m["context_length"] }.compact.freeze
-    MODELS[m["name"]] = model_entry
-    SELECTORS[m["name"]] = ProviderSelector.new(m["name"], provider_list, model_config: m, sample_window: SAMPLE_WINDOW)
-  end
-
-  MODELS.freeze
-  SELECTORS.freeze
-
-  set :max_attempts, CONFIG.dig("retries", "max_attempts") || 3
-  set :backoff_base, CONFIG.dig("retries", "backoff_base") || 2
-
-  TIMEOUTS = {
-    open:  CONFIG.dig("timeouts", "open")  || 30,
-    read:  CONFIG.dig("timeouts", "read")  || 300,
-    write: CONFIG.dig("timeouts", "write") || 60
-  }.freeze
-
-  TRACKING_ENABLED = CONFIG.dig("tracking", "enabled") != false
-
-  AUTH_TOKEN = CONFIG.dig("auth", "token")
-
-  MAX_BODY_SIZE = CONFIG.dig("limits", "max_request_body") || 10 * 1024 * 1024
+  set :max_attempts, ConfigStore.max_attempts
+  set :backoff_base, ConfigStore.backoff_base
 
   before do
     @request_id = SecureRandom.uuid[0..7]
     @request_start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
     settings.logger.info("[#{@request_id}] #{request.request_method} #{request.path}")
 
-    if AUTH_TOKEN
+    auth_token = ConfigStore.auth_token
+    if auth_token
       auth_header = request.env["HTTP_AUTHORIZATION"].to_s
       token = auth_header.start_with?("Bearer ") ? auth_header[7..] : auth_header
-      unless token && token == AUTH_TOKEN
+      unless token && token == auth_token
         halt json_error(status: 401, message: "Unauthorized", type: "authentication_error")
       end
     end
@@ -128,16 +83,17 @@ class LLMProxy < Sinatra::Base
   end
 
   def parse_request(allowed_headers: ["Authorization", "OpenAI-Organization", "OpenAI-Beta"])
+    max_body_size = ConfigStore.max_body_size
     body_raw = request.body.read
-    if body_raw.bytesize > MAX_BODY_SIZE
-      halt json_error(status: 413, message: "Request body too large (max #{MAX_BODY_SIZE / 1024 / 1024}MB)", type: "request_too_large")
+    if body_raw.bytesize > max_body_size
+      halt json_error(status: 413, message: "Request body too large (max #{max_body_size / 1024 / 1024}MB)", type: "request_too_large")
     end
     body = JSON.parse(body_raw)
 
     model_name = body["model"]
     halt json_error(status: 400, message: "Missing 'model' in request body", type: "invalid_request") unless model_name
 
-    model = MODELS[model_name]
+    model = ConfigStore.model(model_name)
     halt json_error(status: 404, message: "Model '#{model_name}' not found in configuration", type: "model_not_found") unless model
 
     incoming_headers = {}
@@ -188,7 +144,7 @@ class LLMProxy < Sinatra::Base
   get "/health" do
     content_type :json
     provider_status = {}
-    SELECTORS.each do |name, selector|
+    ConfigStore.selectors.each do |name, selector|
       metrics = selector.active_metrics
       provider_status[name] = {
         active_provider: selector.active_provider_name,
@@ -196,7 +152,7 @@ class LLMProxy < Sinatra::Base
         providers: selector.provider_stats
       }
     end
-    { status: "ok", models: MODELS.keys, providers: provider_status, timestamp: Time.now.iso8601 }.to_json
+    { status: "ok", models: ConfigStore.models.keys, providers: provider_status, timestamp: Time.now.iso8601 }.to_json
   end
 
   get "/metrics" do
@@ -206,15 +162,16 @@ class LLMProxy < Sinatra::Base
 
   get "/v1/models" do
     content_type :json
+    models = ConfigStore.models
     {
       object: "list",
-      data: MODELS.keys.map { |name| { id: name, object: "model", owned_by: "proxy", context_length: MODELS[name]["context_length"] }.compact }
+      data: models.keys.map { |name| { id: name, object: "model", owned_by: "proxy", context_length: models[name]["context_length"] }.compact }
     }.to_json
   end
 
   get "/v1/models/:name" do
     content_type :json
-    model = MODELS[params[:name]]
+    model = ConfigStore.model(params[:name])
     halt json_error(status: 404, message: "Model '#{params[:name]}' not found", type: "model_not_found") unless model
 
     {
@@ -234,7 +191,10 @@ class LLMProxy < Sinatra::Base
   end
 end
 
-HTTPSupport.prewarm_connections!(CONFIG, LLMProxy::PROVIDERS, LLMProxy.settings.logger, timeouts: LLMProxy::TIMEOUTS)
-HTTPSupport.setup_graceful_shutdown!(LLMProxy.settings.logger, LLMProxy::SELECTORS)
+HTTPSupport.prewarm_connections!(ConfigStore.config, ConfigStore.providers, LLMProxy.settings.logger, timeouts: ConfigStore.timeouts)
+HTTPSupport.setup_graceful_shutdown!(LLMProxy.settings.logger, ConfigStore.selectors)
+
+poll_interval = RAW_CONFIG.dig("performance", "config_poll_interval") || 2
+ConfigWatcher.start!(logger: LLMProxy.settings.logger, poll_interval: poll_interval) if poll_interval > 0
 
 LLMProxy.run! if __FILE__ == $PROGRAM_NAME

@@ -2,9 +2,9 @@
 
 module RequestHandler
   def with_auto_select(model:, model_name:, path:, body:, headers:)
-    selector = self.class::SELECTORS[model_name]
+    selector = ConfigStore.selector(model_name)
 
-    providers = self.class::PROBING_ENABLED ? selector.ordered_providers : selector.providers
+    providers = ConfigStore.probing_enabled ? selector.ordered_providers : selector.providers
 
     deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + REQUEST_DEADLINE
 
@@ -21,7 +21,7 @@ module RequestHandler
       log_prefix = "[#{@request_id}/#{model_name}/#{p_name}]"
       result = yield(provider_config, path, body, p_model, headers, log_prefix)
       if result&.dig(:success)
-        record_metrics(selector, p_name, result) if self.class::PROBING_ENABLED
+        record_metrics(selector, p_name, result) if ConfigStore.probing_enabled
         selector.record_success(p_name)
         Metrics.increment(:provider_success, labels: { provider: p_name, model: model_name })
         Notifier.notify("LLM Proxy Fallback", "#{model_name} \u2192 #{p_name}") if i > 0
@@ -32,8 +32,8 @@ module RequestHandler
       end
     end
 
-    if self.class::PROBING_ENABLED && selector.record_and_maybe_probe(self.class::PROBE_INTERVAL)
-      ProbeManager.launch(selector, model_name, path, headers, timeouts: self.class::TIMEOUTS, auto_switch: self.class::AUTO_SWITCH, logger: settings.logger)
+    if ConfigStore.probing_enabled && selector.record_and_maybe_probe(ConfigStore.probe_interval)
+      ProbeManager.launch(selector, model_name, path, headers, timeouts: ConfigStore.timeouts, auto_switch: ConfigStore.auto_switch, logger: settings.logger)
     end
 
     result || { success: false, error: "All providers failed" }
@@ -50,13 +50,14 @@ module RequestHandler
     uri, request = HTTPSupport.build_upstream_request(provider_config, path, body, body_model, incoming_headers, stream: true)
 
     try_with_retries(log_prefix: log_prefix, body_model: body_model) do
-      http = HTTPSupport.create_http(uri, timeouts: self.class::TIMEOUTS)
+      http = HTTPSupport.create_http(uri, timeouts: ConfigStore.timeouts)
       http.start unless http.started?
 
       timers = Streaming::TimerTracker.new
       usage_data = nil
       stream_result = nil
-      accumulated = self.class::TRACKING_ENABLED ? +"" : nil
+      tracking = ConfigStore.tracking_enabled
+      accumulated = tracking ? +"" : nil
 
       http.request(request) do |response|
         if response.is_a?(Net::HTTPSuccess)
@@ -67,7 +68,7 @@ module RequestHandler
               raise HTTPSupport::ClientDisconnected
             end
 
-            if self.class::TRACKING_ENABLED
+            if tracking
               if accumulated
                 accumulated << chunk
                 if accumulated.bytesize > MAX_ACCUMULATED_SIZE
@@ -84,7 +85,7 @@ module RequestHandler
             end
           end
 
-          if self.class::TRACKING_ENABLED
+          if tracking
             unless usage_data
               fallback = Streaming.parse_chunk(accumulated.to_s) if accumulated
               usage_data = fallback.usage if fallback&.usage
@@ -119,7 +120,7 @@ module RequestHandler
     uri, request = HTTPSupport.build_upstream_request(provider_config, path, body, body_model, incoming_headers, stream: false)
 
     try_with_retries(log_prefix: log_prefix, body_model: body_model) do
-      http = HTTPSupport.create_http(uri, timeouts: self.class::TIMEOUTS)
+      http = HTTPSupport.create_http(uri, timeouts: ConfigStore.timeouts)
       http.start unless http.started?
       response = http.request(request)
 
