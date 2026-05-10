@@ -28,3 +28,4 @@ Gemfile.lock
 
 # OS
 .DS_Store
+.opencode
