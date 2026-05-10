@@ -33,7 +33,6 @@ docker compose up -d --build
 | `lib/streaming.rb` | SSE chunk parser, `TimerTracker` class, token counting, TPS computation |
 | `lib/http_support.rb` | HTTP connection pooling (`PoolEntry` with age/idle tracking), retry logic, graceful shutdown |
 | `lib/request_handler.rb` | Sinatra helper: `with_auto_select`, `try_stream`, `try_single_request`, deadline enforcement |
-| `lib/notifier.rb` | macOS desktop notifications via osascript |
 | `lib/config_validator.rb` | Config validation (errors abort on boot, return errors on reload) |
 | `lib/config_store.rb` | Thread-safe mutable config store — replaces frozen constants, supports hot-reload |
 | `lib/config_watcher.rb` | Polls config.yaml mtime + SIGUSR1 handler, triggers `ConfigStore.reload!` |
@@ -77,7 +76,7 @@ docker compose up -d --build
 ### Observability
 
 - **Prometheus metrics** at `/metrics` — request counts/durations, per-provider success/failure counters.
-- **macOS notifications** — `MACOS` constant enables `osascript` desktop notifications on provider fallback. Harmless no-op on Linux.
+
 
 ### Config hot-reload
 
@@ -93,7 +92,6 @@ docker compose up -d --build
 - **Auth strategy varies by provider** — most use `Authorization: Bearer`, but Anthropic uses `x-api-key`. See `HTTPSupport::AUTH_STRATEGIES`.
 - **`PROTECTED_HEADERS`** (host, authorization, x-api-key, api-key) are stripped from incoming requests before forwarding upstream.
 - **Docker binds port 9234**, not 4567.
-- **`MACOS` constant** enables `osascript` desktop notifications on provider fallback. Harmless no-op on Linux.
 - **`context_length` is optional** per model — only validated if present (must be positive integer).
 - **Background probing** uses a fixed `PROBE_BODY` ("Write a brief paragraph about the weather", max_tokens: 100) and skips providers already being probed.
 - **Incoming auth** optional via `auth.token` in config — clients must send `Authorization: Bearer <token>`.

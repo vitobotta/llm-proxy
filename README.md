@@ -67,7 +67,6 @@ Every incoming request follows this path:
 
 - **Per-request streaming stats** — TTFT, content/thinking token counts, and tokens-per-second logged for every streaming response
 - **Prometheus `/metrics`** — request counts/durations and per-provider success/failure counters in Prometheus-compatible format
-- **macOS desktop notifications** — get alerted when the proxy falls back to an alternative provider
 
 ### Operations
 

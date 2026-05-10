@@ -29,7 +29,6 @@ module RequestHandler
         record_metrics(selector, p_name, result) if probing
         selector.record_success(p_name)
         Metrics.increment(:provider_success, labels: { provider: p_name, model: model_name })
-        Notifier.notify("LLM Proxy Fallback", "#{model_name} \u2192 #{p_name}") if i > 0
         break
       else
         selector.record_failure(p_name)
