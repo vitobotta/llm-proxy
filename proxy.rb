@@ -19,7 +19,7 @@ require_relative "lib/request_handler"
 require_relative "lib/metrics"
 require_relative "provider_selector"
 
-CONFIG_PATH = File.join(__dir__, "config.yaml")
+CONFIG_PATH = ENV.fetch("CONFIG_FILE", File.join(__dir__, "config", "config.yaml"))
 RAW_CONFIG = YAML.unsafe_load_file(CONFIG_PATH)
 
 BOOT_LOGGER = Logger.new($stdout)

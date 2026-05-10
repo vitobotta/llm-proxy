@@ -1,5 +1,5 @@
 # Config with API keys
-config.yaml
+config/config.yaml
 
 # Ruby
 *.gem

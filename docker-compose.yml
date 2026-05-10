@@ -4,8 +4,9 @@ services:
     ports:
       - "9234:4567"
     volumes:
-      # Mount config from host - edit config.yaml locally
-      - ./config.yaml:/app/config.yaml
+      # Mount as directory, not single file — avoids inode breakage on atomic writes
+      - ./config:/app/config
     restart: unless-stopped
     environment:
       - RUBY_ENV=production
+      - CONFIG_FILE=/app/config/config.yaml

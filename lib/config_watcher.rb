@@ -1,18 +1,20 @@
 # frozen_string_literal: true
 
+require "digest"
+
 module ConfigWatcher
-  CONFIG_PATH = File.join(File.dirname(__dir__), "config.yaml")
   DEFAULT_POLL_INTERVAL = 2
 
   @lock = Mutex.new
-  @last_mtime = nil
-  @expected_mtime = nil
+  @last_hash = nil
+  @expected_hash = nil
   @running = false
   @logger = nil
 
   def self.start!(logger:, poll_interval: DEFAULT_POLL_INTERVAL)
     @logger = logger
-    @last_mtime = File.mtime(CONFIG_PATH)
+    @last_hash = file_hash
+    @running = true
     @running = true
 
     Thread.new do
@@ -42,25 +44,31 @@ module ConfigWatcher
 
   def self.expecting_write!
     @lock.synchronize do
-      @expected_mtime = File.mtime(CONFIG_PATH)
+      @expected_hash = file_hash
     end
   end
 
   private
 
+  def self.file_hash
+    Digest::SHA256.file(ConfigStore.config_path).hexdigest
+  rescue Errno::ENOENT
+    @last_hash
+  end
+
   def self.check_and_reload
-    current_mtime = File.mtime(CONFIG_PATH)
-    return if current_mtime == @last_mtime
+    current_hash = file_hash
+    return if current_hash == @last_hash
 
     @lock.synchronize do
-      if @expected_mtime && current_mtime == @expected_mtime
-        @last_mtime = current_mtime
-        @expected_mtime = nil
+      if @expected_hash && current_hash == @expected_hash
+        @last_hash = current_hash
+        @expected_hash = nil
         return
       end
     end
 
-    @last_mtime = current_mtime
+    @last_hash = current_hash
     trigger_reload("file change")
   end
 

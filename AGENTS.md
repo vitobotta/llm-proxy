@@ -5,7 +5,7 @@ Ruby (Sinatra + Puma) multi-provider LLM proxy. OpenAI-compatible API at `/v1/`.
 ## Start / Dev
 
 ```bash
-cp config.yaml.example config.yaml   # then edit with real keys
+cp config/config.yaml.example config/config.yaml   # then edit with real keys
 bundle install
 bundle exec puma -C puma.rb          # listens on :4567
 docker compose up -d                 # listens on :9234
@@ -50,10 +50,10 @@ curl -s http://localhost:9234/v1/models | python3 -m json.tool
 | `lib/notifier.rb` | macOS desktop notifications via osascript |
 | `lib/config_validator.rb` | Config validation (errors abort on boot, return errors on reload) |
 | `lib/config_store.rb` | Thread-safe mutable config store — replaces frozen constants, supports hot-reload |
-| `lib/config_watcher.rb` | Polls config.yaml mtime + SIGUSR1 handler, triggers `ConfigStore.reload!` |
+| `lib/config_watcher.rb` | Polls config content hash + SIGUSR1 handler, triggers `ConfigStore.reload!` |
 | `lib/probe_manager.rb` | Background probe logic |
 | `lib/metrics.rb` | Lightweight Prometheus-compatible counters/histograms |
-| `config.yaml.example` | Template config — reference for all valid keys |
+| `config/config.yaml.example` | Template config — reference for all valid keys |
 | `config.ru` | Rack entrypoint |
 | `puma.rb` | Puma config (threads 1–16, single worker, I/O-bound tuned) |
 
@@ -62,7 +62,7 @@ curl -s http://localhost:9234/v1/models | python3 -m json.tool
 - **Streaming is the default** — `stream: false` must be explicit in the request body. The `stream_requested` var is `true` unless body has `"stream": false`.
 - **Provider auto-selection** happens per-request via `ProviderSelector#ordered_providers`. Active provider is first; others sorted by score. Circuit-broken providers are skipped.
 - **Circuit breaker** — 3 consecutive failures opens a provider's circuit for 60s. Success resets it.
-- **`ProviderSelector` mutates `config.yaml`** — when auto-switch fires, it writes `primary: true` back to the file. This is by design, not a side effect to "fix".
+- **`ProviderSelector` mutates `config/config.yaml`** — when auto-switch fires, it writes `primary: true` back to the file. This is by design, not a side effect to "fix".
 - **Pre-warm** runs at boot: `HTTPSupport.prewarm_connections!` opens and keeps HTTP connections alive.
 - **Graceful shutdown** registered via `HTTPSupport.setup_graceful_shutdown!` — cleans connection pools on SIGINT/SIGTERM.
 - **No JSON parse for chunk tracking** — `Streaming.parse_chunk` uses fast string matching (`include?`) on SSE data lines to detect thinking/content/usage. Only the `usage` block gets `JSON.parse`. When `tracking.enabled: false`, all chunk parsing is skipped entirely.
@@ -71,14 +71,15 @@ curl -s http://localhost:9234/v1/models | python3 -m json.tool
 - **Request deadline** — 600s overall limit across all provider fallback attempts.
 - **Connection lifecycle** — `PoolEntry` tracks creation time and last-used time. Connections evicted after 300s age or 60s idle.
 - **Prometheus metrics** at `/metrics` — request counts/durations, per-provider success/failure counters.
-- **Config hot-reload** — `ConfigWatcher` polls `config.yaml` mtime every 2s (configurable via `config_poll_interval`). Also supports `kill -USR1 <pid>` for manual reload. Invalid config on reload is skipped (keeps last good config, logs errors).
+- **Config hot-reload** — `ConfigWatcher` polls config content hash every 2s (configurable via `config_poll_interval`). Also supports `kill -USR1 <pid>` for manual reload. Invalid config on reload is skipped (keeps last good config, logs errors). Config path is configurable via `CONFIG_FILE` env var (default: `config/config.yaml`).
 - **`ConfigStore`** replaces frozen constants — all config reads go through thread-safe accessors (`ConfigStore.providers`, `ConfigStore.model(name)`, `ConfigStore.selector(name)`, etc.). Selector state (circuit breaker, metrics) is preserved across reloads when provider lists match.
 - **Per-model probe/autoswitch overrides** — each model entry can set `probing_enabled`, `auto_switch`, and `probe_interval` to override the global `performance.*` values. When omitted, falls back to global defaults.
 - **`ConfigWatcher.expecting_write!`** — `ProviderSelector` calls this before writing `config.yaml` so the watcher ignores its own write.
+- **Docker mounts `config/` directory**, not the single file — avoids inode breakage when editors do atomic writes (write-to-temp → rename) on Linux.
 
 ## Gotchas
 
-- **`config.yaml` is gitignored and contains real API keys** — never read it into context or echo it.
+- **`config/config.yaml` is gitignored and contains real API keys** — never read it into context or echo it.
 - **`Gemfile.lock` is gitignored** — this is a library-style repo. Run `bundle install` to generate it.
 - **`YAML.unsafe_load_file` is intentional** — not a security bug. Config contains only trusted local data.
 - **Auth strategy varies by provider** — most use `Authorization: Bearer`, but Anthropic uses `x-api-key`. See `HTTPSupport::AUTH_STRATEGIES`.

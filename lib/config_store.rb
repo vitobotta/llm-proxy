@@ -3,10 +3,11 @@
 require_relative "config_validator"
 
 module ConfigStore
-  CONFIG_PATH = File.join(File.dirname(__dir__), "config.yaml")
+  DEFAULT_CONFIG_PATH = File.join(File.dirname(__dir__), "config", "config.yaml")
 
   @lock = Mutex.new
   @data = {}
+  @config_path = ENV.fetch("CONFIG_FILE", DEFAULT_CONFIG_PATH)
 
   def self.load!(raw_config, logger:)
     new_data = build_data(raw_config, logger)
@@ -18,8 +19,10 @@ module ConfigStore
     self
   end
 
+  def self.config_path = @config_path
+
   def self.reload!(logger:)
-    raw = YAML.unsafe_load_file(CONFIG_PATH)
+    raw = YAML.unsafe_load_file(config_path)
     errors, warnings = ConfigValidator.validate(raw, logger)
     unless errors.empty?
       errors.each { |e| logger.error("Config reload error: #{e}") }
@@ -82,7 +85,7 @@ module ConfigStore
     models = {}
     selectors = {}
     raw["models"].each do |m|
-      provider_list = m["providers"].map { |p| resolve_provider(providers, p["provider"], p["model"], p["headers"]) }
+      provider_list = m["providers"].map { |p| resolve_provider(providers, p["provider"], p["model"], p["headers"], primary: p["primary"]) }
       m_probing = m.key?("probing_enabled") ? (m["probing_enabled"] != false) : probing_enabled
       m_auto_switch = m_probing && (m.key?("auto_switch") ? m["auto_switch"] == true : auto_switch)
       m_probe_interval = m["probe_interval"] || probe_interval
@@ -123,10 +126,12 @@ module ConfigStore
   def self.merge_selectors!(old_data, new_data)
     old_selectors = old_data[:selectors] || {}
     new_selectors = new_data[:selectors]
+    new_models = new_data[:models]
     new_selectors.each do |model_name, new_sel|
       old_sel = old_selectors[model_name]
       next unless old_sel
       next unless provider_lists_match?(old_sel.providers, new_sel.providers)
+      old_sel.realign_active_index!(new_models[model_name])
       new_selectors[model_name] = old_sel
     end
     new_data[:selectors] = new_selectors
@@ -142,7 +147,7 @@ module ConfigStore
     end
   end
 
-  def self.resolve_provider(providers, provider_name, model_id, model_headers = nil)
+  def self.resolve_provider(providers, provider_name, model_id, model_headers = nil, primary: nil)
     provider = providers[provider_name]
     raise "Unknown provider '#{provider_name}'" unless provider
 
@@ -151,8 +156,9 @@ module ConfigStore
       "base_url" => provider["base_url"],
       "api_key"  => provider["api_key"],
       "model"    => model_id,
-      "headers"  => provider["headers"]&.merge(model_headers || {}) || model_headers || {}
-    }.freeze
+      "headers"  => provider["headers"]&.merge(model_headers || {}) || model_headers || {},
+      "primary"  => primary
+    }.compact.freeze
   end
 
   def self.update_logger_level!(raw, logger)

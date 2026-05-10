@@ -17,12 +17,15 @@ class ProviderSelector
 
   attr_reader :providers
 
-  CONFIG_PATH = File.join(__dir__, "config.yaml")
   CONFIG_LOCK = Mutex.new
+
+  def self.config_path
+    defined?(ConfigStore) ? ConfigStore.config_path : File.join(__dir__, "config", "config.yaml")
+  end
 
   def self.persist_active_provider(model_name, provider_index)
     CONFIG_LOCK.synchronize do
-      raw = YAML.unsafe_load_file(CONFIG_PATH)
+      raw = YAML.unsafe_load_file(config_path)
       model_entry = raw["models"].find { |m| m["name"] == model_name }
       return unless model_entry && model_entry["providers"]
 
@@ -30,7 +33,7 @@ class ProviderSelector
       model_entry["providers"][provider_index]["primary"] = true
 
       ConfigWatcher.expecting_write! if defined?(ConfigWatcher)
-      File.write(CONFIG_PATH, YAML.dump(raw))
+      File.write(config_path, YAML.dump(raw))
     end
   rescue => e
     nil
@@ -169,6 +172,16 @@ class ProviderSelector
       return unless circuit
       circuit.failures = 0
       circuit.opened_at = nil
+    end
+  end
+
+  def realign_active_index!(model_config)
+    new_idx = find_initial_active_index(model_config)
+    @lock.synchronize do
+      if new_idx != @active_index
+        @active_index = new_idx
+        @cached_ordered = nil
+      end
     end
   end
 
