@@ -1,23 +1,27 @@
 # LLM Proxy
 
-Ruby-based multi-provider LLM proxy with automatic provider selection, streaming, and fallback.
+Multi-provider LLM proxy that picks the fastest provider, retries on failure, and streams tokens in real time.
 
-## Features
+Drop-in OpenAI-compatible API. Configure once, let the proxy handle provider selection, circuit breaking, and fallback.
 
-- **OpenAI-compatible API** — drop-in replacement for `chat/completions`, `completions`, `embeddings`, and model list endpoints
-- **Auto provider selection** — scores providers by TTFT and TPS, switches to best after every N requests
-- **Per-model multi-provider routing** — each model lists multiple backend providers; proxy picks fastest, falls back on failure
-- **Streaming with TPS stats** — SSE output with per-request TTFT, content/thinking token counts, and throughput
-- **Automatic retry** — configurable max attempts with exponential backoff, EOF stale-connection recovery (no-harm retries), timeout retries
-- **Graceful fallback** — on primary failure, tries other providers in score order
-- **Zero-overhead passthrough** — disable tracking to skip all chunk parsing and JSON inspection
-- **Persistent selection** — chosen provider is written back to `config.yaml` as `primary: true`
-- **Connection pooling** — `Net::HTTP` connections cached per thread per `scheme://host:port`
-- **Pre-warm at boot** — background connections to all providers so first request skips handshake
-- **Graceful shutdown** — SIGINT/SIGTERM handler cleans up pooled connections
-- **JSON or text logging**
+## Why LLM Proxy?
 
-## Architecture
+Open-source models have changed the game — powerful LLMs are now available from dozens of providers at a fraction of the cost of closed-model APIs. But there's a catch: most of these providers are smaller companies. None of them offer the uptime or consistent inference speeds of the big incumbents. One goes down for maintenance, another starts rate-limiting at peak hours, a third is fast today but crawling tomorrow.
+
+The cost isn't the problem — these providers are cheap. The problem is **orchestration**: how do you use several of them together so that downtime on one doesn't take down your app? How do you know which one is fastest *right now*?
+
+LLM Proxy automates this. You list multiple providers for each model, and the proxy routes your requests to whichever one is performing best at that moment. If a provider goes down, it falls back to the next one — transparently, so your app keeps working. In most cases you won't notice individual provider outages unless *all* your configured providers for a model happen to be down at the same time.
+
+## How It Works
+
+Every incoming request follows this path:
+
+1. **Route** — the proxy matches the requested model name to your config
+2. **Select** — `ProviderSelector` picks the best provider: the active primary, or the highest-scoring alternative if the primary's circuit breaker is open
+3. **Stream** — the request is forwarded to the chosen provider; the response streams back to the client in real time (SSE)
+4. **Measure** — TTFT, token counts, and tokens-per-second are recorded per-request
+5. **Auto-switch** — a background probe periodically compares providers on real TTFT/TPS data; if a non-primary provider consistently outperforms the active one, the proxy switches and persists the change to your config
+6. **Fallback** — if the chosen provider fails, the proxy tries the next-best provider in score order, with retry and backoff
 
 ```
 ┌──────────────┐
@@ -38,14 +42,57 @@ Ruby-based multi-provider LLM proxy with automatic provider selection, streaming
  Prov A  Prov B  Prov C  Prov D
 ```
 
+## Key Capabilities
+
+### Smart Routing
+
+- Scores providers by real **TTFT** (time to first token) and **TPS** (tokens per second) — not guesswork
+- **Auto-switches** to the fastest provider after background probes compare performance
+- **Circuit breaker** opens after 3 consecutive failures on a provider (60s cooldown), so bad providers are skipped until they recover
+
+### Resilience
+
+- **Exponential backoff** retry — configurable max attempts with `2^n` second delays
+- **Stale-connection recovery** — `EOFError` from idle connections gets 2 free retries that don't count against your attempt limit
+- **429 Retry-After** — rate-limited responses trigger a non-blocking retry after the provider's specified delay (capped at 60s)
+- **Request deadline** — 600s overall limit across all provider fallback attempts, so a cascade of slow providers can't hang your request forever
+
+### Performance
+
+- **Connection pooling** — `Net::HTTP` connections cached per thread per `scheme://host:port`; evicted after 300s age or 60s idle
+- **Boot-time pre-warm** — background connections opened to all providers at startup, so the first real request skips the TCP/TLS handshake
+- **Zero-overhead passthrough** — set `tracking.enabled: false` to skip all chunk parsing; raw bytes pass straight through with negligible CPU cost
+
+### Observability
+
+- **Per-request streaming stats** — TTFT, content/thinking token counts, and tokens-per-second logged for every streaming response
+- **Prometheus `/metrics`** — request counts/durations and per-provider success/failure counters in Prometheus-compatible format
+- **macOS desktop notifications** — get alerted when the proxy falls back to an alternative provider
+
+### Operations
+
+- **Config hot-reload** — edit `config.yaml` and the proxy picks up changes within seconds (polls every 2s); or send `kill -USR1 <pid>` for an instant reload
+- **Docker with live config** — mount `config/` from the host; edits apply without rebuild or restart
+- **Health check** — `GET /health` returns model list and timestamp for load balancers and monitors
+- **Optional incoming auth** — set `auth.token` in config to require `Authorization: Bearer <token>` on all requests
+
+## Use Cases
+
+**Multi-provider redundancy** — The same open-source model is available via 3 providers. One goes down for maintenance? The proxy falls back to the next. Your app never notices.
+
+**Speed optimisation** — Provider A is fast right now but slows at peak hours. The proxy measures real performance and auto-switches to Provider B when it's faster.
+
+**Zero-downtime migration** — Adding a new provider? Add it to config — the proxy hot-reloads. Removing one? Delete it. No restart needed.
+
+**Single endpoint for all models** — Front all your LLM calls through one URL. Swap providers, add models, change routing — all without touching client code.
+
 ## Quick Start
 
 ### Local
 
 ```bash
 bundle install
-cp config.yaml.example config.yaml
-vim config.yaml
+cp config/config.yaml.example config/config.yaml    # then edit with real keys
 bundle exec puma -C puma.rb
 ```
 
@@ -54,14 +101,13 @@ Exposes `http://localhost:4567`.
 ### Docker Compose
 
 ```bash
-cp config.yaml.example config.yaml
-vim config.yaml
+cp config/config.yaml.example config/config.yaml     # then edit with real keys
 docker compose up -d
 ```
 
 Exposes `http://localhost:9234`.
 
-Config is mounted from host (`./config.yaml:/app/config.yaml`) so edits apply without rebuild. To rebuild after code changes:
+Config is mounted from host (`./config/:/app/config/`) so edits apply without rebuild. To rebuild after code changes:
 
 ```bash
 docker compose up -d --build
@@ -92,7 +138,7 @@ Provider auth strategies:
 
 ### Models
 
-Each model lists one or more providers. Optional `primary: true` on a provider sets the initial active choice. The proxy updates this field when it switches.
+Each model lists one or more providers. Optional `primary: true` on a provider sets the initial active choice. The proxy updates this field when it auto-switches.
 
 ```yaml
 models:
@@ -113,6 +159,8 @@ Provider entry can also override/extend headers:
         headers:
           HTTP-Referer: "https://example.com"
 ```
+
+Per-model overrides — each model entry can set `probing_enabled`, `auto_switch`, and `probe_interval` to override the global `performance.*` values. When omitted, falls back to global defaults.
 
 ### Timeouts
 
@@ -163,6 +211,16 @@ performance:
   auto_switch: false          # auto-switch active provider when better one found (requires probing_enabled)
   probe_interval: 3           # run background probe every N requests
   sample_window: 300          # seconds to keep probe/metrics samples for scoring (default: 300 = 5 min)
+  config_poll_interval: 2     # seconds between config.yaml change checks (set 0 to disable hot-reload)
+```
+
+### Authentication (optional)
+
+Require an auth token on incoming requests:
+
+```yaml
+auth:
+  token: "your-secret-token"   # Clients must send Authorization: Bearer <token>
 ```
 
 ## Environment Variables
@@ -187,6 +245,7 @@ For high-concurrency I/O-bound workloads, raise `PUMA_MAX_THREADS` to `16–32` 
 | `/v1/models` | GET | List configured models |
 | `/v1/models/:name` | GET | Model details with provider routing |
 | `/health` | GET | Health check with models list and timestamp |
+| `/metrics` | GET | Prometheus-compatible metrics |
 
 ## Usage
 
@@ -225,7 +284,7 @@ services:
     ports:
       - "9234:4567"
     volumes:
-      - ./config.yaml:/app/config.yaml
+      - ./config/:/app/config/
     restart: unless-stopped
     environment:
       - RUBY_ENV=production
@@ -233,7 +292,7 @@ services:
 
 Editable fields:
 - `ports` — change left side to remap host port.
-- `volumes` — mount your `config.yaml` from host.
+- `volumes` — mount your `config/` directory from host.
 - `environment` — add any env vars from the table above (e.g. `PUMA_MAX_THREADS=32`).
 
 ---
