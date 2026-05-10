@@ -170,12 +170,16 @@ module HTTPSupport
         Thread.new do
           cleanup_all_connections!
           selectors.each { |_, s| s.persist_active_index }
+          StatePersistence.save(logger: logger) if defined?(StatePersistence)
           exit(0)
         end
       end
     end
 
-    at_exit { cleanup_all_connections! }
+    at_exit do
+      cleanup_all_connections!
+      StatePersistence.save(logger: logger) if defined?(StatePersistence) && !$ERROR_INFO.is_a?(SystemExit)
+    end
   end
 
   def backoff(attempt)

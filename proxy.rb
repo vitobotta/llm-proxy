@@ -13,6 +13,7 @@ require_relative "lib/http_support"
 require_relative "lib/config_validator"
 require_relative "lib/config_store"
 require_relative "lib/config_watcher"
+require_relative "lib/state_persistence"
 require_relative "lib/probe_manager"
 require_relative "lib/request_handler"
 require_relative "lib/metrics"
@@ -48,6 +49,12 @@ class LLMProxy < Sinatra::Base
   set :logger, BOOT_LOGGER
 
   ConfigStore.load!(RAW_CONFIG, logger: BOOT_LOGGER)
+
+  begin
+    StatePersistence.restore!(logger: BOOT_LOGGER)
+  rescue => e
+    BOOT_LOGGER.warn("State restoration failed (starting fresh): #{e.class}: #{e.message}")
+  end
 
   set :max_attempts, ConfigStore.max_attempts
   set :backoff_base, ConfigStore.backoff_base

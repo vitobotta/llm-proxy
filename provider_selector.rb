@@ -96,7 +96,7 @@ class ProviderSelector
   def update_metrics(provider_name, ttft, tps)
     return unless ttft
     @lock.synchronize do
-      now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      now = Time.now.to_f
       samples = (@samples[provider_name] ||= [])
       prune_stale_samples!(samples, now)
       sample = { ttft: ttft.to_f, timestamp: now }
@@ -138,6 +138,7 @@ class ProviderSelector
           @cached_ordered = nil
           logger.info("[#{@model_name}] Switched to #{new_name} (avg_ttft=#{best_avg[:avg_ttft].round(3)}s, avg_tps=#{best_avg[:avg_tps].round(1)}, n=#{best_avg[:sample_count]}) from #{old_name} (avg_ttft=#{active_avg&.dig(:avg_ttft)&.round(3)}s, avg_tps=#{active_avg&.dig(:avg_tps)&.round(1)}, n=#{active_avg&.dig(:sample_count)})")
         end
+        StatePersistence.save(logger: logger) if defined?(StatePersistence)
       else
         logger.info("[#{@model_name}] Suggest switch to #{new_name} (avg_ttft=#{best_avg[:avg_ttft].round(3)}s, avg_tps=#{best_avg[:avg_tps].round(1)}, n=#{best_avg[:sample_count]}) from #{old_name} (avg_ttft=#{active_avg&.dig(:avg_ttft)&.round(3)}s, avg_tps=#{active_avg&.dig(:avg_tps)&.round(1)}, n=#{active_avg&.dig(:sample_count)})")
       end
@@ -156,7 +157,7 @@ class ProviderSelector
       return unless circuit
       circuit.failures += 1
       if circuit.failures >= @circuit_failure_threshold
-        circuit.opened_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        circuit.opened_at = Time.now.to_f
         @cached_ordered = nil
       end
     end
@@ -215,12 +216,87 @@ class ProviderSelector
     end
   end
 
+  def to_state
+    @lock.synchronize do
+      now = Time.now.to_f
+      {
+        active_provider: @providers[@active_index]["provider"],
+        samples: @samples.transform_values do |arr|
+          arr.map { |s| sample_to_hash(s) }
+        end,
+        circuits: @circuits.transform_values do |c|
+          { failures: c.failures, opened_at: c.opened_at }
+        end,
+        request_count: @request_count
+      }
+    end
+  end
+
+  def restore_state!(state)
+    @lock.synchronize do
+      now = Time.now.to_f
+      if state.key?("active_provider")
+        idx = @providers.index { |p| p["provider"] == state["active_provider"] }
+        if idx
+          @active_index = idx
+          @cached_ordered = nil
+        end
+      end
+
+      if state["samples"].is_a?(Hash)
+        state["samples"].each do |p_name, arr|
+          next unless arr.is_a?(Array)
+          next unless @circuits.key?(p_name)
+          restored = arr.filter_map { |h| hash_to_sample(h, now) }
+          @samples[p_name] = restored unless restored.empty?
+        end
+      end
+
+      if state["circuits"].is_a?(Hash)
+        state["circuits"].each do |p_name, c|
+          next unless c.is_a?(Hash)
+          next unless @circuits.key?(p_name)
+          circuit = @circuits[p_name]
+          circuit.failures = Integer(c["failures"]) rescue 0
+          opened_at = c["opened_at"]
+          if opened_at && now - opened_at.to_f > @circuit_cooldown
+            circuit.opened_at = nil
+            circuit.failures = 0
+          else
+            circuit.opened_at = opened_at ? opened_at.to_f : nil
+          end
+        end
+      end
+
+      if state["request_count"]
+        @request_count = Integer(state["request_count"]) rescue 0
+      end
+
+      @cached_ordered = nil
+    end
+  end
+
   private
+
+  def sample_to_hash(sample)
+    h = { "ttft" => sample[:ttft], "ts" => sample[:timestamp] }
+    h["tps"] = sample[:tps] if sample[:tps]
+    h
+  end
+
+  def hash_to_sample(hash, now)
+    return nil unless hash.is_a?(Hash) && hash["ttft"] && hash["ts"]
+    ts = hash["ts"].to_f
+    return nil if now - ts > @sample_window
+    sample = { ttft: hash["ttft"].to_f, timestamp: ts }
+    sample[:tps] = hash["tps"].to_f if hash["tps"]
+    sample
+  end
 
   def circuit_open?(provider_name)
     circuit = @circuits[provider_name]
     return false unless circuit&.opened_at
-    now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    now = Time.now.to_f
     if now - circuit.opened_at > @circuit_cooldown
       circuit.opened_at = nil
       circuit.failures = 0

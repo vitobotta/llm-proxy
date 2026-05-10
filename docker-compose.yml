@@ -6,6 +6,8 @@ services:
     volumes:
       # Mount as directory, not single file — avoids inode breakage on atomic writes
       - ./config:/app/config
+      # Persist provider state across container restarts
+      - ./data:/app/data
     restart: unless-stopped
     environment:
       - RUBY_ENV=production

@@ -1,6 +1,9 @@
 # Config with API keys
 config/config.yaml
 
+# Runtime state
+data/provider_state.json
+
 # Ruby
 *.gem
 *.rbc

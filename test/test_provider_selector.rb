@@ -151,10 +151,8 @@ class TestProviderSelector < Minitest::Test
 
     begin
       File.write(mock_path, YAML.dump(MOCK_CONFIG))
-      # Monkey-patch CONFIG_PATH temporarily
-      old_path = ProviderSelector.const_get(:CONFIG_PATH)
-      ProviderSelector.send(:remove_const, :CONFIG_PATH)
-      ProviderSelector.const_set(:CONFIG_PATH, mock_path)
+      old_method = ProviderSelector.method(:config_path)
+      ProviderSelector.define_singleton_method(:config_path) { mock_path }
 
       selector.persist_active_index
 
@@ -162,8 +160,7 @@ class TestProviderSelector < Minitest::Test
       model = raw["models"].find { |m| m["name"] == "test-model" }
       assert model["providers"][0]["primary"]
     ensure
-      ProviderSelector.send(:remove_const, :CONFIG_PATH) if ProviderSelector.const_defined?(:CONFIG_PATH)
-      ProviderSelector.const_set(:CONFIG_PATH, old_path)
+      ProviderSelector.define_singleton_method(:config_path, old_method)
       File.delete(mock_path) if File.exist?(mock_path)
     end
   end
