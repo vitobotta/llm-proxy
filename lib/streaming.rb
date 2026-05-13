@@ -109,7 +109,8 @@ module Streaming
   def self.extract_token_counts(usage_data)
     completion = usage_data.dig("completion_tokens") || usage_data.dig("output_tokens")
     thinking = usage_data.dig("completion_tokens_details", "reasoning_tokens") ||
-               usage_data.dig("output_tokens_details", "reasoning_tokens") || 0
+               usage_data.dig("output_tokens_details", "reasoning_tokens") ||
+               usage_data.dig("reasoning_tokens") || 0
     content = completion ? completion - thinking : nil
     { completion: completion, thinking: thinking, content: content }
   end
