@@ -1,6 +1,15 @@
 # Puma configuration for LLM Proxy
 # Optimized for I/O-bound proxy workload (waiting on upstream LLM providers)
 
+# Override Puma's default 10s write timeout — LLM streaming responses can take
+# minutes, and clients may briefly pause reading. The default causes
+# "Socket timeout writing data" errors on long-lived streaming connections.
+Puma::Const::WRITE_TIMEOUT = 300 unless Puma::Const::WRITE_TIMEOUT >= 300
+
+# Keep-alive timeout — LLM streaming connections stay open much longer than
+# typical web requests. Default is 20s which kills slow streaming responses.
+persistent_timeout 300
+
 # Thread pool settings
 # Min threads: keep some warm for quick response
 # Max threads: handle concurrent streaming requests

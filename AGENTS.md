@@ -54,7 +54,7 @@ curl -s http://localhost:9234/v1/models | python3 -m json.tool
 | `lib/metrics.rb` | Lightweight Prometheus-compatible counters/histograms |
 | `config/config.yaml.example` | Template config — reference for all valid keys |
 | `config.ru` | Rack entrypoint |
-| `puma.rb` | Puma config (threads 1–16, single worker, I/O-bound tuned) |
+| `puma.rb` | Puma config (threads 1–16, single worker, I/O-bound tuned, WRITE_TIMEOUT override) |
 
 ## Architecture notes
 
@@ -89,3 +89,4 @@ curl -s http://localhost:9234/v1/models | python3 -m json.tool
 - **Incoming auth** optional via `auth.token` in config — clients must send `Authorization: Bearer <token>`.
 - **`accumulated` string** is nil'd after usage data found OR after exceeding 512KB — always nil-check before use.
 - **`probing_enabled: false` disables auto_switch** — per-model `auto_switch` is forced false when `probing_enabled` is false, matching the global behaviour.
+- **Puma's `WRITE_TIMEOUT` is monkey-patched to 300s** — Puma's default 10s write timeout (`Puma::Const::WRITE_TIMEOUT`) kills long-lived streaming connections with "Socket timeout writing data". Overridden in `puma.rb` + `persistent_timeout 300`.
