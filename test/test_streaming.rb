@@ -93,38 +93,38 @@ class TestStreaming < Minitest::Test
   end
 
   def test_track_chunk_sets_thinking_timers
-    timers = { thinking_detected: false, content_detected: false }
+    timers = Streaming::TimerTracker.new
     now = 100.0
     cr = Streaming::ChunkResult.new(nil, true, false, false)
     track_chunk!(cr, now, timers)
 
-    assert_equal now, timers[:first_thinking]
-    assert_equal now, timers[:last_thinking]
-    assert_equal now, timers[:first_token]
-    assert timers[:thinking_detected]
+    assert_equal now, timers.first_thinking
+    assert_equal now, timers.last_thinking
+    assert_equal now, timers.first_token
+    assert timers.thinking_detected
   end
 
   def test_track_chunk_sets_content_timers
-    timers = { thinking_detected: false, content_detected: false }
+    timers = Streaming::TimerTracker.new
     now = 100.0
     cr = Streaming::ChunkResult.new(nil, false, true, false)
     track_chunk!(cr, now, timers)
 
-    assert_equal now, timers[:first_content]
-    assert_equal now, timers[:last_content]
-    assert_equal now, timers[:first_token]
-    assert timers[:content_detected]
+    assert_equal now, timers.first_content
+    assert_equal now, timers.last_content
+    assert_equal now, timers.first_token
+    assert timers.content_detected
   end
 
   def test_track_chunk_first_token_unchanged_on_subsequent_chunks
-    timers = { thinking_detected: false, content_detected: false }
+    timers = Streaming::TimerTracker.new
     cr_think = Streaming::ChunkResult.new(nil, true, false, false)
     track_chunk!(cr_think, 100.0, timers)
     cr_content = Streaming::ChunkResult.new(nil, false, true, false)
     track_chunk!(cr_content, 200.0, timers)
 
-    assert_equal 100.0, timers[:first_token]
-    assert_equal 200.0, timers[:last_content]
+    assert_equal 100.0, timers.first_token
+    assert_equal 200.0, timers.last_content
   end
 
   def test_extract_sse_content
@@ -132,5 +132,18 @@ class TestStreaming < Minitest::Test
     result = Streaming.extract_sse_content(accumulated)
     assert_equal 5, result[:content_len]
     assert_equal 8, result[:thinking_len]
+  end
+
+  def test_parse_chunk_ignores_empty_content_in_role_delta
+    chunk = 'data: {"choices":[{"delta":{"role":"assistant","content":""}}]}' + "\n\n"
+    cr = Streaming.parse_chunk(chunk)
+    refute cr.has_content, "empty content in role delta should not trigger content detection"
+  end
+
+  def test_parse_chunk_does_not_confuse_reasoning_content_as_content
+    chunk = 'data: {"choices":[{"delta":{"reasoning_content":"thinking..."}}]}' + "\n\n"
+    cr = Streaming.parse_chunk(chunk)
+    assert cr.has_thinking, "should detect thinking"
+    refute cr.has_content, "reasoning_content should not trigger content detection"
   end
 end

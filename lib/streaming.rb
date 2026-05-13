@@ -3,9 +3,16 @@
 require "json"
 
 module Streaming
-  THINKING_STRINGS = ['"reasoning_content"', '"thinking"', '"reasoning"'].freeze
-  CONTENT_STRINGS = ['"content"', '"text"'].freeze
-  TOOL_CALL_STRING = '"tool_calls"'
+  THINKING_PATTERNS = [
+    /[^a-zA-Z_]"reasoning_content"\s*:\s*"/,
+    /[^a-zA-Z_]"thinking"\s*:\s*"/,
+    /[^a-zA-Z_]"reasoning"\s*:\s*"/
+  ].freeze
+  CONTENT_PATTERNS = [
+    /[^a-zA-Z_]"content"\s*:\s*"[^"}]/,
+    /[^a-zA-Z_]"text"\s*:\s*"[^"}]/
+  ].freeze
+  TOOL_CALL_PATTERN = /[^a-zA-Z_]"tool_calls"\s*:\s*\[/
   USAGE_STRING = '"usage"'
 
   ChunkResult = Struct.new(:usage, :has_thinking, :has_content, :has_tool_call)
@@ -66,13 +73,13 @@ module Streaming
       end
     end
 
-    result.has_thinking = true if !result.has_thinking && THINKING_STRINGS.any? { |s| chunk.include?(s) }
+    result.has_thinking = true if !result.has_thinking && THINKING_PATTERNS.any? { |r| chunk.match?(r) }
 
-    if chunk.include?(TOOL_CALL_STRING)
+    if chunk.match?(TOOL_CALL_PATTERN)
       result.has_tool_call = true
       result.has_content = true
     elsif !result.has_content
-      result.has_content = true if CONTENT_STRINGS.any? { |s| chunk.include?(s) }
+      result.has_content = true if CONTENT_PATTERNS.any? { |r| chunk.match?(r) }
     end
 
     result
