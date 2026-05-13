@@ -9,7 +9,7 @@ module RequestHandler
     auto_switch = model_entry&.dig("auto_switch") == true
     probe_interval = model_entry&.dig("probe_interval") || ConfigStore.probe_interval
 
-    providers = probing ? selector.ordered_providers : selector.providers
+    providers = selector.ordered_providers
 
     deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + REQUEST_DEADLINE
 

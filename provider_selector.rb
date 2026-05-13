@@ -55,6 +55,7 @@ class ProviderSelector
     @circuits = providers.each_with_object({}) { |p, h| h[p["provider"]] = CircuitState.new(failures: 0, opened_at: nil) }
     @error_counts = providers.each_with_object({}) { |p, h| h[p["provider"]] = 0 }
     @total_requests = providers.each_with_object({}) { |p, h| h[p["provider"]] = 0 }
+    @model_config = model_config
   end
 
   def active_provider_name
@@ -146,6 +147,9 @@ class ProviderSelector
   end
 
   def persist_active_index
+    auto_switch = @lock.synchronize { @model_config&.dig("auto_switch") == true }
+    return unless auto_switch
+
     idx = @lock.synchronize { @active_index }
     self.class.persist_active_provider(@model_name, idx)
   end

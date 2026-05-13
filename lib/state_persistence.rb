@@ -59,6 +59,11 @@ module StatePersistence
       end
     end
 
+    ConfigStore.models.each do |model_name, model_config|
+      selector = selectors[model_name]
+      selector&.realign_active_index!(model_config)
+    end
+
     logger&.info("[StatePersistence] Restored state for #{restored} model(s) from #{state_file}")
   end
 
