@@ -173,6 +173,7 @@ module Streaming
       tokens = Streaming.extract_token_counts(usage_data)
       content_tps = Streaming.compute_tps(tokens[:content], tracker.first_content, tracker.last_content)
       thinking_tps = Streaming.compute_tps(tokens[:thinking], tracker.first_thinking, tracker.last_thinking)
+      total_tps = Streaming.compute_tps(tokens[:completion], tracker.first_token, tracker.last_any_token)
 
       log_parts = []
       log_parts << "content=#{tokens[:content]}" if tokens[:content]&.positive?
@@ -180,9 +181,10 @@ module Streaming
       log_parts << "ttft=#{ttft}s"
       log_parts << "content_tps=#{content_tps}" if content_tps&.positive?
       log_parts << "thinking_tps=#{thinking_tps}" if thinking_tps&.positive?
+      log_parts << "total_tps=#{total_tps}" if total_tps&.positive?
 
       settings.logger.info("#{log_prefix} Success | #{log_parts.join(' ')}")
-      { success: true, content_tokens: tokens[:content], thinking_tokens: tokens[:thinking], ttft: ttft, content_tps: content_tps, thinking_tps: thinking_tps }
+      { success: true, content_tokens: tokens[:content], thinking_tokens: tokens[:thinking], ttft: ttft, content_tps: content_tps, thinking_tps: thinking_tps, total_tps: total_tps }
     else
       settings.logger.info("#{log_prefix} Success | ttft=#{ttft}s (no usage data from provider)")
       { success: true, content_tokens: nil, thinking_tokens: nil, ttft: ttft, content_tps: nil, thinking_tps: nil }

@@ -68,10 +68,10 @@ module ProbeManager
       tokens = Streaming.extract_token_counts(result[:usage_data])
       completion_tokens = tokens[:completion] || 0
 
-      tps = Streaming.compute_tps(tokens[:content], result[:first_content_time], result[:last_content_time])
+      tps = Streaming.compute_tps(completion_tokens, result[:first_token_time], result[:last_any_token_time])
 
       if tps.nil?
-        tps = Streaming.compute_tps(completion_tokens, result[:first_token_time], result[:last_any_token_time])
+        tps = Streaming.compute_tps(tokens[:content], result[:first_content_time], result[:last_content_time])
       end
 
       if tps.nil? && result[:first_token_time]

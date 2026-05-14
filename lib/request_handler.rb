@@ -44,7 +44,8 @@ module RequestHandler
   end
 
   def record_metrics(selector, provider_name, result)
-    selector.update_metrics(provider_name, result[:ttft], result[:content_tps]) if result[:ttft]
+    tps = result[:total_tps] || result[:content_tps]
+    selector.update_metrics(provider_name, result[:ttft], tps) if result[:ttft]
   end
 
   MAX_ACCUMULATED_SIZE = 512 * 1024
