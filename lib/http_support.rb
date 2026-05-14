@@ -26,10 +26,6 @@ module HTTPSupport
   KEEP_ALIVE_TIMEOUT = 30
   MAX_UPSTREAM_BODY_SIZE = 5 * 1024 * 1024
   JITTER_FACTOR = 0.5
-  MAX_CONNECTION_AGE = 300
-  CONNECTION_IDLE_TIMEOUT = 60
-
-  PoolEntry = Struct.new(:http, :created_at, :last_used_at, keyword_init: true)
 
   SSE_HEADERS = {
     "Content-Type" => "text/event-stream",
@@ -42,9 +38,6 @@ module HTTPSupport
 
   URI_CACHE = {}
   URI_CACHE_LOCK = Mutex.new
-
-  ALL_CONNECTION_POOLS = []
-  ALL_POOLS_LOCK = Mutex.new
 
   AUTH_STRATEGIES = {
     "anthropic" => ->(req, key) { req["x-api-key"] = key }
@@ -85,65 +78,18 @@ module HTTPSupport
   end
 
   def self.create_http(uri, timeouts:)
-    key = "#{uri.scheme}://#{uri.host}:#{uri.port}"
-    thread_pool = (Thread.current[:http_connections] ||= {})
-    now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-
-    ALL_POOLS_LOCK.synchronize do
-      ALL_CONNECTION_POOLS << thread_pool unless ALL_CONNECTION_POOLS.include?(thread_pool)
-    end
-
-    if (entry = thread_pool[key])
-      age = now - entry.created_at
-      idle = now - entry.last_used_at
-      if entry.http.started? && age < MAX_CONNECTION_AGE && idle < CONNECTION_IDLE_TIMEOUT
-        entry.last_used_at = now
-        return entry.http
-      end
-      begin
-        entry.http.finish if entry.http.started?
-      rescue StandardError
-        nil
-      end
-      thread_pool.delete(key)
-    end
-
     http = Net::HTTP.new(uri.host, uri.port)
     http.use_ssl = uri.scheme == "https"
     http.open_timeout = timeouts[:open]
     http.read_timeout = timeouts[:read]
     http.write_timeout = timeouts[:write]
     http.keep_alive_timeout = KEEP_ALIVE_TIMEOUT
-    thread_pool[key] = PoolEntry.new(http: http, created_at: now, last_used_at: now)
     http
   end
 
-  def self.cleanup_thread_connections!
-    thread_pool = Thread.current[:http_connections]
-    return unless thread_pool
-
-    thread_pool.each_value do |entry|
-      http = entry.is_a?(PoolEntry) ? entry.http : entry
-      http.finish if http.started?
-    rescue StandardError
-      nil
-    end
-    thread_pool.clear
-  end
-
-  def self.cleanup_all_connections!
-    ALL_POOLS_LOCK.synchronize do
-      ALL_CONNECTION_POOLS.each do |pool|
-        pool.each_value do |entry|
-          http = entry.is_a?(PoolEntry) ? entry.http : entry
-          http.finish if http.started?
-        rescue StandardError
-          nil
-        end
-        pool.clear
-      end
-    end
-  end
+  # (cleanup_thread_connections! removed with connection pool)
+  # (cleanup_all_connections! removed with connection pool)
+  # (flush_stale_connections removed with connection pool)
 
   def self.prewarm_connections!(config, providers, logger, timeouts:)
     return unless config.dig("performance", "prewarm_connections") != false
@@ -155,6 +101,7 @@ module HTTPSupport
           uri = URI.parse(base_url)
           http = create_http(uri, timeouts: timeouts)
           http.start unless http.started?
+          http.finish
           logger.info("  \u2713 #{base_url}")
         rescue StandardError => e
           logger.warn("  \u2717 #{base_url} (#{e.class}: #{e.message})")
@@ -168,7 +115,6 @@ module HTTPSupport
       Signal.trap(sig) do
         logger.info("\nShutting down gracefully...")
         Thread.new do
-          cleanup_all_connections!
           selectors.each { |_, s| s.persist_active_index }
           StatePersistence.save(logger: logger) if defined?(StatePersistence)
           exit(0)
@@ -177,7 +123,6 @@ module HTTPSupport
     end
 
     at_exit do
-      cleanup_all_connections!
       StatePersistence.save(logger: logger) if defined?(StatePersistence) && !$ERROR_INFO.is_a?(SystemExit)
     end
   end
@@ -223,7 +168,6 @@ module HTTPSupport
         eof_retries += 1
         if eof_retries <= MAX_EOF_RETRIES
           settings.logger.warn("#{log_prefix} EOF on stale connection (retry #{eof_retries}/2, not counting against attempts)")
-          flush_stale_connections
           next
         end
         settings.logger.warn("#{log_prefix} EOF persisted after #{eof_retries} retries, counting as attempt failure")
@@ -238,14 +182,7 @@ module HTTPSupport
     end
   end
 
-  def flush_stale_connections
-    thread_pool = Thread.current[:http_connections]
-    return unless thread_pool
-    thread_pool.delete_if do |_, entry|
-      http = entry.is_a?(PoolEntry) ? entry.http : entry
-      !http.started?
-    end
-  end
+  # (flush_stale_connections removed with connection pool)
 
   def handle_upstream_error(response, log_prefix)
     code = response.code.to_i

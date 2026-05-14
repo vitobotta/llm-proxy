@@ -36,7 +36,6 @@ module ProbeManager
       rescue => e
         logger.error("[probe:#{probe_id}] #{model_name} error: #{e.message}")
       ensure
-        HTTPSupport.cleanup_thread_connections!
         selector.probe_finished
       end
     end
