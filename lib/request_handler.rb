@@ -52,7 +52,9 @@ module RequestHandler
     end
 
     if probing && selector.record_and_maybe_probe(probe_interval)
-      ProbeManager.launch(selector, model_name, path, headers, timeouts: ConfigStore.timeouts, auto_switch: auto_switch, logger: settings.logger)
+      ProbeManager.launch(selector, model_name, path, headers,
+        timeouts: ConfigStore.timeouts, auto_switch: auto_switch, logger: settings.logger,
+        max_per_minute: ConfigStore.probe_max_per_minute)
     end
 
     return result if result&.dig(:success)
@@ -124,27 +126,18 @@ module RequestHandler
       begin
         http.request(request) do |response|
           if response.is_a?(Net::HTTPSuccess)
-            response.read_body do |chunk|
-              begin
-                out << chunk
-              rescue Errno::EPIPE, IOError
-                raise HTTPSupport::ClientDisconnected
-              end
-
-              if tracking
+            if tracking
+              usage_data = Streaming.consume_stream(response, tracker: timers) do |chunk, cr, _now|
+                forward_chunk_to_client(out, chunk)
                 if accumulated
                   accumulated << chunk
-                  if accumulated.bytesize > MAX_ACCUMULATED_SIZE
-                    accumulated = nil
-                  end
+                  accumulated = nil if accumulated.bytesize > MAX_ACCUMULATED_SIZE
                 end
-                now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-                cr = Streaming.parse_chunk(chunk)
-                if cr.usage
-                  usage_data = cr.usage
-                  accumulated = nil
-                end
-                track_chunk!(cr, now, timers)
+                accumulated = nil if cr.usage # once we have usage, stop buffering
+              end
+            else
+              response.read_body do |chunk|
+                forward_chunk_to_client(out, chunk)
               end
             end
 
@@ -219,5 +212,11 @@ module RequestHandler
     return if result[:success]
     out << streaming_error(result[:error], detail: result[:detail])
     out << "data: [DONE]\n\n"
+  end
+
+  def forward_chunk_to_client(out, chunk)
+    out << chunk
+  rescue Errno::EPIPE, IOError
+    raise HTTPSupport::ClientDisconnected
   end
 end

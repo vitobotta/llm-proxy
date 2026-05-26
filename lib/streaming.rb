@@ -138,6 +138,24 @@ module Streaming
     elapsed > 0 ? (token_count / elapsed).round(1) : nil
   end
 
+  # Walks response.read_body, parsing each chunk and updating `tracker`
+  # with thinking/content timestamps. Captures cr.usage as it appears.
+  # The caller-supplied block receives (chunk, cr, now) per chunk and may
+  # write the chunk to a client, accumulate it, or do nothing.
+  # Returns the most recently seen usage Hash, or nil.
+  def self.consume_stream(response, tracker:)
+    usage = nil
+    response.read_body do |chunk|
+      now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      cr = parse_chunk(chunk)
+      usage = cr.usage if cr.usage
+      tracker.record_thinking(now) if cr.has_thinking
+      tracker.record_content(now) if cr.has_content
+      yield(chunk, cr, now) if block_given?
+    end
+    usage
+  end
+
   def self.stream_response(http, request, request_start, on_chunk: nil)
     timers = TimerTracker.new
     usage_data = nil
@@ -149,15 +167,7 @@ module Streaming
         next
       end
 
-      response.read_body do |chunk|
-        now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-        cr = parse_chunk(chunk)
-
-        usage_data = cr.usage if cr.usage
-
-        timers.record_thinking(now) if cr.has_thinking
-        timers.record_content(now) if cr.has_content
-
+      usage_data = consume_stream(response, tracker: timers) do |chunk, cr, now|
         on_chunk&.call(chunk, cr, now)
       end
     end

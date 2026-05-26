@@ -95,6 +95,7 @@ module ConfigStore
   def self.probing_enabled = @data[:probing_enabled]
   def self.auto_switch = @data[:auto_switch]
   def self.probe_interval = @data[:probe_interval]
+  def self.probe_max_per_minute = @data[:probe_max_per_minute]
   def self.sample_window = @data[:sample_window]
   def self.max_attempts = @data[:max_attempts]
   def self.backoff_base = @data[:backoff_base]
@@ -156,6 +157,7 @@ module ConfigStore
       probing_enabled: probing_enabled,
       auto_switch: auto_switch,
       probe_interval: probe_interval,
+      probe_max_per_minute: raw.dig("performance", "probe_max_per_minute"),
       sample_window: sample_window,
       max_attempts: raw.dig("retries", "max_attempts") || 3,
       backoff_base: raw.dig("retries", "backoff_base") || 2

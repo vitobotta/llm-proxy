@@ -19,6 +19,8 @@ require_relative "lib/probe_manager"
 require_relative "lib/request_handler"
 require_relative "lib/metrics"
 require_relative "provider_selector"
+require_relative "lib/routes/completions"
+require_relative "lib/routes/admin"
 
 CONFIG_PATH = ENV.fetch("CONFIG_FILE", File.join(__dir__, "config", "config.yaml"))
 
@@ -168,96 +170,8 @@ class LLMProxy < Sinatra::Base
     halt json_error(status: 400, message: "Invalid JSON body", type: "invalid_request")
   end
 
-  %w[chat/completions completions].each do |endpoint|
-    post "/v1/#{endpoint}" do
-      req = parse_request
-      stream_requested = req[:body].key?("stream") ? req[:body]["stream"] != false : true
-
-      if stream_requested
-        HTTPSupport::SSE_HEADERS.each { |k, v| headers[k] = v }
-
-        stream do |out|
-          begin
-            result = with_auto_select(
-              model: req[:model], model_name: req[:model_name],
-              path: endpoint, body: req[:body], headers: req[:headers]
-            ) { |pc, p, b, pm, h, lp| try_stream(pc, p, b, pm, h, out: out, log_prefix: lp) }
-            handle_streaming_error(result, out)
-          rescue HTTPSupport::ClientDisconnected
-            # Expected: client closed the connection mid-stream.
-            settings.logger.info("[#{@request_id}] Client disconnected mid-stream")
-          rescue => e
-            settings.logger.error("[#{@request_id}] Streaming error: #{e.class}: #{e.message}")
-            settings.logger.debug(e.backtrace.join("\n")) if e.backtrace
-            begin
-              out << streaming_error("Streaming error: #{e.class}", detail: e.message)
-              out << "data: [DONE]\n\n"
-            rescue StandardError
-              nil
-            end
-          end
-        end
-      else
-        result = with_auto_select(
-          model: req[:model], model_name: req[:model_name],
-          path: endpoint, body: req[:body], headers: req[:headers]
-        ) { |pc, p, b, pm, h, lp| try_single_request(pc, p, b, pm, h, log_prefix: lp) }
-        handle_non_stream_result(result)
-      end
-    end
-  end
-
-  post "/v1/embeddings" do
-    req = parse_request(allowed_headers: ["Authorization"])
-    result = with_auto_select(
-      model: req[:model], model_name: req[:model_name],
-      path: "embeddings", body: req[:body], headers: req[:headers]
-    ) { |pc, p, b, pm, h, lp| try_single_request(pc, p, b, pm, h, log_prefix: lp) }
-    handle_non_stream_result(result)
-  end
-
-  get "/health" do
-    content_type :json
-    provider_status = {}
-    ConfigStore.selectors.each do |name, selector|
-      metrics = selector.active_metrics
-      provider_status[name] = {
-        active_provider: selector.active_provider_name,
-        metrics: metrics,
-        providers: selector.provider_stats
-      }
-    end
-    { status: "ok", models: ConfigStore.models.keys, providers: provider_status, timestamp: Time.now.iso8601 }.to_json
-  end
-
-  get "/metrics" do
-    metrics_token_required!
-    content_type "text/plain; version=0.0.4"
-    Metrics.to_prometheus
-  end
-
-  get "/v1/models" do
-    content_type :json
-    models = ConfigStore.models
-    {
-      object: "list",
-      data: models.keys.map { |name| { id: name, object: "model", owned_by: "proxy", context_length: models[name]["context_length"] }.compact }
-    }.to_json
-  end
-
-  get "/v1/models/:name" do
-    content_type :json
-    model = ConfigStore.model(params[:name])
-    halt json_error(status: 404, message: "Model '#{params[:name]}' not found", type: "model_not_found") unless model
-
-    {
-      id: model["name"],
-      object: "model",
-      owned_by: "proxy",
-      context_length: model["context_length"],
-      providers: model["providers"].map { |p| { provider: p["provider"], model: p["model"] } }
-    }.compact.to_json
-  end
+  register Routes::Completions
+  register Routes::Admin
 
   not_found do
     json_error(status: 404, message: "Not Found", detail: request.path, type: "not_found")

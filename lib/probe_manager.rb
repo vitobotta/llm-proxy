@@ -12,7 +12,35 @@ module ProbeManager
   # cannot keep @probing latched and block all future probes for a model.
   PROBE_DEADLINE_SECONDS = 30
 
-  def self.launch(selector, model_name, path, headers, timeouts:, auto_switch:, logger:, deadline_seconds: PROBE_DEADLINE_SECONDS)
+  # Global probe rate limiter — tracks recent probe launches across all
+  # models so a misconfigured probe_interval (or many models all probing)
+  # can't burn through tokens at $/req scale.
+  RECENT_PROBES = []
+  RATE_LOCK = Mutex.new
+
+  def self.reset_rate_limiter!
+    RATE_LOCK.synchronize { RECENT_PROBES.clear }
+  end
+
+  def self.allow_probe?(max_per_minute)
+    return true if max_per_minute.nil? || max_per_minute <= 0
+    now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    RATE_LOCK.synchronize do
+      cutoff = now - 60.0
+      RECENT_PROBES.shift while RECENT_PROBES.first && RECENT_PROBES.first < cutoff
+      return false if RECENT_PROBES.size >= max_per_minute
+      RECENT_PROBES << now
+      true
+    end
+  end
+
+  def self.launch(selector, model_name, path, headers, timeouts:, auto_switch:, logger:, deadline_seconds: PROBE_DEADLINE_SECONDS, max_per_minute: nil)
+    unless allow_probe?(max_per_minute)
+      logger.info("[probe] skipped #{model_name} — global rate (#{max_per_minute}/min) reached")
+      selector.probe_finished
+      return nil
+    end
+
     probe_id = SecureRandom.uuid[0..7]
 
     Thread.new do

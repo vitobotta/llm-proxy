@@ -110,6 +110,12 @@ module ConfigValidator
       end
     end
 
+    if (n = config.dig("performance", "probe_max_per_minute"))
+      if !n.is_a?(Integer) || n < 1 || n > 10_000
+        errors << "performance.probe_max_per_minute must be 1..10000 (got #{n.inspect})"
+      end
+    end
+
     if (n = config.dig("performance", "sample_window"))
       if !n.is_a?(Integer) || n < 1 || n > MAX_SAMPLE_WINDOW
         errors << "performance.sample_window must be 1..#{MAX_SAMPLE_WINDOW} seconds (got #{n.inspect})"

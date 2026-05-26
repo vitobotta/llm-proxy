@@ -77,6 +77,49 @@ class TestProbeManager < Minitest::Test
     end
   end
 
+  def test_global_rate_limit_skips_when_exceeded
+    ProbeManager.reset_rate_limiter!
+    others = [{ "provider" => "p1", "model" => "m", "base_url" => "https://x", "api_key" => "k" }]
+
+    ProbeManager.singleton_class.class_eval do
+      alias_method :__orig_probe_provider_rate, :probe_provider
+      define_method(:probe_provider) { |*_args, **_kw| { ttft: 0.01, tps: 100.0 } }
+    end
+
+    sel1 = FakeSelector.new(others)
+    sel2 = FakeSelector.new(others)
+    sel3 = FakeSelector.new(others)
+
+    # max_per_minute=2; first two launches proceed, third returns nil.
+    t1 = ProbeManager.launch(sel1, "m1", "p", {}, timeouts: { open: 1, read: 1, write: 1 }, auto_switch: false, logger: @logger, max_per_minute: 2)
+    t2 = ProbeManager.launch(sel2, "m2", "p", {}, timeouts: { open: 1, read: 1, write: 1 }, auto_switch: false, logger: @logger, max_per_minute: 2)
+    t3 = ProbeManager.launch(sel3, "m3", "p", {}, timeouts: { open: 1, read: 1, write: 1 }, auto_switch: false, logger: @logger, max_per_minute: 2)
+
+    refute_nil t1
+    refute_nil t2
+    assert_nil t3, "third launch must be rate-limited"
+    [t1, t2].each { |t| t.join(5) }
+
+    # The rate-limited launch must still unstick the selector's @probing flag
+    assert sel3.probe_finished_called, "probe_finished must be called on rate-limited skip"
+
+    assert(@captured_logs.any? { |level, msg| msg.is_a?(String) && msg.include?("rate") && msg.include?("m3") }, "rate-limit skip should be logged: #{@captured_logs.inspect}")
+  ensure
+    ProbeManager.reset_rate_limiter!
+    ProbeManager.singleton_class.class_eval do
+      if method_defined?(:__orig_probe_provider_rate) || private_method_defined?(:__orig_probe_provider_rate)
+        alias_method :probe_provider, :__orig_probe_provider_rate
+        remove_method :__orig_probe_provider_rate
+      end
+    end
+  end
+
+  def test_allow_probe_without_limit_is_always_true
+    ProbeManager.reset_rate_limiter!
+    100.times { assert ProbeManager.allow_probe?(nil) }
+    100.times { assert ProbeManager.allow_probe?(0) }
+  end
+
   def test_hung_probe_is_killed_after_deadline
     others = [
       { "provider" => "fast", "model" => "m", "base_url" => "https://example.invalid/v1", "api_key" => "k" },
