@@ -1,28 +1,64 @@
 # frozen_string_literal: true
 
+require "logger"
+require "yaml"
+require "date"
 require_relative "config_validator"
 
 module ConfigStore
   DEFAULT_CONFIG_PATH = File.join(File.dirname(__dir__), "config", "config.yaml")
 
+  # Permitted classes for YAML parsing. Config schema is strings, integers,
+  # floats, booleans, hashes, arrays — nothing exotic. Keeping this strict
+  # means a malicious config (e.g. from a compromised host volume) can't
+  # trigger Ruby object deserialization.
+  YAML_PERMITTED_CLASSES = [Symbol, Date, Time].freeze
+
+  def self.load_yaml_file(path)
+    YAML.safe_load_file(path, permitted_classes: YAML_PERMITTED_CLASSES, aliases: true)
+  end
+
+  # Writer-side lock: only serializes concurrent load!/reload! callers.
+  # READS DO NOT TAKE THIS LOCK.
+  #
+  # @data is replaced with a fully-built snapshot via a single assignment.
+  # Under MRI's GVL, ivar assignment is atomic — readers always see either
+  # the old snapshot or the new one, never a torn read. Writers must compute
+  # the new snapshot (including merge_selectors!) in full before swapping.
   @lock = Mutex.new
   @data = {}
   @config_path = ENV.fetch("CONFIG_FILE", DEFAULT_CONFIG_PATH)
+  @app_ref = nil
+  @last_added_provider_keys = [].freeze
 
   def self.load!(raw_config, logger:)
     new_data = build_data(raw_config, logger)
     @lock.synchronize do
       old_data = @data
-      @data = new_data
+      old_provider_keys = (old_data[:providers] || {}).keys
+      # Mutate new_data into final form (carry over preserved selectors)
+      # BEFORE swapping so readers never observe an in-progress merge.
       merge_selectors!(old_data, new_data)
+      added = (new_data[:providers] || {}).keys - old_provider_keys
+      @last_added_provider_keys = added.freeze
+      @data = new_data
     end
     self
+  end
+
+  def self.last_added_provider_keys
+    (@last_added_provider_keys || []).dup
+  end
+
+  def self.register_app!(app)
+    @app_ref = app
+    update_settings!(app)
   end
 
   def self.config_path = @config_path
 
   def self.reload!(logger:)
-    raw = YAML.unsafe_load_file(config_path)
+    raw = load_yaml_file(config_path)
     errors, warnings = ConfigValidator.validate(raw, logger)
     unless errors.empty?
       errors.each { |e| logger.error("Config reload error: #{e}") }
@@ -31,13 +67,13 @@ module ConfigStore
     end
     warnings.each { |w| logger.warn("Config warning: #{w}") }
 
-    old_providers = providers
     load!(raw, logger: logger)
-    new_provider_keys = providers.keys - old_providers.keys
+    new_provider_keys = last_added_provider_keys
     unless new_provider_keys.empty?
       HTTPSupport.prewarm_connections!(raw, providers, logger, timeouts: timeouts)
     end
     update_logger_level!(raw, logger)
+    update_settings!(@app_ref) if @app_ref
     logger.info("Configuration reloaded from config.yaml")
     true
   rescue => e
@@ -45,32 +81,37 @@ module ConfigStore
     false
   end
 
-  def self.config = @lock.synchronize { @data[:config] }
-  def self.providers = @lock.synchronize { @data[:providers] }
-  def self.models = @lock.synchronize { @data[:models] }
-  def self.selectors = @lock.synchronize { @data[:selectors] }
-  def self.timeouts = @lock.synchronize { @data[:timeouts] }
-  def self.auth_token = @lock.synchronize { @data[:auth_token] }
-  def self.max_body_size = @lock.synchronize { @data[:max_body_size] }
-  def self.tracking_enabled = @lock.synchronize { @data[:tracking_enabled] }
-  def self.probing_enabled = @lock.synchronize { @data[:probing_enabled] }
-  def self.auto_switch = @lock.synchronize { @data[:auto_switch] }
-  def self.probe_interval = @lock.synchronize { @data[:probe_interval] }
-  def self.sample_window = @lock.synchronize { @data[:sample_window] }
-  def self.max_attempts = @lock.synchronize { @data[:max_attempts] }
-  def self.backoff_base = @lock.synchronize { @data[:backoff_base] }
+  # All accessors below are LOCK-FREE — they perform a single ivar read
+  # plus a hash lookup. Safe under MRI's GVL; see the @data comment above.
+  def self.config = @data[:config]
+  def self.providers = @data[:providers]
+  def self.models = @data[:models]
+  def self.selectors = @data[:selectors]
+  def self.timeouts = @data[:timeouts]
+  def self.auth_token = @data[:auth_token]
+  def self.metrics_token = @data[:metrics_token]
+  def self.max_body_size = @data[:max_body_size]
+  def self.tracking_enabled = @data[:tracking_enabled]
+  def self.probing_enabled = @data[:probing_enabled]
+  def self.auto_switch = @data[:auto_switch]
+  def self.probe_interval = @data[:probe_interval]
+  def self.probe_max_per_minute = @data[:probe_max_per_minute]
+  def self.sample_window = @data[:sample_window]
+  def self.max_attempts = @data[:max_attempts]
+  def self.backoff_base = @data[:backoff_base]
 
-  def self.model(name) = @lock.synchronize { @data[:models][name] }
-  def self.selector(name) = @lock.synchronize { @data[:selectors][name] }
+  def self.model(name) = @data[:models][name]
+  def self.selector(name) = @data[:selectors][name]
 
   def self.update_settings!(app)
-    @lock.synchronize do
-      app.set :max_attempts, @data[:max_attempts]
-      app.set :backoff_base, @data[:backoff_base]
-    end
+    snapshot = @data
+    app.set :max_attempts, snapshot[:max_attempts]
+    app.set :backoff_base, snapshot[:backoff_base]
   end
 
-  private
+  # `private` is a no-op on `def self.foo` definitions in modules; use
+  # `private_class_method` (at the bottom) instead. These are conceptually
+  # private — internal helpers, not part of the public ConfigStore API.
 
   def self.build_data(raw, logger)
     providers = (raw["providers"] || {}).transform_values(&:freeze).freeze
@@ -107,16 +148,18 @@ module ConfigStore
       models: models.freeze,
       selectors: selectors,
       timeouts: {
-        open:  raw.dig("timeouts", "open")  || 30,
-        read:  raw.dig("timeouts", "read")  || 300,
+        open: raw.dig("timeouts", "open") || 30,
+        read: raw.dig("timeouts", "read") || 300,
         write: raw.dig("timeouts", "write") || 60
       }.freeze,
       auth_token: raw.dig("auth", "token"),
+      metrics_token: raw.dig("auth", "metrics_token"),
       max_body_size: raw.dig("limits", "max_request_body") || 10 * 1024 * 1024,
       tracking_enabled: tracking_enabled,
       probing_enabled: probing_enabled,
       auto_switch: auto_switch,
       probe_interval: probe_interval,
+      probe_max_per_minute: raw.dig("performance", "probe_max_per_minute"),
       sample_window: sample_window,
       max_attempts: raw.dig("retries", "max_attempts") || 3,
       backoff_base: raw.dig("retries", "backoff_base") || 2
@@ -154,15 +197,17 @@ module ConfigStore
     {
       "provider" => provider_name,
       "base_url" => provider["base_url"],
-      "api_key"  => provider["api_key"],
-      "model"    => model_id,
-      "headers"  => provider["headers"]&.merge(model_headers || {}) || model_headers || {},
-      "primary"  => primary
+      "api_key" => provider["api_key"],
+      "model" => model_id,
+      "headers" => provider["headers"]&.merge(model_headers || {}) || model_headers || {},
+      "primary" => primary
     }.compact.freeze
   end
 
   def self.update_logger_level!(raw, logger)
-    levels = { "debug" => Logger::DEBUG, "info" => Logger::INFO, "warn" => Logger::WARN, "error" => Logger::ERROR }
+    levels = {"debug" => Logger::DEBUG, "info" => Logger::INFO, "warn" => Logger::WARN, "error" => Logger::ERROR}
     logger.level = levels.fetch(raw.dig("logging", "level"), Logger::INFO)
   end
+
+  private_class_method :build_data, :merge_selectors!, :provider_lists_match?, :resolve_provider, :update_logger_level!
 end

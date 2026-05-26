@@ -8,12 +8,12 @@ require "json"
 class TestStatePersistence < Minitest::Test
   def setup
     @providers = [
-      { "provider" => "prov_a", "model" => "m-a", "base_url" => "https://a.example.com/v1", "api_key" => "ka" }.freeze,
-      { "provider" => "prov_b", "model" => "m-b", "base_url" => "https://b.example.com/v1", "api_key" => "kb" }.freeze
+      {"provider" => "prov_a", "model" => "m-a", "base_url" => "https://a.example.com/v1", "api_key" => "ka"}.freeze,
+      {"provider" => "prov_b", "model" => "m-b", "base_url" => "https://b.example.com/v1", "api_key" => "kb"}.freeze
     ].freeze
-    @model_config = { "name" => "test-model", "providers" => [
-      { "provider" => "prov_a", "model" => "m-a", "primary" => true },
-      { "provider" => "prov_b", "model" => "m-b" }
+    @model_config = {"name" => "test-model", "providers" => [
+      {"provider" => "prov_a", "model" => "m-a", "primary" => true},
+      {"provider" => "prov_b", "model" => "m-b"}
     ]}
     @tmpdir = Dir.mktmpdir("state_persistence_test_")
   end
@@ -61,8 +61,8 @@ class TestStatePersistence < Minitest::Test
       "active_provider" => "prov_b",
       "samples" => {
         "prov_b" => [
-          { "ttft" => 0.5, "tps" => 120.0, "ts" => Time.now.to_f - 10 },
-          { "ttft" => 0.6, "tps" => 110.0, "ts" => Time.now.to_f - 5 }
+          {"ttft" => 0.5, "tps" => 120.0, "ts" => Time.now.to_f - 10},
+          {"ttft" => 0.6, "tps" => 110.0, "ts" => Time.now.to_f - 5}
         ]
       },
       "circuits" => {},
@@ -80,7 +80,7 @@ class TestStatePersistence < Minitest::Test
       "active_provider" => "prov_a",
       "samples" => {
         "prov_a" => [
-          { "ttft" => 1.0, "tps" => 50.0, "ts" => old_ts }
+          {"ttft" => 1.0, "tps" => 50.0, "ts" => old_ts}
         ]
       },
       "circuits" => {}
@@ -97,7 +97,7 @@ class TestStatePersistence < Minitest::Test
       "active_provider" => "prov_a",
       "samples" => {},
       "circuits" => {
-        "prov_b" => { "failures" => 3, "opened_at" => opened_at }
+        "prov_b" => {"failures" => 3, "opened_at" => opened_at}
       }
     }
 
@@ -110,8 +110,8 @@ class TestStatePersistence < Minitest::Test
   def test_restore_state_ignores_unknown_providers
     state = {
       "active_provider" => "prov_unknown",
-      "samples" => { "prov_unknown" => [{ "ttft" => 1.0, "ts" => Time.now.to_f }] },
-      "circuits" => { "prov_unknown" => { "failures" => 1, "opened_at" => nil } }
+      "samples" => {"prov_unknown" => [{"ttft" => 1.0, "ts" => Time.now.to_f}]},
+      "circuits" => {"prov_unknown" => {"failures" => 1, "opened_at" => nil}}
     }
 
     selector.restore_state!(state)
@@ -151,7 +151,7 @@ class TestStatePersistence < Minitest::Test
     old_env = ENV["STATE_DIR"]
     ENV["STATE_DIR"] = @tmpdir
     begin
-      File.write(File.join(@tmpdir, "provider_state.json"), JSON.generate({ "version" => 999, "models" => {} }))
+      File.write(File.join(@tmpdir, "provider_state.json"), JSON.generate({"version" => 999, "models" => {}}))
       assert_nil StatePersistence.load
     ensure
       ENV["STATE_DIR"] = old_env
@@ -182,6 +182,99 @@ class TestStatePersistence < Minitest::Test
       assert_equal 2, circuit_b.failures
     ensure
       ENV["STATE_DIR"] = old_env
+    end
+  end
+
+  def test_load_returns_nil_for_malformed_json
+    old_env = ENV["STATE_DIR"]
+    ENV["STATE_DIR"] = @tmpdir
+    begin
+      File.write(File.join(@tmpdir, "provider_state.json"), "{not valid json")
+      assert_nil StatePersistence.load
+    ensure
+      ENV["STATE_DIR"] = old_env
+    end
+  end
+
+  def test_load_returns_nil_when_not_a_hash
+    old_env = ENV["STATE_DIR"]
+    ENV["STATE_DIR"] = @tmpdir
+    begin
+      File.write(File.join(@tmpdir, "provider_state.json"), JSON.generate([1, 2, 3]))
+      assert_nil StatePersistence.load
+    ensure
+      ENV["STATE_DIR"] = old_env
+    end
+  end
+
+  def test_load_returns_nil_when_version_missing
+    old_env = ENV["STATE_DIR"]
+    ENV["STATE_DIR"] = @tmpdir
+    begin
+      File.write(File.join(@tmpdir, "provider_state.json"), JSON.generate({"models" => {}}))
+      assert_nil StatePersistence.load
+    ensure
+      ENV["STATE_DIR"] = old_env
+    end
+  end
+
+  def test_load_returns_nil_for_truncated_file
+    old_env = ENV["STATE_DIR"]
+    ENV["STATE_DIR"] = @tmpdir
+    begin
+      full = JSON.generate({"version" => 1, "saved_at" => 1.0, "models" => {"x" => {"active_provider" => "y"}}})
+      truncated = full[0..(full.bytesize / 2)]
+      File.write(File.join(@tmpdir, "provider_state.json"), truncated)
+      assert_nil StatePersistence.load
+    ensure
+      ENV["STATE_DIR"] = old_env
+    end
+  end
+
+  def test_save_cleans_up_temp_file_on_rename_failure
+    old_env = ENV["STATE_DIR"]
+    ENV["STATE_DIR"] = @tmpdir
+    begin
+      # Stub build_state to avoid needing ConfigStore.
+      StatePersistence.singleton_class.class_eval do
+        alias_method :__orig_build_state, :build_state
+        define_method(:build_state) { {"version" => StatePersistence::STATE_VERSION, "models" => {}} }
+      end
+
+      # Force File.rename to fail. Use the real File.rename via a stub.
+      File.singleton_class.class_eval do
+        alias_method :__orig_rename, :rename
+        define_method(:rename) { |_src, _dst| raise Errno::EACCES, "stubbed" }
+      end
+
+      captured = []
+      err_logger = Class.new(NullLogger) do
+        define_method(:error) { |m| captured << m }
+      end.new
+
+      # Should NOT raise NameError (the bug). Should log the error and clean up tmp.
+      StatePersistence.save(logger: err_logger)
+
+      refute_empty captured, "expected an error to be logged"
+      refute(captured.any? { |m| m.include?("NameError") }, "rescue path must not raise NameError, got: #{captured.inspect}")
+
+      # No leftover .tmp.* files in the directory
+      leftovers = Dir.entries(@tmpdir).select { |f| f.start_with?("provider_state.json.tmp.") }
+      assert_empty leftovers, "tmp file should be cleaned up, found: #{leftovers}"
+    ensure
+      ENV["STATE_DIR"] = old_env
+      File.singleton_class.class_eval do
+        if method_defined?(:__orig_rename) || private_method_defined?(:__orig_rename)
+          alias_method :rename, :__orig_rename
+          remove_method :__orig_rename
+        end
+      end
+      StatePersistence.singleton_class.class_eval do
+        if method_defined?(:__orig_build_state) || private_method_defined?(:__orig_build_state)
+          alias_method :build_state, :__orig_build_state
+          remove_method :__orig_build_state
+        end
+      end
     end
   end
 

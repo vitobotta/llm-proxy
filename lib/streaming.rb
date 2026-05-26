@@ -3,6 +3,21 @@
 require "json"
 
 module Streaming
+  NEGATIVE_TOKEN_WARNED = {}
+  NEGATIVE_TOKEN_LOCK = Mutex.new
+
+  def self.reset_negative_token_warnings!
+    NEGATIVE_TOKEN_LOCK.synchronize { NEGATIVE_TOKEN_WARNED.clear }
+  end
+
+  def self.note_negative_content_once(provider_key)
+    NEGATIVE_TOKEN_LOCK.synchronize do
+      return false if NEGATIVE_TOKEN_WARNED[provider_key]
+      NEGATIVE_TOKEN_WARNED[provider_key] = true
+    end
+    true
+  end
+
   THINKING_PATTERNS = [
     /[^a-zA-Z_]"reasoning_content"\s*:\s*"/,
     /[^a-zA-Z_]"thinking"\s*:\s*"/,
@@ -19,8 +34,8 @@ module Streaming
 
   class TimerTracker
     attr_reader :first_token, :first_thinking, :last_thinking,
-                :first_content, :last_content, :last_any_token,
-                :thinking_detected, :content_detected
+      :first_content, :last_content, :last_any_token,
+      :thinking_detected, :content_detected
 
     def initialize
       @first_token = nil
@@ -73,13 +88,13 @@ module Streaming
       end
     end
 
-    result.has_thinking = true if !result.has_thinking && THINKING_PATTERNS.any? { |r| chunk.match?(r) }
+    result.has_thinking = THINKING_PATTERNS.any? { |r| chunk.match?(r) }
 
     if chunk.match?(TOOL_CALL_PATTERN)
       result.has_tool_call = true
       result.has_content = true
-    elsif !result.has_content
-      result.has_content = true if CONTENT_PATTERNS.any? { |r| chunk.match?(r) }
+    else
+      result.has_content = CONTENT_PATTERNS.any? { |r| chunk.match?(r) }
     end
 
     result
@@ -103,22 +118,42 @@ module Streaming
       end
     end
 
-    { content_len: content_len, thinking_len: thinking_len }
+    {content_len: content_len, thinking_len: thinking_len}
   end
 
   def self.extract_token_counts(usage_data)
     completion = usage_data.dig("completion_tokens") || usage_data.dig("output_tokens")
     thinking = usage_data.dig("completion_tokens_details", "reasoning_tokens") ||
-               usage_data.dig("output_tokens_details", "reasoning_tokens") ||
-               usage_data.dig("reasoning_tokens") || 0
-    content = completion ? completion - thinking : nil
-    { completion: completion, thinking: thinking, content: content }
+      usage_data.dig("output_tokens_details", "reasoning_tokens") ||
+      usage_data.dig("reasoning_tokens") || 0
+    raw_content = completion ? completion - thinking : nil
+    clamped = !raw_content.nil? && raw_content < 0
+    content = clamped ? 0 : raw_content
+    {completion: completion, thinking: thinking, content: content, content_clamped: clamped}
   end
 
   def self.compute_tps(token_count, first_time, last_time)
     return nil unless token_count && token_count > 0 && first_time && last_time
     elapsed = last_time - first_time
-    elapsed > 0 ? (token_count / elapsed).round(1) : nil
+    (elapsed > 0) ? (token_count / elapsed).round(1) : nil
+  end
+
+  # Walks response.read_body, parsing each chunk and updating `tracker`
+  # with thinking/content timestamps. Captures cr.usage as it appears.
+  # The caller-supplied block receives (chunk, cr, now) per chunk and may
+  # write the chunk to a client, accumulate it, or do nothing.
+  # Returns the most recently seen usage Hash, or nil.
+  def self.consume_stream(response, tracker:)
+    usage = nil
+    response.read_body do |chunk|
+      now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      cr = parse_chunk(chunk)
+      usage = cr.usage if cr.usage
+      tracker.record_thinking(now) if cr.has_thinking
+      tracker.record_content(now) if cr.has_content
+      yield(chunk, cr, now) if block_given?
+    end
+    usage
   end
 
   def self.stream_response(http, request, request_start, on_chunk: nil)
@@ -132,21 +167,13 @@ module Streaming
         next
       end
 
-      response.read_body do |chunk|
-        now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-        cr = parse_chunk(chunk)
-
-        usage_data = cr.usage if cr.usage
-
-        timers.record_thinking(now) if cr.has_thinking
-        timers.record_content(now) if cr.has_content
-
+      usage_data = consume_stream(response, tracker: timers) do |chunk, cr, now|
         on_chunk&.call(chunk, cr, now)
       end
     end
 
     if error
-      { error: error }
+      {error: error}
     else
       {
         first_token_time: timers.first_token,
@@ -171,6 +198,9 @@ module Streaming
 
     if usage_data
       tokens = Streaming.extract_token_counts(usage_data)
+      if tokens[:content_clamped] && Streaming.note_negative_content_once(log_prefix)
+        settings.logger.warn("#{log_prefix} provider reported reasoning_tokens (#{tokens[:thinking]}) > completion_tokens (#{tokens[:completion]}); clamping content to 0. This indicates a bug at the provider — please verify their usage accounting.")
+      end
       content_tps = Streaming.compute_tps(tokens[:content], tracker.first_content, tracker.last_content)
       thinking_tps = Streaming.compute_tps(tokens[:thinking], tracker.first_thinking, tracker.last_thinking)
       total_tps = Streaming.compute_tps(tokens[:completion], tracker.first_token, tracker.last_any_token)
@@ -183,15 +213,15 @@ module Streaming
       log_parts << "thinking_tps=#{thinking_tps}" if thinking_tps&.positive?
       log_parts << "total_tps=#{total_tps}" if total_tps&.positive?
 
-      settings.logger.info("#{log_prefix} Success | #{log_parts.join(' ')}")
-      { success: true, content_tokens: tokens[:content], thinking_tokens: tokens[:thinking], ttft: ttft, content_tps: content_tps, thinking_tps: thinking_tps, total_tps: total_tps }
+      settings.logger.info("#{log_prefix} Success | #{log_parts.join(" ")}")
+      {success: true, content_tokens: tokens[:content], thinking_tokens: tokens[:thinking], ttft: ttft, content_tps: content_tps, thinking_tps: thinking_tps, total_tps: total_tps}
     else
       settings.logger.info("#{log_prefix} Success | ttft=#{ttft}s (no usage data from provider)")
-      { success: true, content_tokens: nil, thinking_tokens: nil, ttft: ttft, content_tps: nil, thinking_tps: nil }
+      {success: true, content_tokens: nil, thinking_tokens: nil, ttft: ttft, content_tps: nil, thinking_tps: nil}
     end
   end
 
   def streaming_error(message, detail: nil)
-    "data: #{ { error: { message: message, detail: detail } }.to_json }\n\n"
+    "data: #{{error: {message: message, detail: detail}}.to_json}\n\n"
   end
 end

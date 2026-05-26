@@ -18,7 +18,7 @@ bundle exec puma -C puma.rb          # listens on :4567
 docker compose up -d                 # listens on :9234
 ```
 
-Config is mounted from host (`./config.yaml:/app/config.yaml`) so edits apply without rebuild. To rebuild after code changes:
+Config is mounted from host (`./config:/app/config` — mounted as a directory, not a single file, to avoid inode breakage when editors do atomic writes on Linux) so edits apply without rebuild. To rebuild after code changes:
 
 ```bash
 docker compose up -d --build
@@ -31,14 +31,14 @@ docker compose up -d --build
 | `proxy.rb` | Sinatra app: routes, config loading, before/after hooks, auth |
 | `provider_selector.rb` | Per-model provider scorer with TTFT/TPS ranking, hysteresis, circuit breaker |
 | `lib/streaming.rb` | SSE chunk parser, `TimerTracker` class, token counting, TPS computation |
-| `lib/http_support.rb` | HTTP connection pooling (`PoolEntry` with age/idle tracking), retry logic, graceful shutdown |
+| `lib/http_support.rb` | HTTP request building, retry logic, graceful shutdown |
 | `lib/request_handler.rb` | Sinatra helper: `with_auto_select`, `try_stream`, `try_single_request`, deadline enforcement |
 | `lib/config_validator.rb` | Config validation (errors abort on boot, return errors on reload) |
 | `lib/config_store.rb` | Thread-safe mutable config store — replaces frozen constants, supports hot-reload |
-| `lib/config_watcher.rb` | Polls config.yaml mtime + SIGUSR1 handler, triggers `ConfigStore.reload!` |
+| `lib/config_watcher.rb` | Polls config.yaml content hash + SIGUSR1 handler, triggers `ConfigStore.reload!` |
 | `lib/probe_manager.rb` | Background probe logic |
 | `lib/metrics.rb` | Lightweight Prometheus-compatible counters/histograms |
-| `config.yaml.example` | Template config — reference for all valid keys |
+| `config/config.yaml.example` | Template config — reference for all valid keys |
 | `config.ru` | Rack entrypoint |
 | `puma.rb` | Puma config (threads 1–16, single worker, I/O-bound tuned) |
 

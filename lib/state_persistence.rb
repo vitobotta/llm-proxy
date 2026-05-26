@@ -21,18 +21,20 @@ module StatePersistence
   end
 
   def self.save(logger: nil)
+    tmp = nil
     WRITE_LOCK.synchronize do
       state = build_state
       tmp = "#{state_file}.tmp.#{Process.pid}"
       File.write(tmp, JSON.generate(state))
       File.rename(tmp, state_file)
+      tmp = nil
       logger&.debug("[StatePersistence] Saved state to #{state_file}")
     end
   rescue => e
     logger&.error("[StatePersistence] Failed to save state: #{e.class}: #{e.message}")
     begin
       File.delete(tmp) if tmp && File.exist?(tmp)
-    rescue StandardError
+    rescue
       nil
     end
   end
@@ -41,7 +43,11 @@ module StatePersistence
     state = load
     return unless state
 
+    # Snapshot the selectors and models maps once; if a config reload runs
+    # concurrently, we don't want the hash we iterate over to be replaced
+    # under us.
     selectors = ConfigStore.selectors
+    models_config = ConfigStore.models
     models = state["models"] || {}
     restored = 0
 
@@ -59,7 +65,7 @@ module StatePersistence
       end
     end
 
-    ConfigStore.models.each do |model_name, model_config|
+    models_config.each do |model_name, model_config|
       selector = selectors[model_name]
       selector&.realign_active_index!(model_config)
     end
@@ -69,7 +75,9 @@ module StatePersistence
 
   def self.build_state
     models_state = {}
-    ConfigStore.selectors.each do |model_name, selector|
+    # Snapshot once so the hash isn't swapped out mid-iteration by a reload.
+    selectors = ConfigStore.selectors
+    selectors.each do |model_name, selector|
       models_state[model_name] = selector.to_state
     end
     {
@@ -88,7 +96,7 @@ module StatePersistence
       return nil
     end
     state
-  rescue => e
+  rescue
     nil
   end
 end

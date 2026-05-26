@@ -2,6 +2,7 @@
 # frozen_string_literal: true
 
 require "sinatra/base"
+require "rack/utils"
 require "json"
 require "yaml"
 require "net/http"
@@ -18,26 +19,62 @@ require_relative "lib/probe_manager"
 require_relative "lib/request_handler"
 require_relative "lib/metrics"
 require_relative "provider_selector"
+require_relative "lib/routes/completions"
+require_relative "lib/routes/admin"
 
 CONFIG_PATH = ENV.fetch("CONFIG_FILE", File.join(__dir__, "config", "config.yaml"))
-RAW_CONFIG = YAML.unsafe_load_file(CONFIG_PATH)
+
+def self.load_raw_config!(path)
+  ConfigStore.load_yaml_file(path)
+rescue Errno::ENOENT
+  warn("[BOOT] Config file not found at #{path}.")
+  warn("[BOOT] Set CONFIG_FILE or copy config/config.yaml.example to #{path} and edit it.")
+  exit(78) # EX_CONFIG
+rescue Errno::EACCES => e
+  warn("[BOOT] Cannot read config file at #{path}: #{e.message}")
+  exit(78)
+rescue Psych::SyntaxError, Psych::DisallowedClass => e
+  warn("[BOOT] Config file at #{path} has invalid YAML: #{e.message}")
+  exit(78)
+rescue => e
+  warn("[BOOT] Failed to load config file at #{path}: #{e.class}: #{e.message}")
+  exit(78)
+end
+
+RAW_CONFIG = load_raw_config!(CONFIG_PATH)
 
 BOOT_LOGGER = Logger.new($stdout)
 LOG_LEVELS = {
   "debug" => Logger::DEBUG,
-  "info"  => Logger::INFO,
-  "warn"  => Logger::WARN,
+  "info" => Logger::INFO,
+  "warn" => Logger::WARN,
   "error" => Logger::ERROR
 }.freeze
 BOOT_LOGGER.level = LOG_LEVELS.fetch(RAW_CONFIG.dig("logging", "level"), Logger::INFO)
 
-if RAW_CONFIG.dig("logging", "format") == "json"
-  BOOT_LOGGER.formatter = proc do |severity, datetime, _progname, msg|
-    { timestamp: datetime.iso8601, level: severity, message: msg }.to_json + "\n"
+BOOT_LOGGER.formatter = if RAW_CONFIG.dig("logging", "format") == "json"
+  # JSON formatter: caller can pass a String (becomes `message` field) or a
+  # Hash (fields spread into the JSON record). Thread-local request_id is
+  # included automatically when set by the before-hook.
+  proc do |severity, datetime, _progname, msg|
+    record = {timestamp: datetime.iso8601, level: severity}
+    rid = Thread.current[:request_id]
+    record[:request_id] = rid if rid
+    if msg.is_a?(Hash)
+      record.merge!(msg)
+    else
+      record[:message] = msg.to_s
+    end
+    record.to_json + "\n"
   end
 else
-  BOOT_LOGGER.formatter = proc do |severity, datetime, _progname, msg|
-    "[#{datetime.iso8601}] #{severity}: #{msg}\n"
+  proc do |severity, datetime, _progname, msg|
+    if msg.is_a?(Hash)
+      pairs = msg.map { |k, v| "#{k}=#{(v.is_a?(String) && v.include?(" ")) ? v.inspect : v}" }
+      "[#{datetime.iso8601}] #{severity}: #{pairs.join(" ")}\n"
+    else
+      "[#{datetime.iso8601}] #{severity}: #{msg}\n"
+    end
   end
 end
 
@@ -49,6 +86,7 @@ class LLMProxy < Sinatra::Base
   set :logger, BOOT_LOGGER
 
   ConfigStore.load!(RAW_CONFIG, logger: BOOT_LOGGER)
+  ConfigStore.register_app!(self)
 
   begin
     StatePersistence.restore!(logger: BOOT_LOGGER)
@@ -56,35 +94,54 @@ class LLMProxy < Sinatra::Base
     BOOT_LOGGER.warn("State restoration failed (starting fresh): #{e.class}: #{e.message}")
   end
 
-  set :max_attempts, ConfigStore.max_attempts
-  set :backoff_base, ConfigStore.backoff_base
-
   before do
-    @request_id = SecureRandom.uuid[0..7]
+    @request_id = SecureRandom.hex(8)
     @request_start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-    settings.logger.info("[#{@request_id}] #{request.request_method} #{request.path}")
+    @client_ip = request.ip
+    Thread.current[:request_id] = @request_id
+    settings.logger.info("[#{@request_id}] #{request.request_method} #{request.path} from #{@client_ip}")
 
     auth_token = ConfigStore.auth_token
-    if auth_token
+    if auth_token && requires_auth?(request.path)
       auth_header = request.env["HTTP_AUTHORIZATION"].to_s
       token = auth_header.start_with?("Bearer ") ? auth_header[7..] : auth_header
-      unless token && token == auth_token
+      unless token && Rack::Utils.secure_compare(token, auth_token)
         halt json_error(status: 401, message: "Unauthorized", type: "authentication_error")
       end
+    end
+  end
+
+  def requires_auth?(path)
+    # /health is always public so load balancers can probe.
+    # /metrics is public by default; if auth.metrics_token is set,
+    # it is gated separately below via metrics_token_required!
+    return false if path == "/health"
+    return false if path == "/metrics"
+    true
+  end
+
+  def metrics_token_required!
+    token = ConfigStore.metrics_token
+    return unless token
+    auth_header = request.env["HTTP_AUTHORIZATION"].to_s
+    provided = auth_header.start_with?("Bearer ") ? auth_header[7..] : auth_header
+    unless provided && Rack::Utils.secure_compare(provided, token)
+      halt json_error(status: 401, message: "Unauthorized", type: "authentication_error")
     end
   end
 
   after do
     elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - @request_start
     settings.logger.info("[#{@request_id}] Completed #{response.status} in #{elapsed.round(3)}s")
-    Metrics.increment(:requests_total, labels: { status: response.status })
+    Metrics.increment(:requests_total, labels: {status: response.status})
     Metrics.observe(:request_duration_seconds, elapsed)
+    Thread.current[:request_id] = nil
   end
 
   def json_error(status:, message:, detail: nil, type: "proxy_error")
     content_type :json
-    body = { error: { message: message, type: type } }
-    body[:error].merge!(detail: detail) if detail
+    body = {error: {message: message, type: type}}
+    body[:error][:detail] = detail if detail
     [status, body.to_json]
   end
 
@@ -104,95 +161,32 @@ class LLMProxy < Sinatra::Base
 
     incoming_headers = {}
     allowed_headers.each do |h|
-      env_key = "HTTP_#{h.upcase.tr('-', '_')}"
+      env_key = "HTTP_#{h.upcase.tr("-", "_")}"
       incoming_headers[h] = request.env[env_key] if request.env[env_key]
     end
 
-    { body: body, model: model, model_name: model_name, headers: incoming_headers }
+    {body: body, model: model, model_name: model_name, headers: incoming_headers}
   rescue JSON::ParserError
     halt json_error(status: 400, message: "Invalid JSON body", type: "invalid_request")
   end
 
-  %w[chat/completions completions].each do |endpoint|
-    post "/v1/#{endpoint}" do
-      req = parse_request
-      stream_requested = req[:body].key?("stream") ? req[:body]["stream"] != false : true
+  register Routes::Completions
+  register Routes::Admin
 
-      if stream_requested
-        HTTPSupport::SSE_HEADERS.each { |k, v| headers[k] = v }
-
-        stream do |out|
-          result = with_auto_select(
-            model: req[:model], model_name: req[:model_name],
-            path: endpoint, body: req[:body], headers: req[:headers]
-          ) { |pc, p, b, pm, h, lp| try_stream(pc, p, b, pm, h, out: out, log_prefix: lp) }
-          handle_streaming_error(result, out)
-        end
-      else
-        result = with_auto_select(
-          model: req[:model], model_name: req[:model_name],
-          path: endpoint, body: req[:body], headers: req[:headers]
-        ) { |pc, p, b, pm, h, lp| try_single_request(pc, p, b, pm, h, log_prefix: lp) }
-        handle_non_stream_result(result)
-      end
-    end
-  end
-
-  post "/v1/embeddings" do
-    req = parse_request(allowed_headers: ["Authorization"])
-    result = with_auto_select(
-      model: req[:model], model_name: req[:model_name],
-      path: "embeddings", body: req[:body], headers: req[:headers]
-    ) { |pc, p, b, pm, h, lp| try_single_request(pc, p, b, pm, h, log_prefix: lp) }
-    handle_non_stream_result(result)
-  end
-
-  get "/health" do
-    content_type :json
-    provider_status = {}
-    ConfigStore.selectors.each do |name, selector|
-      metrics = selector.active_metrics
-      provider_status[name] = {
-        active_provider: selector.active_provider_name,
-        metrics: metrics,
-        providers: selector.provider_stats
-      }
-    end
-    { status: "ok", models: ConfigStore.models.keys, providers: provider_status, timestamp: Time.now.iso8601 }.to_json
-  end
-
-  get "/metrics" do
-    content_type "text/plain; version=0.0.4"
-    Metrics.to_prometheus
-  end
-
-  get "/v1/models" do
-    content_type :json
-    models = ConfigStore.models
-    {
-      object: "list",
-      data: models.keys.map { |name| { id: name, object: "model", owned_by: "proxy", context_length: models[name]["context_length"] }.compact }
-    }.to_json
-  end
-
-  get "/v1/models/:name" do
-    content_type :json
-    model = ConfigStore.model(params[:name])
-    halt json_error(status: 404, message: "Model '#{params[:name]}' not found", type: "model_not_found") unless model
-
-    {
-      id: model["name"],
-      object: "model",
-      owned_by: "proxy",
-      context_length: model["context_length"],
-      providers: model["providers"].map { |p| { provider: p["provider"], model: p["model"] } }
-    }.compact.to_json
+  # Scope to Sinatra::NotFound (raised when no route matches) so that
+  # route-level `halt json_error(status: 404, ...)` keeps its specific
+  # message instead of being overridden by this generic handler.
+  error Sinatra::NotFound do
+    json_error(status: 404, message: "Not Found", detail: request.path, type: "not_found")
   end
 
   error do
     e = env["sinatra.error"]
     settings.logger.error("[#{@request_id}] Unhandled error: #{e.class}: #{e.message}")
-    settings.logger.error(e.backtrace[0..10].join("\n")) if e.backtrace
+    if e.backtrace
+      settings.logger.error(e.backtrace.first(20).join("\n"))
+      settings.logger.debug(e.backtrace.join("\n"))
+    end
     json_error(status: 500, message: "Internal server error", detail: e.message, type: "internal_error")
   end
 end

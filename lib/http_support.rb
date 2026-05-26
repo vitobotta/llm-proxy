@@ -3,11 +3,13 @@
 require "net/http"
 require "json"
 require "uri"
+require "time"
 require "securerandom"
 
 module HTTPSupport
   class RetryableError < StandardError; end
   class ClientDisconnected < StandardError; end
+
   class RateLimitedError < RetryableError
     attr_reader :retry_after
 
@@ -38,16 +40,55 @@ module HTTPSupport
 
   URI_CACHE = {}
   URI_CACHE_LOCK = Mutex.new
+  MAX_URI_CACHE_SIZE = 1024
 
   AUTH_STRATEGIES = {
     "anthropic" => ->(req, key) { req["x-api-key"] = key }
   }.freeze
   DEFAULT_AUTH = ->(req, key) { req["Authorization"] = "Bearer #{key}" }
 
+  # Reads an upstream error response body, capping memory use.
+  # If Content-Length advertises an oversized body, we skip the read
+  # entirely so a buggy or hostile upstream can't force a multi-GB allocation.
+  def self.read_capped_error_body(response)
+    cl = response["Content-Length"]&.to_i
+    if cl && cl > MAX_UPSTREAM_BODY_SIZE
+      return "[upstream error body of #{cl} bytes exceeds #{MAX_UPSTREAM_BODY_SIZE}-byte cap, suppressed]"
+    end
+
+    body = begin
+      response.body
+    rescue => e
+      "[failed to read upstream body: #{e.class}: #{e.message}]"
+    end
+
+    return body if body.nil? || body.bytesize <= MAX_UPSTREAM_BODY_SIZE
+    body.byteslice(0, MAX_UPSTREAM_BODY_SIZE) + "... (truncated)"
+  end
+
+  # Parses an RFC 7231 Retry-After value (either a delta-seconds integer
+  # or an HTTP-date) into a Float number of seconds from now.
+  # Returns 0.0 if the value can't be parsed.
+  def self.parse_retry_after(value, now: Time.now)
+    return 0.0 if value.nil? || value.to_s.strip.empty?
+    stripped = value.to_s.strip
+    if /\A\d+(\.\d+)?\z/.match?(stripped)
+      stripped.to_f
+    else
+      begin
+        (Time.httpdate(stripped) - now).to_f
+      rescue ArgumentError
+        0.0
+      end
+    end
+  end
+
   def self.cached_uri(base, path)
     key = "#{base}/#{path}"
     URI_CACHE_LOCK.synchronize do
       return URI_CACHE[key] if URI_CACHE.key?(key)
+      # FIFO eviction. Hash preserves insertion order in Ruby; first key is oldest.
+      URI_CACHE.shift if URI_CACHE.size >= MAX_URI_CACHE_SIZE
       b = base.end_with?("/") ? base : base + "/"
       URI_CACHE[key] = URI.join(b, path)
     end
@@ -61,7 +102,12 @@ module HTTPSupport
 
     (AUTH_STRATEGIES[provider_config["provider"]] || DEFAULT_AUTH).call(request, provider_config["api_key"])
 
-    provider_config["headers"]&.each { |k, v| request[k] = v }
+    provider_config["headers"]&.each do |k, v|
+      # PROTECTED_HEADERS are stripped from provider config too so a fat-fingered
+      # `Authorization:` or `Host:` in config can't override the auth strategy.
+      next if PROTECTED_HEADERS.include?(k.to_s.downcase)
+      request[k] = v
+    end
 
     incoming_headers&.each do |key, value|
       next if PROTECTED_HEADERS.include?(key.downcase)
@@ -71,7 +117,7 @@ module HTTPSupport
     request_body = body.dup
     request_body["model"] = body_model if body_model
     request_body["stream"] = stream
-    request_body["stream_options"] = { "include_usage" => true } if stream
+    request_body["stream_options"] = {"include_usage" => true} if stream
     request.body = request_body.to_json
 
     [uri, request]
@@ -97,15 +143,13 @@ module HTTPSupport
     Thread.new do
       logger.info("Pre-warming HTTP connections to providers...")
       providers.values.map { |p| p["base_url"] }.uniq.each do |base_url|
-        begin
-          uri = URI.parse(base_url)
-          http = create_http(uri, timeouts: timeouts)
-          http.start unless http.started?
-          http.finish
-          logger.info("  \u2713 #{base_url}")
-        rescue StandardError => e
-          logger.warn("  \u2717 #{base_url} (#{e.class}: #{e.message})")
-        end
+        uri = URI.parse(base_url)
+        http = create_http(uri, timeouts: timeouts)
+        http.start unless http.started?
+        http.finish
+        logger.info("  \u2713 #{base_url}")
+      rescue => e
+        logger.warn("  \u2717 #{base_url} (#{e.class}: #{e.message})")
       end
     end
   end
@@ -115,7 +159,7 @@ module HTTPSupport
       Signal.trap(sig) do
         logger.info("\nShutting down gracefully...")
         Thread.new do
-          selectors.each { |_, s| s.persist_active_index }
+          selectors.each { |_, s| s.persist_active_index(logger: logger) }
           StatePersistence.save(logger: logger) if defined?(StatePersistence)
           exit(0)
         end
@@ -140,7 +184,7 @@ module HTTPSupport
 
   def retry_or_fail(log_prefix, error_label:, detail: nil)
     settings.logger.error("#{log_prefix} All #{settings.max_attempts} attempts failed")
-    result = { success: false, error: "#{error_label} after #{settings.max_attempts} attempts" }
+    result = {success: false, error: "#{error_label} after #{settings.max_attempts} attempts"}
     result[:detail] = detail if detail
     result
   end
@@ -163,7 +207,7 @@ module HTTPSupport
         return retry_or_fail(log_prefix, error_label: "Failed", detail: e.message) unless maybe_retry(attempts)
       rescue ClientDisconnected
         settings.logger.info("#{log_prefix} Client disconnected")
-        return { success: false, error: "Client disconnected" }
+        return {success: false, error: "Client disconnected"}
       rescue EOFError
         eof_retries += 1
         if eof_retries <= MAX_EOF_RETRIES
@@ -175,7 +219,7 @@ module HTTPSupport
       rescue *TIMEOUT_EXCEPTIONS => e
         settings.logger.warn("#{log_prefix} Timeout: #{e.message}")
         return retry_or_fail(log_prefix, error_label: "Timeout") unless maybe_retry(attempts)
-      rescue StandardError => e
+      rescue => e
         settings.logger.warn("#{log_prefix} Error: #{e.message}")
         return retry_or_fail(log_prefix, error_label: "Error", detail: e.message) unless maybe_retry(attempts)
       end
@@ -186,22 +230,21 @@ module HTTPSupport
 
   def handle_upstream_error(response, log_prefix)
     code = response.code.to_i
-    error_body = response.body
-    if error_body && error_body.bytesize > MAX_UPSTREAM_BODY_SIZE
-      error_body = error_body.byteslice(0, MAX_UPSTREAM_BODY_SIZE) + "... (truncated)"
-    end
+    error_body = HTTPSupport.read_capped_error_body(response)
     error_msg = "HTTP #{code}: #{error_body}"
     settings.logger.warn("#{log_prefix} Failed: #{error_msg}")
 
     if RETRYABLE_CODES.include?(code)
       if code == 429 && response["Retry-After"]
-        delay = [response["Retry-After"].to_f, MAX_RETRY_AFTER].min
+        delay = HTTPSupport.parse_retry_after(response["Retry-After"])
+        delay = [delay, MAX_RETRY_AFTER].min
+        delay = 0 if delay.negative?
         settings.logger.warn("#{log_prefix} Rate limited, Retry-After: #{delay}s")
         raise RateLimitedError.new(delay)
       end
       raise RetryableError, error_msg
     end
 
-    { success: false, error: error_msg, status: code }
+    {success: false, error: error_msg, status: code}
   end
 end

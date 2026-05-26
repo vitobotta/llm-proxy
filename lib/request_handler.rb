@@ -14,38 +14,97 @@ module RequestHandler
     deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + REQUEST_DEADLINE
 
     result = nil
+    attempts = []
+    deadline_hit = false
+
     providers.each_with_index do |provider_config, i|
       if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
-        settings.logger.warn("[#{@request_id}/#{model_name}] Request deadline exceeded, aborting")
+        deadline_hit = true
+        settings.logger.warn("[#{@request_id}/#{model_name}] Request deadline exceeded after trying #{attempts.size} provider(s), aborting")
         break
       end
       p_name = provider_config["provider"]
       p_model = provider_config["model"]
-      settings.logger.info("[#{@request_id}/#{model_name}] #{i == 0 ? 'Using' : 'Fallback to'} #{p_name} (#{p_model})")
+      if i == 0
+        settings.logger.info("[#{@request_id}/#{model_name}] Using #{p_name} (#{p_model})")
+      else
+        prev = attempts.last
+        prev_reason = prev ? "#{prev[:provider]} #{prev[:reason]}#{" (status=#{prev[:status]})" if prev[:status]}" : "previous failure"
+        settings.logger.info("[#{@request_id}/#{model_name}] Fallback to #{p_name} (#{p_model}) because #{prev_reason}")
+      end
 
       log_prefix = "[#{@request_id}/#{model_name}/#{p_name}]"
       result = yield(provider_config, path, body, p_model, headers, log_prefix)
       if result&.dig(:success)
         record_metrics(selector, p_name, result) if probing
         selector.record_success(p_name)
-        Metrics.increment(:provider_success, labels: { provider: p_name, model: model_name })
+        Metrics.increment(:provider_success, labels: {provider: p_name, model: model_name})
+        if result[:ttft]
+          Metrics.observe(:upstream_ttft_seconds, result[:ttft], labels: {provider: p_name, model: model_name})
+        end
         break
       else
+        reason = RequestHandler.failure_reason(result)
+        attempts << {provider: p_name, status: result.is_a?(Hash) ? result[:status] : nil, error: result.is_a?(Hash) ? result[:error] : nil, reason: reason}
         selector.record_failure(p_name)
-        Metrics.increment(:provider_failure, labels: { provider: p_name, model: model_name })
+        Metrics.increment(:provider_failure, labels: {provider: p_name, model: model_name, reason: reason})
       end
     end
 
     if probing && selector.record_and_maybe_probe(probe_interval)
-      ProbeManager.launch(selector, model_name, path, headers, timeouts: ConfigStore.timeouts, auto_switch: auto_switch, logger: settings.logger)
+      ProbeManager.launch(selector, model_name, path, headers,
+        timeouts: ConfigStore.timeouts, auto_switch: auto_switch, logger: settings.logger,
+        max_per_minute: ConfigStore.probe_max_per_minute)
     end
 
-    result || { success: false, error: "All providers failed" }
+    return result if result&.dig(:success)
+
+    # All providers failed (or deadline hit). Synthesize a final result that
+    # carries enough context for operators to debug from the response alone.
+    failure_summary = build_failure_summary(attempts, deadline_hit)
+    settings.logger.warn("[#{@request_id}/#{model_name}] #{failure_summary[:error]}")
+    failure_summary
+  end
+
+  def build_failure_summary(attempts, deadline_hit)
+    if attempts.empty?
+      return {success: false, error: deadline_hit ? "Request deadline exceeded before any provider attempted" : "No providers available", status: 503}
+    end
+
+    summary_lines = attempts.map { |a| "#{a[:provider]}: #{a[:reason]}#{" (status=#{a[:status]})" if a[:status]}" }
+    last_status = attempts.last[:status]
+    fallback_status = (last_status && last_status >= 400 && last_status < 600) ? last_status : 502
+
+    msg = deadline_hit ? "All providers failed (request deadline exceeded)" : "All providers failed"
+    {
+      success: false,
+      error: "#{msg}: #{summary_lines.join("; ")}",
+      detail: {attempts: attempts, deadline_hit: deadline_hit},
+      status: fallback_status
+    }
   end
 
   def record_metrics(selector, provider_name, result)
     tps = result[:total_tps] || result[:content_tps]
     selector.update_metrics(provider_name, result[:ttft], tps) if result[:ttft]
+  end
+
+  # Categorize a failure result into a stable Prometheus label.
+  # Keep cardinality bounded — don't use raw exception messages.
+  def self.failure_reason(result)
+    return "unknown" unless result.is_a?(Hash)
+    status = result[:status]
+    err = result[:error].to_s
+    if status
+      return "rate_limited" if status == 429
+      return "client_error" if status >= 400 && status < 500
+      return "server_error" if status >= 500
+    end
+    return "timeout" if err.include?("Timeout")
+    return "client_disconnect" if err == "Client disconnected"
+    return "rate_limited" if err.include?("Rate limited")
+    return "connection_reset" if err.include?("Connection reset")
+    "error"
   end
 
   MAX_ACCUMULATED_SIZE = 512 * 1024
@@ -64,58 +123,53 @@ module RequestHandler
       tracking = ConfigStore.tracking_enabled
       accumulated = tracking ? +"" : nil
 
-      http.request(request) do |response|
-        if response.is_a?(Net::HTTPSuccess)
-          response.read_body do |chunk|
-            begin
-              out << chunk
-            rescue Errno::EPIPE, IOError
-              raise HTTPSupport::ClientDisconnected
+      begin
+        http.request(request) do |response|
+          if response.is_a?(Net::HTTPSuccess)
+            if tracking
+              usage_data = Streaming.consume_stream(response, tracker: timers) do |chunk, cr, _now|
+                forward_chunk_to_client(out, chunk)
+                if accumulated
+                  accumulated << chunk
+                  accumulated = nil if accumulated.bytesize > MAX_ACCUMULATED_SIZE
+                end
+                accumulated = nil if cr.usage # once we have usage, stop buffering
+              end
+            else
+              response.read_body do |chunk|
+                forward_chunk_to_client(out, chunk)
+              end
             end
 
             if tracking
-              if accumulated
-                accumulated << chunk
-                if accumulated.bytesize > MAX_ACCUMULATED_SIZE
-                  accumulated = nil
+              unless usage_data
+                fallback = Streaming.parse_chunk(accumulated.to_s) if accumulated
+                usage_data = fallback.usage if fallback&.usage
+              end
+
+              unless usage_data
+                if accumulated
+                  counts = Streaming.extract_sse_content(accumulated.to_s)
+                  total = counts[:content_len] + counts[:thinking_len]
+                  if total > 0
+                    usage_data = {
+                      "completion_tokens" => total,
+                      "completion_tokens_details" => {"reasoning_tokens" => counts[:thinking_len]}
+                    }
+                  end
                 end
               end
-              now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-              cr = Streaming.parse_chunk(chunk)
-              if cr.usage
-                usage_data = cr.usage
-                accumulated = nil
-              end
-              track_chunk!(cr, now, timers)
-            end
-          end
 
-          if tracking
-            unless usage_data
-              fallback = Streaming.parse_chunk(accumulated.to_s) if accumulated
-              usage_data = fallback.usage if fallback&.usage
+              stream_result = build_stream_result(log_prefix, timers, usage_data)
+            else
+              stream_result = {success: true}
             end
-
-            unless usage_data
-              if accumulated
-                counts = Streaming.extract_sse_content(accumulated.to_s)
-                total = counts[:content_len] + counts[:thinking_len]
-                if total > 0
-                  usage_data = {
-                    "completion_tokens" => total,
-                    "completion_tokens_details" => { "reasoning_tokens" => counts[:thinking_len] }
-                  }
-                end
-              end
-            end
-
-            stream_result = build_stream_result(log_prefix, timers, usage_data)
           else
-            stream_result = { success: true }
+            stream_result = handle_upstream_error(response, log_prefix)
           end
-        else
-          stream_result = handle_upstream_error(response, log_prefix)
         end
+      ensure
+        http.finish if http&.started?
       end
       stream_result
     end
@@ -127,13 +181,17 @@ module RequestHandler
     try_with_retries(log_prefix: log_prefix, body_model: body_model) do
       http = HTTPSupport.create_http(uri, timeouts: ConfigStore.timeouts)
       http.start unless http.started?
-      response = http.request(request)
+      begin
+        response = http.request(request)
 
-      if response.is_a?(Net::HTTPSuccess)
-        settings.logger.info("#{log_prefix} Success")
-        { success: true, response: [response.code.to_i, { "Content-Type" => "application/json" }, [response.body]] }
-      else
-        handle_upstream_error(response, log_prefix)
+        if response.is_a?(Net::HTTPSuccess)
+          settings.logger.info("#{log_prefix} Success")
+          {success: true, response: [response.code.to_i, {"Content-Type" => "application/json"}, [response.body]]}
+        else
+          handle_upstream_error(response, log_prefix)
+        end
+      ensure
+        http.finish if http&.started?
       end
     end
   end
@@ -154,5 +212,11 @@ module RequestHandler
     return if result[:success]
     out << streaming_error(result[:error], detail: result[:detail])
     out << "data: [DONE]\n\n"
+  end
+
+  def forward_chunk_to_client(out, chunk)
+    out << chunk
+  rescue Errno::EPIPE, IOError
+    raise HTTPSupport::ClientDisconnected
   end
 end

@@ -3,14 +3,58 @@
 require_relative "test_helper"
 
 class TestProviderSelector < Minitest::Test
+  def test_persist_active_provider_logs_failure
+    require_relative "../lib/config_store"
+    captured = []
+    logger = Class.new(NullLogger) do
+      define_method(:warn) { |m| captured << m }
+    end.new
+
+    # Force the YAML loader to raise.
+    ConfigStore.singleton_class.class_eval do
+      alias_method :__orig_load_yaml, :load_yaml_file
+      define_method(:load_yaml_file) { |*_args| raise Errno::ENOENT, "stubbed" }
+    end
+
+    ProviderSelector.persist_active_provider("test-model", 0, logger: logger)
+
+    refute_empty captured
+    assert captured.first.include?("test-model"), "log must include model name: #{captured.inspect}"
+    assert captured.first.include?("Errno::ENOENT"), "log must include exception class: #{captured.inspect}"
+  ensure
+    ConfigStore.singleton_class.class_eval do
+      if method_defined?(:__orig_load_yaml) || private_method_defined?(:__orig_load_yaml)
+        alias_method :load_yaml_file, :__orig_load_yaml
+        remove_method :__orig_load_yaml
+      end
+    end
+  end
+
+  def test_provider_stats_tracks_last_success_at
+    selector
+    @selector.record_success("prov_a")
+    sleep(0.01)
+    @selector.record_success("prov_a")
+
+    stats = @selector.provider_stats["prov_a"]
+    refute_nil stats[:last_success_at], "last_success_at must be set"
+    assert stats[:last_success_age_seconds] >= 0
+    assert stats[:last_success_age_seconds] < 5, "should be fresh, got #{stats[:last_success_age_seconds]}"
+
+    # Provider that's never succeeded gets nil
+    other = @selector.provider_stats["prov_b"]
+    assert_nil other[:last_success_at]
+    assert_nil other[:last_success_age_seconds]
+  end
+
   def setup
     @providers = [
-      { "provider" => "prov_a", "model" => "m-a", "base_url" => "https://a.example.com/v1", "api_key" => "ka" }.freeze,
-      { "provider" => "prov_b", "model" => "m-b", "base_url" => "https://b.example.com/v1", "api_key" => "kb" }.freeze
+      {"provider" => "prov_a", "model" => "m-a", "base_url" => "https://a.example.com/v1", "api_key" => "ka"}.freeze,
+      {"provider" => "prov_b", "model" => "m-b", "base_url" => "https://b.example.com/v1", "api_key" => "kb"}.freeze
     ].freeze
-    @model_config = { "name" => "test-model", "providers" => [
-      { "provider" => "prov_a", "model" => "m-a", "primary" => true },
-      { "provider" => "prov_b", "model" => "m-b" }
+    @model_config = {"name" => "test-model", "providers" => [
+      {"provider" => "prov_a", "model" => "m-a", "primary" => true},
+      {"provider" => "prov_b", "model" => "m-b"}
     ]}
   end
 
@@ -23,9 +67,9 @@ class TestProviderSelector < Minitest::Test
   end
 
   def test_initial_active_index_without_primary
-    config = { "name" => "t", "providers" => [
-      { "provider" => "prov_a", "model" => "m-a" },
-      { "provider" => "prov_b", "model" => "m-b" }
+    config = {"name" => "t", "providers" => [
+      {"provider" => "prov_a", "model" => "m-a"},
+      {"provider" => "prov_b", "model" => "m-b"}
     ]}
     s = ProviderSelector.new("t", @providers, model_config: config)
     assert_equal 0, s.instance_variable_get(:@active_index)
@@ -61,7 +105,7 @@ class TestProviderSelector < Minitest::Test
   end
 
   def test_score_from_avg_ttft_saturation
-    avg = { avg_ttft: 2.0, avg_tps: 100.0, sample_count: 5 }
+    avg = {avg_ttft: 2.0, avg_tps: 100.0, sample_count: 5}
     score = selector.send(:score_from_avg, avg)
     ttft_score = [4.0 / 2.0, 1.0].min
     tps_score = [100.0 / 100.0, 3.0].min
@@ -70,7 +114,7 @@ class TestProviderSelector < Minitest::Test
   end
 
   def test_score_from_avg_ttft_cap
-    avg = { avg_ttft: 1.0, avg_tps: 50.0, sample_count: 3 }
+    avg = {avg_ttft: 1.0, avg_tps: 50.0, sample_count: 3}
     score = selector.send(:score_from_avg, avg)
     ttft_score = 1.0
     tps_score = [50.0 / 100.0, 3.0].min
@@ -84,7 +128,7 @@ class TestProviderSelector < Minitest::Test
   end
 
   def test_score_from_avg_tps_cap
-    avg = { avg_ttft: 4.0, avg_tps: 500.0, sample_count: 5 }
+    avg = {avg_ttft: 4.0, avg_tps: 500.0, sample_count: 5}
     score = selector.send(:score_from_avg, avg)
     tps_score = [500.0 / 100.0, 3.0].min
     assert_equal 3.0, tps_score

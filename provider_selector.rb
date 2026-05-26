@@ -2,9 +2,9 @@
 
 class ProviderSelector
   TTFT_SATURATION = 4.0
-  TPS_REFERENCE   = 100.0
+  TPS_REFERENCE = 100.0
   TTFT_WEIGHT = 0.5
-  TPS_WEIGHT  = 0.5
+  TPS_WEIGHT = 0.5
   DEFAULT_SAMPLE_WINDOW = 180
   MAX_SAMPLES = 100
   MIN_SAMPLES = 2
@@ -23,9 +23,9 @@ class ProviderSelector
     defined?(ConfigStore) ? ConfigStore.config_path : File.join(__dir__, "config", "config.yaml")
   end
 
-  def self.persist_active_provider(model_name, provider_index)
+  def self.persist_active_provider(model_name, provider_index, logger: nil)
     CONFIG_LOCK.synchronize do
-      raw = YAML.unsafe_load_file(config_path)
+      raw = defined?(ConfigStore) ? ConfigStore.load_yaml_file(config_path) : YAML.safe_load_file(config_path, permitted_classes: [Symbol, Date, Time], aliases: true)
       model_entry = raw["models"].find { |m| m["name"] == model_name }
       return unless model_entry && model_entry["providers"]
 
@@ -36,11 +36,14 @@ class ProviderSelector
       File.write(config_path, YAML.dump(raw))
     end
   rescue => e
+    msg = "[#{model_name}] Failed to persist active provider: #{e.class}: #{e.message}"
+    logger&.warn(msg)
+    warn(msg) if logger.nil?
     nil
   end
 
   def initialize(model_name, providers, model_config:, sample_window: DEFAULT_SAMPLE_WINDOW,
-                 circuit_failure_threshold: CIRCUIT_FAILURE_THRESHOLD, circuit_cooldown: CIRCUIT_COOLDOWN)
+    circuit_failure_threshold: CIRCUIT_FAILURE_THRESHOLD, circuit_cooldown: CIRCUIT_COOLDOWN)
     @model_name = model_name
     @providers = providers
     @active_index = find_initial_active_index(model_config)
@@ -55,6 +58,7 @@ class ProviderSelector
     @circuits = providers.each_with_object({}) { |p, h| h[p["provider"]] = CircuitState.new(failures: 0, opened_at: nil) }
     @error_counts = providers.each_with_object({}) { |p, h| h[p["provider"]] = 0 }
     @total_requests = providers.each_with_object({}) { |p, h| h[p["provider"]] = 0 }
+    @last_success_at = providers.each_with_object({}) { |p, h| h[p["provider"]] = nil }
     @model_config = model_config
   end
 
@@ -67,8 +71,8 @@ class ProviderSelector
       @cached_ordered ||= begin
         active = @providers[@active_index]
         others = @providers.reject.with_index { |_, i| i == @active_index }
-                          .reject { |p| circuit_open?(p["provider"]) }
-                          .sort_by { |p| -score_provider(p["provider"]) }
+          .reject { |p| circuit_open?(p["provider"]) }
+          .sort_by { |p| -score_provider(p["provider"]) }
         [active, *others]
       end
     end
@@ -100,7 +104,7 @@ class ProviderSelector
       now = Time.now.to_f
       samples = (@samples[provider_name] ||= [])
       prune_stale_samples!(samples, now)
-      sample = { ttft: ttft.to_f, timestamp: now }
+      sample = {ttft: ttft.to_f, timestamp: now}
       sample[:tps] = tps.to_f if tps
       samples << sample
       samples.shift if samples.length > MAX_SAMPLES
@@ -146,12 +150,13 @@ class ProviderSelector
     end
   end
 
-  def persist_active_index
-    auto_switch = @lock.synchronize { @model_config&.dig("auto_switch") == true }
+  def persist_active_index(logger: nil)
+    auto_switch, idx = @lock.synchronize do
+      [@model_config&.dig("auto_switch") == true, @active_index]
+    end
     return unless auto_switch
 
-    idx = @lock.synchronize { @active_index }
-    self.class.persist_active_provider(@model_name, idx)
+    self.class.persist_active_provider(@model_name, idx, logger: logger)
   end
 
   def record_failure(provider_name)
@@ -170,6 +175,7 @@ class ProviderSelector
   def record_success(provider_name)
     @lock.synchronize do
       @total_requests[provider_name] = (@total_requests[provider_name] || 0) + 1
+      @last_success_at[provider_name] = Time.now.to_f
       circuit = @circuits[provider_name]
       return unless circuit
       circuit.failures = 0
@@ -195,26 +201,30 @@ class ProviderSelector
     @lock.synchronize do
       avg = average_metrics(@providers[@active_index]["provider"])
       return nil unless avg
-      { ttft: avg[:avg_ttft], tps: avg[:avg_tps], sample_count: avg[:sample_count] }
+      {ttft: avg[:avg_ttft], tps: avg[:avg_tps], sample_count: avg[:sample_count]}
     end
   end
 
   def circuit_states
     @lock.synchronize do
       @circuits.transform_values do |c|
-        { failures: c.failures, open: !c.opened_at.nil? }
+        {failures: c.failures, open: !c.opened_at.nil?}
       end
     end
   end
 
   def provider_stats
     @lock.synchronize do
+      now = Time.now.to_f
       @providers.each_with_object({}) do |p, h|
         name = p["provider"]
+        last = @last_success_at[name]
         h[name] = {
           errors: @error_counts[name] || 0,
           successes: @total_requests[name] || 0,
-          circuit_open: !@circuits[name]&.opened_at.nil?
+          circuit_open: !@circuits[name]&.opened_at.nil?,
+          last_success_at: last ? Time.at(last).iso8601 : nil,
+          last_success_age_seconds: last ? (now - last).round(1) : nil
         }
       end
     end
@@ -222,14 +232,14 @@ class ProviderSelector
 
   def to_state
     @lock.synchronize do
-      now = Time.now.to_f
+      Time.now.to_f
       {
         active_provider: @providers[@active_index]["provider"],
         samples: @samples.transform_values do |arr|
           arr.map { |s| sample_to_hash(s) }
         end,
         circuits: @circuits.transform_values do |c|
-          { failures: c.failures, opened_at: c.opened_at }
+          {failures: c.failures, opened_at: c.opened_at}
         end,
         request_count: @request_count
       }
@@ -261,19 +271,27 @@ class ProviderSelector
           next unless c.is_a?(Hash)
           next unless @circuits.key?(p_name)
           circuit = @circuits[p_name]
-          circuit.failures = Integer(c["failures"]) rescue 0
+          circuit.failures = begin
+            Integer(c["failures"])
+          rescue
+            0
+          end
           opened_at = c["opened_at"]
           if opened_at && now - opened_at.to_f > @circuit_cooldown
             circuit.opened_at = nil
             circuit.failures = 0
           else
-            circuit.opened_at = opened_at ? opened_at.to_f : nil
+            circuit.opened_at = opened_at&.to_f
           end
         end
       end
 
       if state["request_count"]
-        @request_count = Integer(state["request_count"]) rescue 0
+        @request_count = begin
+          Integer(state["request_count"])
+        rescue
+          0
+        end
       end
 
       @cached_ordered = nil
@@ -283,7 +301,7 @@ class ProviderSelector
   private
 
   def sample_to_hash(sample)
-    h = { "ttft" => sample[:ttft], "ts" => sample[:timestamp] }
+    h = {"ttft" => sample[:ttft], "ts" => sample[:timestamp]}
     h["tps"] = sample[:tps] if sample[:tps]
     h
   end
@@ -292,11 +310,14 @@ class ProviderSelector
     return nil unless hash.is_a?(Hash) && hash["ttft"] && hash["ts"]
     ts = hash["ts"].to_f
     return nil if now - ts > @sample_window
-    sample = { ttft: hash["ttft"].to_f, timestamp: ts }
+    sample = {ttft: hash["ttft"].to_f, timestamp: ts}
     sample[:tps] = hash["tps"].to_f if hash["tps"]
     sample
   end
 
+  # CALLER MUST HOLD @lock. This method mutates circuit state to
+  # auto-close after cooldown, so unsynchronized reads can race with
+  # concurrent record_failure / record_success calls.
   def circuit_open?(provider_name)
     circuit = @circuits[provider_name]
     return false unless circuit&.opened_at
@@ -327,7 +348,7 @@ class ProviderSelector
     avg_ttft = samples.sum { |s| s[:ttft] } / n
     tps_samples = samples.select { |s| s[:tps] }
     avg_tps = tps_samples.empty? ? 0.0 : tps_samples.sum { |s| s[:tps] } / tps_samples.length
-    { avg_ttft: avg_ttft, avg_tps: avg_tps, sample_count: n }
+    {avg_ttft: avg_ttft, avg_tps: avg_tps, sample_count: n}
   end
 
   def score_provider(provider_name)
@@ -338,9 +359,9 @@ class ProviderSelector
   def score_from_avg(avg)
     return -Float::INFINITY unless avg
     ttft = avg[:avg_ttft]
-    tps  = avg[:avg_tps] || 0
+    tps = avg[:avg_tps] || 0
 
-    ttft_score = ttft > 0 ? [TTFT_SATURATION / ttft, 1.0].min : 0
+    ttft_score = (ttft > 0) ? [TTFT_SATURATION / ttft, 1.0].min : 0
 
     tps_score = [tps / TPS_REFERENCE, 3.0].min
 

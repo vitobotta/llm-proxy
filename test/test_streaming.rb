@@ -29,7 +29,39 @@ class TestStreaming < Minitest::Test
   def test_parse_chunk_extracts_usage
     chunk = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":50}}\n\n"
     cr = Streaming.parse_chunk(chunk)
-    assert_equal({ "prompt_tokens" => 10, "completion_tokens" => 50 }, cr.usage)
+    assert_equal({"prompt_tokens" => 10, "completion_tokens" => 50}, cr.usage)
+  end
+
+  def test_parse_chunk_word_usage_in_content_is_not_treated_as_usage_block
+    # The fast-path `chunk.include?("usage")` will fire, but the actual
+    # JSON has no `usage` key — so parse_chunk should return usage=nil.
+    chunk = 'data: {"choices":[{"delta":{"content":"Check your usage limit"}}]}' + "\n\n"
+    cr = Streaming.parse_chunk(chunk)
+    assert_nil cr.usage
+    assert cr.has_content
+  end
+
+  def test_parse_chunk_word_content_inside_string_does_not_set_has_content
+    # The substring "content" appears inside a string value, not as a JSON key.
+    # The regex requires it to be preceded by a non-identifier char and followed
+    # by `:`, so it must not match here.
+    chunk = 'data: {"choices":[{"delta":{"role":"assistant","name":"my_content_helper"}}]}' + "\n\n"
+    cr = Streaming.parse_chunk(chunk)
+    refute cr.has_content, "content substring inside a value must not flip has_content"
+  end
+
+  def test_parse_chunk_handles_chunk_with_only_done
+    cr = Streaming.parse_chunk("data: [DONE]\n\n")
+    refute cr.has_content
+    refute cr.has_thinking
+    assert_nil cr.usage
+  end
+
+  def test_parse_chunk_oversize_chunk_does_not_blow_up
+    # A 1 MB chunk built from many tiny SSE lines — parse_chunk must complete.
+    chunk = "data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n" * 10_000
+    cr = Streaming.parse_chunk(chunk)
+    assert cr.has_content
   end
 
   def test_parse_chunk_ignores_done_line
@@ -44,11 +76,11 @@ class TestStreaming < Minitest::Test
   def test_parse_chunk_skips_invalid_json_in_usage_scan
     chunk = "data: {not json}\ndata: {\"choices\":[],\"usage\":{\"completion_tokens\":5}}\n\n"
     cr = Streaming.parse_chunk(chunk)
-    assert_equal({ "completion_tokens" => 5 }, cr.usage)
+    assert_equal({"completion_tokens" => 5}, cr.usage)
   end
 
   def test_extract_token_counts_openai_format
-    usage = { "completion_tokens" => 100, "completion_tokens_details" => { "reasoning_tokens" => 30 } }
+    usage = {"completion_tokens" => 100, "completion_tokens_details" => {"reasoning_tokens" => 30}}
     result = Streaming.extract_token_counts(usage)
     assert_equal 100, result[:completion]
     assert_equal 30, result[:thinking]
@@ -56,7 +88,7 @@ class TestStreaming < Minitest::Test
   end
 
   def test_extract_token_counts_anthropic_format
-    usage = { "output_tokens" => 80, "output_tokens_details" => { "reasoning_tokens" => 20 } }
+    usage = {"output_tokens" => 80, "output_tokens_details" => {"reasoning_tokens" => 20}}
     result = Streaming.extract_token_counts(usage)
     assert_equal 80, result[:completion]
     assert_equal 20, result[:thinking]
@@ -64,11 +96,28 @@ class TestStreaming < Minitest::Test
   end
 
   def test_extract_token_counts_no_thinking
-    usage = { "completion_tokens" => 50 }
+    usage = {"completion_tokens" => 50}
     result = Streaming.extract_token_counts(usage)
     assert_equal 50, result[:completion]
     assert_equal 0, result[:thinking]
     assert_equal 50, result[:content]
+    refute result[:content_clamped]
+  end
+
+  def test_extract_token_counts_clamps_negative_content
+    usage = {"completion_tokens" => 10, "completion_tokens_details" => {"reasoning_tokens" => 30}}
+    result = Streaming.extract_token_counts(usage)
+    assert_equal 10, result[:completion]
+    assert_equal 30, result[:thinking]
+    assert_equal 0, result[:content], "content must be clamped to 0 instead of going negative"
+    assert result[:content_clamped]
+  end
+
+  def test_note_negative_content_once_returns_true_only_first_time
+    Streaming.reset_negative_token_warnings!
+    assert_equal true, Streaming.note_negative_content_once("k1")
+    assert_equal false, Streaming.note_negative_content_once("k1")
+    assert_equal true, Streaming.note_negative_content_once("k2")
   end
 
   def test_compute_tps_normal

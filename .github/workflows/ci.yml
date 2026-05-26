@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main, refactoring]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "4.0"
+          bundler-cache: true
+
+      - name: Lint with standardrb
+        run: bundle exec standardrb
+
+      - name: Run tests
+        run: bundle exec ruby -I. -e 'Dir["test/test_*.rb"].each { |f| load f }'
+
+  docker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: llm-proxy:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test container
+        run: |
+          cp config/config.yaml.example config/config.yaml
+          docker run --rm -d --name llm-proxy-ci \
+            -v "$PWD/config:/app/config" \
+            -p 4567:4567 \
+            llm-proxy:ci
+          # Wait for /health up to 30s
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:4567/health > /dev/null; then
+              echo "Container healthy after ${i}s"
+              break
+            fi
+            sleep 1
+          done
+          curl -sf http://localhost:4567/health > /dev/null
+          curl -sf http://localhost:4567/v1/models > /dev/null
+          curl -sf http://localhost:4567/metrics > /dev/null
+          docker stop llm-proxy-ci
