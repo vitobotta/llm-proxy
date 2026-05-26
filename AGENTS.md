@@ -90,3 +90,16 @@ curl -s http://localhost:9234/v1/models | python3 -m json.tool
 - **`accumulated` string** is nil'd after usage data found OR after exceeding 512KB — always nil-check before use.
 - **`probing_enabled: false` disables auto_switch** — per-model `auto_switch` is forced false when `probing_enabled` is false, matching the global behaviour.
 - **Puma's `WRITE_TIMEOUT` is monkey-patched to 300s** — Puma's default 10s write timeout (`Puma::Const::WRITE_TIMEOUT`) kills long-lived streaming connections with "Socket timeout writing data". Overridden in `puma.rb` + `persistent_timeout 300`.
+
+## Writing style for user-facing prose
+
+Anything end users will read — GitHub release notes, CHANGELOG entries, README, error messages, the docs in `CONTRIBUTING.md` — uses a changelog voice, not a working-notes voice. Match the existing v1.2.3 release notes as the template.
+
+- **Third person about the proxy, not first person about the work.** "The proxy now …" / "`X` is rejected at boot" — not "I added", "we changed", "you should now".
+- **Lead with the user-visible behaviour change.** Short cause/effect after, only when it helps the reader act on the change. Don't open with the diagnosis.
+- **Breaking changes lead with the operator action.** "Update Prometheus configs that reference the old name", "Ensure every provider has a non-empty `api_key`", "Set `user:` in compose if your host UID isn't 1000". Action first; explanation second.
+- **No dev-process metadata.** Don't mention phases, commit counts, audit numbering, which tool surfaced a bug, or how work was batched. The reader doesn't care that something was "P0.4" or that "standardrb caught it".
+- **No reader-direct framing.** Avoid "read these first", "for context", "as you'll see", "happy to …". These read like agent-to-maintainer chat, not a public artifact.
+- **Section the notes** — `⚠️ Breaking changes`, `What's Fixed`, `What's New` (subgrouped if long: Observability / Configuration / Security), `Performance`, then `Code organisation` / `Tooling` / `Tests` for the contributor-facing tail. Skip empty sections.
+
+Internal artifacts — commit messages, plan files, conversations — are exempt and may stay in working-notes voice.
