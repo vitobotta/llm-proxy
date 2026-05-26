@@ -15,7 +15,6 @@ module ConfigWatcher
     @logger = logger
     @last_hash = file_hash
     @running = true
-    @running = true
 
     Thread.new do
       loop do

@@ -15,10 +15,16 @@ module ConfigStore
     new_data = build_data(raw_config, logger)
     @lock.synchronize do
       old_data = @data
+      old_provider_keys = (old_data[:providers] || {}).keys
       @data = new_data
       merge_selectors!(old_data, new_data)
+      @last_added_provider_keys = (new_data[:providers] || {}).keys - old_provider_keys
     end
     self
+  end
+
+  def self.last_added_provider_keys
+    @lock.synchronize { (@last_added_provider_keys || []).dup }
   end
 
   def self.register_app!(app)
@@ -38,9 +44,8 @@ module ConfigStore
     end
     warnings.each { |w| logger.warn("Config warning: #{w}") }
 
-    old_providers = providers
     load!(raw, logger: logger)
-    new_provider_keys = providers.keys - old_providers.keys
+    new_provider_keys = last_added_provider_keys
     unless new_provider_keys.empty?
       HTTPSupport.prewarm_connections!(raw, providers, logger, timeouts: timeouts)
     end

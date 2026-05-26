@@ -39,6 +39,7 @@ module HTTPSupport
 
   URI_CACHE = {}
   URI_CACHE_LOCK = Mutex.new
+  MAX_URI_CACHE_SIZE = 1024
 
   AUTH_STRATEGIES = {
     "anthropic" => ->(req, key) { req["x-api-key"] = key }
@@ -66,6 +67,8 @@ module HTTPSupport
     key = "#{base}/#{path}"
     URI_CACHE_LOCK.synchronize do
       return URI_CACHE[key] if URI_CACHE.key?(key)
+      # FIFO eviction. Hash preserves insertion order in Ruby; first key is oldest.
+      URI_CACHE.shift if URI_CACHE.size >= MAX_URI_CACHE_SIZE
       b = base.end_with?("/") ? base : base + "/"
       URI_CACHE[key] = URI.join(b, path)
     end

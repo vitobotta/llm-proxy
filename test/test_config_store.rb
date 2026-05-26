@@ -80,6 +80,38 @@ class TestConfigStore < Minitest::Test
     end
   end
 
+  def test_reload_triggers_prewarm_only_when_new_providers_added
+    prewarm_calls = []
+    HTTPSupport.singleton_class.class_eval do
+      alias_method :__orig_prewarm3, :prewarm_connections!
+      define_method(:prewarm_connections!) do |_config, providers, *_args, **_kw|
+        prewarm_calls << providers.keys.sort
+        nil
+      end
+    end
+
+    # Reload with no provider change — should NOT prewarm.
+    write_config(MOCK_CONFIG)
+    assert ConfigStore.reload!(logger: NullLogger.new)
+    assert_empty prewarm_calls, "reload with same providers should not prewarm"
+
+    # Reload with a new provider added — SHOULD prewarm.
+    cfg_with_new = Marshal.load(Marshal.dump(MOCK_CONFIG)) # deep copy
+    cfg_with_new["providers"]["prov_c"] = { "base_url" => "https://c.example.com/v1", "api_key" => "kc" }
+    write_config(cfg_with_new)
+    assert ConfigStore.reload!(logger: NullLogger.new)
+
+    refute_empty prewarm_calls, "new provider should trigger prewarm"
+    assert_includes prewarm_calls.last, "prov_c"
+  ensure
+    HTTPSupport.singleton_class.class_eval do
+      if method_defined?(:__orig_prewarm3) || private_method_defined?(:__orig_prewarm3)
+        alias_method :prewarm_connections!, :__orig_prewarm3
+        remove_method :__orig_prewarm3
+      end
+    end
+  end
+
   def test_reload_without_registered_app_does_not_raise
     new_cfg = MOCK_CONFIG.merge("retries" => { "max_attempts" => 5, "backoff_base" => 2 })
     write_config(new_cfg)

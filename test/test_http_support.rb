@@ -168,6 +168,23 @@ class TestHTTPSupport < Minitest::Test
     assert val <= 0, "past date should yield non-positive delay, got: #{val}"
   end
 
+  def test_uri_cache_evicts_oldest_at_capacity
+    HTTPSupport::URI_CACHE_LOCK.synchronize { HTTPSupport::URI_CACHE.clear }
+    cap = HTTPSupport::MAX_URI_CACHE_SIZE
+
+    (cap + 5).times do |i|
+      HTTPSupport.cached_uri("https://host-#{i}.example.com/v1", "chat/completions")
+    end
+
+    size = HTTPSupport::URI_CACHE_LOCK.synchronize { HTTPSupport::URI_CACHE.size }
+    assert size <= cap, "cache must be capped at #{cap}, got #{size}"
+
+    # The oldest 5 entries should have been evicted; the newest are still there.
+    keys = HTTPSupport::URI_CACHE_LOCK.synchronize { HTTPSupport::URI_CACHE.keys }
+    refute_includes keys, "https://host-0.example.com/v1/chat/completions"
+    assert_includes keys, "https://host-#{cap + 4}.example.com/v1/chat/completions"
+  end
+
   def test_parse_retry_after_garbage_returns_zero
     assert_equal 0.0, HTTPSupport.parse_retry_after("not a date or number")
     assert_equal 0.0, HTTPSupport.parse_retry_after(nil)

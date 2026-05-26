@@ -301,6 +301,9 @@ class ProviderSelector
     sample
   end
 
+  # CALLER MUST HOLD @lock. This method mutates circuit state to
+  # auto-close after cooldown, so unsynchronized reads can race with
+  # concurrent record_failure / record_success calls.
   def circuit_open?(provider_name)
     circuit = @circuits[provider_name]
     return false unless circuit&.opened_at

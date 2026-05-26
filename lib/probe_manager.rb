@@ -8,14 +8,18 @@ module ProbeManager
     "max_tokens" => 100
   }.freeze
 
-  def self.launch(selector, model_name, path, headers, timeouts:, auto_switch:, logger:)
+  # Hard upper bound on a single probe so a half-open or hung provider
+  # cannot keep @probing latched and block all future probes for a model.
+  PROBE_DEADLINE_SECONDS = 30
+
+  def self.launch(selector, model_name, path, headers, timeouts:, auto_switch:, logger:, deadline_seconds: PROBE_DEADLINE_SECONDS)
     probe_id = SecureRandom.uuid[0..7]
 
     Thread.new do
       begin
-        threads = selector.other_providers.map do |provider_config|
+        named_threads = selector.other_providers.map do |provider_config|
           p_name = provider_config["provider"]
-          Thread.new do
+          thread = Thread.new do
             Thread.current.report_on_exception = false
             begin
               metrics = probe_provider(provider_config, path, PROBE_BODY, provider_config["model"], headers, timeouts: timeouts, logger: logger)
@@ -25,9 +29,18 @@ module ProbeManager
               [p_name, { ttft: Float::INFINITY, tps: nil }]
             end
           end
+          [p_name, thread]
         end
 
-        results = threads.map(&:value)
+        results = named_threads.map do |p_name, t|
+          if t.join(deadline_seconds).nil?
+            logger.warn("[probe:#{probe_id}] #{p_name} exceeded #{deadline_seconds}s deadline, killing thread")
+            t.kill
+            [p_name, { ttft: Float::INFINITY, tps: nil }]
+          else
+            t.value
+          end
+        end
 
         results.each do |p_name, m|
           selector.update_metrics(p_name, m[:ttft], m[:tps])

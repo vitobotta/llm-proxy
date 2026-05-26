@@ -77,6 +77,50 @@ class TestProbeManager < Minitest::Test
     end
   end
 
+  def test_hung_probe_is_killed_after_deadline
+    others = [
+      { "provider" => "fast", "model" => "m", "base_url" => "https://example.invalid/v1", "api_key" => "k" },
+      { "provider" => "hung", "model" => "m", "base_url" => "https://example.invalid/v1", "api_key" => "k" }
+    ]
+
+    ProbeManager.singleton_class.class_eval do
+      alias_method :__orig_probe_provider3, :probe_provider
+      define_method(:probe_provider) do |provider_config, *_args, **_kw|
+        if provider_config["provider"] == "hung"
+          sleep(60)
+          { ttft: 0.01, tps: 999.0 }
+        else
+          { ttft: 0.05, tps: 50.0 }
+        end
+      end
+    end
+
+    selector = FakeSelector.new(others)
+    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    thread = ProbeManager.launch(selector, "test-model", "chat/completions", {}, timeouts: { open: 1, read: 1, write: 1 }, auto_switch: false, logger: @logger, deadline_seconds: 1)
+    finished = thread.join(10)
+    elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+
+    refute_nil finished, "outer probe thread must complete"
+    assert elapsed < 5, "outer probe should finish well under sleep(60), got #{elapsed}s"
+
+    assert selector.probe_finished_called
+
+    by_provider = selector.metrics_calls.group_by(&:first)
+    refute_nil by_provider["hung"], "hung probe must still record a result"
+    assert_equal Float::INFINITY, by_provider["hung"].first[1], "hung probe should be +Inf ttft"
+    refute_nil by_provider["fast"], "fast probe must record real result"
+
+    assert(@captured_logs.any? { |level, msg| level == :warn && msg.include?("hung") && msg.include?("deadline") }, "warn log mentioning hung + deadline expected; got #{@captured_logs.inspect}")
+  ensure
+    ProbeManager.singleton_class.class_eval do
+      if method_defined?(:__orig_probe_provider3) || private_method_defined?(:__orig_probe_provider3)
+        alias_method :probe_provider, :__orig_probe_provider3
+        remove_method :__orig_probe_provider3
+      end
+    end
+  end
+
   def test_failing_probe_does_not_abort_other_probes
     others = [
       { "provider" => "ok",   "model" => "m", "base_url" => "https://example.invalid/v1", "api_key" => "k" },
