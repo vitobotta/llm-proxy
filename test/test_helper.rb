@@ -3,6 +3,7 @@
 require "minitest/autorun"
 require "json"
 require "yaml"
+require "logger"
 
 $LOAD_PATH.unshift File.join(__dir__, "..")
 require_relative "../lib/streaming"
@@ -10,6 +11,7 @@ require_relative "../lib/http_support"
 require_relative "../provider_selector"
 
 class NullLogger
+  attr_accessor :level
   def info(_msg); end
   def warn(_msg); end
   def error(_msg); end

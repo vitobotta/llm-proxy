@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require_relative "test_helper"
+require "time"
 
 class TestHTTPSupport < Minitest::Test
   def test_retryable_error_is_standard_error
@@ -147,5 +148,29 @@ class TestHTTPSupport < Minitest::Test
     assert_includes HTTPSupport::TIMEOUT_EXCEPTIONS, Net::OpenTimeout
     assert_includes HTTPSupport::TIMEOUT_EXCEPTIONS, Net::ReadTimeout
     assert_includes HTTPSupport::TIMEOUT_EXCEPTIONS, Net::WriteTimeout
+  end
+
+  def test_parse_retry_after_delta_seconds
+    assert_equal 5.0, HTTPSupport.parse_retry_after("5")
+    assert_equal 12.5, HTTPSupport.parse_retry_after("12.5")
+  end
+
+  def test_parse_retry_after_http_date
+    now = Time.utc(2026, 5, 26, 14, 0, 0)
+    future = Time.utc(2026, 5, 26, 14, 0, 30).httpdate
+    assert_in_delta 30.0, HTTPSupport.parse_retry_after(future, now: now), 0.01
+  end
+
+  def test_parse_retry_after_past_date_clamped_to_zero
+    now = Time.utc(2026, 5, 26, 14, 0, 0)
+    past = Time.utc(2026, 5, 26, 13, 0, 0).httpdate
+    val = HTTPSupport.parse_retry_after(past, now: now)
+    assert val <= 0, "past date should yield non-positive delay, got: #{val}"
+  end
+
+  def test_parse_retry_after_garbage_returns_zero
+    assert_equal 0.0, HTTPSupport.parse_retry_after("not a date or number")
+    assert_equal 0.0, HTTPSupport.parse_retry_after(nil)
+    assert_equal 0.0, HTTPSupport.parse_retry_after("")
   end
 end

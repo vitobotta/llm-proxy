@@ -3,6 +3,21 @@
 require "json"
 
 module Streaming
+  NEGATIVE_TOKEN_WARNED = {}
+  NEGATIVE_TOKEN_LOCK = Mutex.new
+
+  def self.reset_negative_token_warnings!
+    NEGATIVE_TOKEN_LOCK.synchronize { NEGATIVE_TOKEN_WARNED.clear }
+  end
+
+  def self.note_negative_content_once(provider_key)
+    NEGATIVE_TOKEN_LOCK.synchronize do
+      return false if NEGATIVE_TOKEN_WARNED[provider_key]
+      NEGATIVE_TOKEN_WARNED[provider_key] = true
+    end
+    true
+  end
+
   THINKING_PATTERNS = [
     /[^a-zA-Z_]"reasoning_content"\s*:\s*"/,
     /[^a-zA-Z_]"thinking"\s*:\s*"/,
@@ -111,8 +126,10 @@ module Streaming
     thinking = usage_data.dig("completion_tokens_details", "reasoning_tokens") ||
                usage_data.dig("output_tokens_details", "reasoning_tokens") ||
                usage_data.dig("reasoning_tokens") || 0
-    content = completion ? completion - thinking : nil
-    { completion: completion, thinking: thinking, content: content }
+    raw_content = completion ? completion - thinking : nil
+    clamped = !raw_content.nil? && raw_content < 0
+    content = clamped ? 0 : raw_content
+    { completion: completion, thinking: thinking, content: content, content_clamped: clamped }
   end
 
   def self.compute_tps(token_count, first_time, last_time)
@@ -171,6 +188,9 @@ module Streaming
 
     if usage_data
       tokens = Streaming.extract_token_counts(usage_data)
+      if tokens[:content_clamped] && Streaming.note_negative_content_once(log_prefix)
+        settings.logger.warn("#{log_prefix} provider reported reasoning_tokens (#{tokens[:thinking]}) > completion_tokens (#{tokens[:completion]}); clamping content to 0. This indicates a bug at the provider — please verify their usage accounting.")
+      end
       content_tps = Streaming.compute_tps(tokens[:content], tracker.first_content, tracker.last_content)
       thinking_tps = Streaming.compute_tps(tokens[:thinking], tracker.first_thinking, tracker.last_thinking)
       total_tps = Streaming.compute_tps(tokens[:completion], tracker.first_token, tracker.last_any_token)

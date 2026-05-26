@@ -20,7 +20,25 @@ require_relative "lib/metrics"
 require_relative "provider_selector"
 
 CONFIG_PATH = ENV.fetch("CONFIG_FILE", File.join(__dir__, "config", "config.yaml"))
-RAW_CONFIG = YAML.unsafe_load_file(CONFIG_PATH)
+
+def self.load_raw_config!(path)
+  YAML.unsafe_load_file(path)
+rescue Errno::ENOENT
+  warn("[BOOT] Config file not found at #{path}.")
+  warn("[BOOT] Set CONFIG_FILE or copy config/config.yaml.example to #{path} and edit it.")
+  exit(78) # EX_CONFIG
+rescue Errno::EACCES => e
+  warn("[BOOT] Cannot read config file at #{path}: #{e.message}")
+  exit(78)
+rescue Psych::SyntaxError => e
+  warn("[BOOT] Config file at #{path} has invalid YAML: #{e.message}")
+  exit(78)
+rescue => e
+  warn("[BOOT] Failed to load config file at #{path}: #{e.class}: #{e.message}")
+  exit(78)
+end
+
+RAW_CONFIG = load_raw_config!(CONFIG_PATH)
 
 BOOT_LOGGER = Logger.new($stdout)
 LOG_LEVELS = {
@@ -49,15 +67,13 @@ class LLMProxy < Sinatra::Base
   set :logger, BOOT_LOGGER
 
   ConfigStore.load!(RAW_CONFIG, logger: BOOT_LOGGER)
+  ConfigStore.register_app!(self)
 
   begin
     StatePersistence.restore!(logger: BOOT_LOGGER)
   rescue => e
     BOOT_LOGGER.warn("State restoration failed (starting fresh): #{e.class}: #{e.message}")
   end
-
-  set :max_attempts, ConfigStore.max_attempts
-  set :backoff_base, ConfigStore.backoff_base
 
   before do
     @request_id = SecureRandom.uuid[0..7]

@@ -3,6 +3,7 @@
 require "net/http"
 require "json"
 require "uri"
+require "time"
 require "securerandom"
 
 module HTTPSupport
@@ -43,6 +44,23 @@ module HTTPSupport
     "anthropic" => ->(req, key) { req["x-api-key"] = key }
   }.freeze
   DEFAULT_AUTH = ->(req, key) { req["Authorization"] = "Bearer #{key}" }
+
+  # Parses an RFC 7231 Retry-After value (either a delta-seconds integer
+  # or an HTTP-date) into a Float number of seconds from now.
+  # Returns 0.0 if the value can't be parsed.
+  def self.parse_retry_after(value, now: Time.now)
+    return 0.0 if value.nil? || value.to_s.strip.empty?
+    stripped = value.to_s.strip
+    if stripped =~ /\A\d+(\.\d+)?\z/
+      stripped.to_f
+    else
+      begin
+        (Time.httpdate(stripped) - now).to_f
+      rescue ArgumentError
+        0.0
+      end
+    end
+  end
 
   def self.cached_uri(base, path)
     key = "#{base}/#{path}"
@@ -115,7 +133,7 @@ module HTTPSupport
       Signal.trap(sig) do
         logger.info("\nShutting down gracefully...")
         Thread.new do
-          selectors.each { |_, s| s.persist_active_index }
+          selectors.each { |_, s| s.persist_active_index(logger: logger) }
           StatePersistence.save(logger: logger) if defined?(StatePersistence)
           exit(0)
         end
@@ -195,7 +213,9 @@ module HTTPSupport
 
     if RETRYABLE_CODES.include?(code)
       if code == 429 && response["Retry-After"]
-        delay = [response["Retry-After"].to_f, MAX_RETRY_AFTER].min
+        delay = HTTPSupport.parse_retry_after(response["Retry-After"])
+        delay = [delay, MAX_RETRY_AFTER].min
+        delay = 0 if delay.negative?
         settings.logger.warn("#{log_prefix} Rate limited, Retry-After: #{delay}s")
         raise RateLimitedError.new(delay)
       end

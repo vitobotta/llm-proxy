@@ -21,11 +21,13 @@ module StatePersistence
   end
 
   def self.save(logger: nil)
+    tmp = nil
     WRITE_LOCK.synchronize do
       state = build_state
       tmp = "#{state_file}.tmp.#{Process.pid}"
       File.write(tmp, JSON.generate(state))
       File.rename(tmp, state_file)
+      tmp = nil
       logger&.debug("[StatePersistence] Saved state to #{state_file}")
     end
   rescue => e

@@ -3,6 +3,32 @@
 require_relative "test_helper"
 
 class TestProviderSelector < Minitest::Test
+  def test_persist_active_provider_logs_failure
+    captured = []
+    logger = Class.new(NullLogger) do
+      define_method(:warn) { |m| captured << m }
+    end.new
+
+    # Force YAML.unsafe_load_file to raise.
+    YAML.singleton_class.class_eval do
+      alias_method :__orig_unsafe, :unsafe_load_file
+      define_method(:unsafe_load_file) { |*_args| raise Errno::ENOENT, "stubbed" }
+    end
+
+    ProviderSelector.persist_active_provider("test-model", 0, logger: logger)
+
+    refute_empty captured
+    assert captured.first.include?("test-model"), "log must include model name: #{captured.inspect}"
+    assert captured.first.include?("Errno::ENOENT"), "log must include exception class: #{captured.inspect}"
+  ensure
+    YAML.singleton_class.class_eval do
+      if method_defined?(:__orig_unsafe) || private_method_defined?(:__orig_unsafe)
+        alias_method :unsafe_load_file, :__orig_unsafe
+        remove_method :__orig_unsafe
+      end
+    end
+  end
+
   def setup
     @providers = [
       { "provider" => "prov_a", "model" => "m-a", "base_url" => "https://a.example.com/v1", "api_key" => "ka" }.freeze,

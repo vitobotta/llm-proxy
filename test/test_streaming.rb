@@ -69,6 +69,23 @@ class TestStreaming < Minitest::Test
     assert_equal 50, result[:completion]
     assert_equal 0, result[:thinking]
     assert_equal 50, result[:content]
+    refute result[:content_clamped]
+  end
+
+  def test_extract_token_counts_clamps_negative_content
+    usage = { "completion_tokens" => 10, "completion_tokens_details" => { "reasoning_tokens" => 30 } }
+    result = Streaming.extract_token_counts(usage)
+    assert_equal 10, result[:completion]
+    assert_equal 30, result[:thinking]
+    assert_equal 0, result[:content], "content must be clamped to 0 instead of going negative"
+    assert result[:content_clamped]
+  end
+
+  def test_note_negative_content_once_returns_true_only_first_time
+    Streaming.reset_negative_token_warnings!
+    assert_equal true,  Streaming.note_negative_content_once("k1")
+    assert_equal false, Streaming.note_negative_content_once("k1")
+    assert_equal true,  Streaming.note_negative_content_once("k2")
   end
 
   def test_compute_tps_normal

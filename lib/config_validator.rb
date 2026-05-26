@@ -29,6 +29,19 @@ module ConfigValidator
     errors << "Missing 'models' in config" unless config["models"]&.any?
     errors << "Missing 'providers' in config" unless config["providers"]&.any?
 
+    provider_keys = (config["providers"] || {}).keys
+
+    (config["providers"] || {}).each do |name, p|
+      next unless p.is_a?(Hash)
+      api_key = p["api_key"]
+      if api_key.nil? || api_key.to_s.strip.empty?
+        errors << "Provider '#{name}' has no api_key (set api_key to a non-empty string)"
+      end
+      if p["base_url"].nil? || p["base_url"].to_s.strip.empty?
+        errors << "Provider '#{name}' has no base_url"
+      end
+    end
+
     (config["models"] || []).each do |m|
       unless m["name"]
         errors << "Model entry missing 'name'"
@@ -44,6 +57,10 @@ module ConfigValidator
       m["providers"].each do |p|
         unless p["provider"]
           errors << "Model '#{m['name']}' has a provider entry missing 'provider' key"
+          next
+        end
+        unless provider_keys.include?(p["provider"])
+          errors << "Model '#{m['name']}' references unknown provider '#{p['provider']}' (define it under 'providers')"
         end
       end
       if m.key?("probing_enabled") && ![true, false].include?(m["probing_enabled"])

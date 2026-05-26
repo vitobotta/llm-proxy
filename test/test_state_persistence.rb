@@ -185,6 +185,53 @@ class TestStatePersistence < Minitest::Test
     end
   end
 
+  def test_save_cleans_up_temp_file_on_rename_failure
+    old_env = ENV["STATE_DIR"]
+    ENV["STATE_DIR"] = @tmpdir
+    begin
+      # Stub build_state to avoid needing ConfigStore.
+      StatePersistence.singleton_class.class_eval do
+        alias_method :__orig_build_state, :build_state
+        define_method(:build_state) { { "version" => StatePersistence::STATE_VERSION, "models" => {} } }
+      end
+
+      # Force File.rename to fail. Use the real File.rename via a stub.
+      File.singleton_class.class_eval do
+        alias_method :__orig_rename, :rename
+        define_method(:rename) { |_src, _dst| raise Errno::EACCES, "stubbed" }
+      end
+
+      captured = []
+      err_logger = Class.new(NullLogger) do
+        define_method(:error) { |m| captured << m }
+      end.new
+
+      # Should NOT raise NameError (the bug). Should log the error and clean up tmp.
+      StatePersistence.save(logger: err_logger)
+
+      refute_empty captured, "expected an error to be logged"
+      refute(captured.any? { |m| m.include?("NameError") }, "rescue path must not raise NameError, got: #{captured.inspect}")
+
+      # No leftover .tmp.* files in the directory
+      leftovers = Dir.entries(@tmpdir).select { |f| f.start_with?("provider_state.json.tmp.") }
+      assert_empty leftovers, "tmp file should be cleaned up, found: #{leftovers}"
+    ensure
+      ENV["STATE_DIR"] = old_env
+      File.singleton_class.class_eval do
+        if method_defined?(:__orig_rename) || private_method_defined?(:__orig_rename)
+          alias_method :rename, :__orig_rename
+          remove_method :__orig_rename
+        end
+      end
+      StatePersistence.singleton_class.class_eval do
+        if method_defined?(:__orig_build_state) || private_method_defined?(:__orig_build_state)
+          alias_method :build_state, :__orig_build_state
+          remove_method :__orig_build_state
+        end
+      end
+    end
+  end
+
   private
 
   def write_state_file(selectors)

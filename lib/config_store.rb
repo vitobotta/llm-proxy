@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require "logger"
 require_relative "config_validator"
 
 module ConfigStore
@@ -8,6 +9,7 @@ module ConfigStore
   @lock = Mutex.new
   @data = {}
   @config_path = ENV.fetch("CONFIG_FILE", DEFAULT_CONFIG_PATH)
+  @app_ref = nil
 
   def self.load!(raw_config, logger:)
     new_data = build_data(raw_config, logger)
@@ -17,6 +19,11 @@ module ConfigStore
       merge_selectors!(old_data, new_data)
     end
     self
+  end
+
+  def self.register_app!(app)
+    @app_ref = app
+    update_settings!(app)
   end
 
   def self.config_path = @config_path
@@ -38,6 +45,7 @@ module ConfigStore
       HTTPSupport.prewarm_connections!(raw, providers, logger, timeouts: timeouts)
     end
     update_logger_level!(raw, logger)
+    update_settings!(@app_ref) if @app_ref
     logger.info("Configuration reloaded from config.yaml")
     true
   rescue => e

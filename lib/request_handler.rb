@@ -64,58 +64,62 @@ module RequestHandler
       tracking = ConfigStore.tracking_enabled
       accumulated = tracking ? +"" : nil
 
-      http.request(request) do |response|
-        if response.is_a?(Net::HTTPSuccess)
-          response.read_body do |chunk|
-            begin
-              out << chunk
-            rescue Errno::EPIPE, IOError
-              raise HTTPSupport::ClientDisconnected
+      begin
+        http.request(request) do |response|
+          if response.is_a?(Net::HTTPSuccess)
+            response.read_body do |chunk|
+              begin
+                out << chunk
+              rescue Errno::EPIPE, IOError
+                raise HTTPSupport::ClientDisconnected
+              end
+
+              if tracking
+                if accumulated
+                  accumulated << chunk
+                  if accumulated.bytesize > MAX_ACCUMULATED_SIZE
+                    accumulated = nil
+                  end
+                end
+                now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+                cr = Streaming.parse_chunk(chunk)
+                if cr.usage
+                  usage_data = cr.usage
+                  accumulated = nil
+                end
+                track_chunk!(cr, now, timers)
+              end
             end
 
             if tracking
-              if accumulated
-                accumulated << chunk
-                if accumulated.bytesize > MAX_ACCUMULATED_SIZE
-                  accumulated = nil
+              unless usage_data
+                fallback = Streaming.parse_chunk(accumulated.to_s) if accumulated
+                usage_data = fallback.usage if fallback&.usage
+              end
+
+              unless usage_data
+                if accumulated
+                  counts = Streaming.extract_sse_content(accumulated.to_s)
+                  total = counts[:content_len] + counts[:thinking_len]
+                  if total > 0
+                    usage_data = {
+                      "completion_tokens" => total,
+                      "completion_tokens_details" => { "reasoning_tokens" => counts[:thinking_len] }
+                    }
+                  end
                 end
               end
-              now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-              cr = Streaming.parse_chunk(chunk)
-              if cr.usage
-                usage_data = cr.usage
-                accumulated = nil
-              end
-              track_chunk!(cr, now, timers)
-            end
-          end
 
-          if tracking
-            unless usage_data
-              fallback = Streaming.parse_chunk(accumulated.to_s) if accumulated
-              usage_data = fallback.usage if fallback&.usage
+              stream_result = build_stream_result(log_prefix, timers, usage_data)
+            else
+              stream_result = { success: true }
             end
-
-            unless usage_data
-              if accumulated
-                counts = Streaming.extract_sse_content(accumulated.to_s)
-                total = counts[:content_len] + counts[:thinking_len]
-                if total > 0
-                  usage_data = {
-                    "completion_tokens" => total,
-                    "completion_tokens_details" => { "reasoning_tokens" => counts[:thinking_len] }
-                  }
-                end
-              end
-            end
-
-            stream_result = build_stream_result(log_prefix, timers, usage_data)
           else
-            stream_result = { success: true }
+            stream_result = handle_upstream_error(response, log_prefix)
           end
-        else
-          stream_result = handle_upstream_error(response, log_prefix)
         end
+      ensure
+        http.finish if http&.started?
       end
       stream_result
     end
@@ -127,13 +131,17 @@ module RequestHandler
     try_with_retries(log_prefix: log_prefix, body_model: body_model) do
       http = HTTPSupport.create_http(uri, timeouts: ConfigStore.timeouts)
       http.start unless http.started?
-      response = http.request(request)
+      begin
+        response = http.request(request)
 
-      if response.is_a?(Net::HTTPSuccess)
-        settings.logger.info("#{log_prefix} Success")
-        { success: true, response: [response.code.to_i, { "Content-Type" => "application/json" }, [response.body]] }
-      else
-        handle_upstream_error(response, log_prefix)
+        if response.is_a?(Net::HTTPSuccess)
+          settings.logger.info("#{log_prefix} Success")
+          { success: true, response: [response.code.to_i, { "Content-Type" => "application/json" }, [response.body]] }
+        else
+          handle_upstream_error(response, log_prefix)
+        end
+      ensure
+        http.finish if http&.started?
       end
     end
   end

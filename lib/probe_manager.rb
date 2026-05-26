@@ -13,18 +13,21 @@ module ProbeManager
 
     Thread.new do
       begin
-        threads = []
-        results = {}
-
-        selector.other_providers.each do |provider_config|
+        threads = selector.other_providers.map do |provider_config|
           p_name = provider_config["provider"]
-          threads << Thread.new do
-            metrics = probe_provider(provider_config, path, PROBE_BODY, provider_config["model"], headers, timeouts: timeouts, logger: logger)
-            results[p_name] = metrics
+          Thread.new do
+            Thread.current.report_on_exception = false
+            begin
+              metrics = probe_provider(provider_config, path, PROBE_BODY, provider_config["model"], headers, timeouts: timeouts, logger: logger)
+              [p_name, metrics]
+            rescue => e
+              logger.error("[probe:#{probe_id}] #{p_name} thread error: #{e.class}: #{e.message}")
+              [p_name, { ttft: Float::INFINITY, tps: nil }]
+            end
           end
         end
 
-        threads.each(&:join)
+        results = threads.map(&:value)
 
         results.each do |p_name, m|
           selector.update_metrics(p_name, m[:ttft], m[:tps])
@@ -45,6 +48,7 @@ module ProbeManager
     pname = provider_config["provider"]
     uri, request = HTTPSupport.build_upstream_request(provider_config, path, body, body_model, incoming_headers, stream: true)
 
+    http = nil
     begin
       http = HTTPSupport.create_http(uri, timeouts: timeouts)
       http.start unless http.started?
@@ -95,6 +99,12 @@ module ProbeManager
     rescue => e
       logger.debug("[probe] #{pname}: #{e.message}")
       { ttft: Float::INFINITY, tps: nil }
+    ensure
+      begin
+        http.finish if http&.started?
+      rescue StandardError
+        nil
+      end
     end
   end
 end

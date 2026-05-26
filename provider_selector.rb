@@ -23,7 +23,7 @@ class ProviderSelector
     defined?(ConfigStore) ? ConfigStore.config_path : File.join(__dir__, "config", "config.yaml")
   end
 
-  def self.persist_active_provider(model_name, provider_index)
+  def self.persist_active_provider(model_name, provider_index, logger: nil)
     CONFIG_LOCK.synchronize do
       raw = YAML.unsafe_load_file(config_path)
       model_entry = raw["models"].find { |m| m["name"] == model_name }
@@ -36,6 +36,9 @@ class ProviderSelector
       File.write(config_path, YAML.dump(raw))
     end
   rescue => e
+    msg = "[#{model_name}] Failed to persist active provider: #{e.class}: #{e.message}"
+    logger&.warn(msg)
+    warn(msg) if logger.nil?
     nil
   end
 
@@ -146,12 +149,13 @@ class ProviderSelector
     end
   end
 
-  def persist_active_index
-    auto_switch = @lock.synchronize { @model_config&.dig("auto_switch") == true }
+  def persist_active_index(logger: nil)
+    auto_switch, idx = @lock.synchronize do
+      [@model_config&.dig("auto_switch") == true, @active_index]
+    end
     return unless auto_switch
 
-    idx = @lock.synchronize { @active_index }
-    self.class.persist_active_provider(@model_name, idx)
+    self.class.persist_active_provider(@model_name, idx, logger: logger)
   end
 
   def record_failure(provider_name)
