@@ -1,6 +1,12 @@
 # frozen_string_literal: true
 
 module ConfigValidator
+  MAX_MAX_ATTEMPTS = 10
+  MAX_PROBE_INTERVAL = 100_000
+  MAX_SAMPLE_WINDOW = 86_400      # 1 day
+  MAX_BACKOFF_BASE = 60
+  MAX_MAX_REQUEST_BODY = 100 * 1024 * 1024  # 100 MB
+
   def self.validate!(config, log)
     errors, warnings = run_checks(config)
 
@@ -82,8 +88,46 @@ module ConfigValidator
       warnings << "Incoming request auth is enabled — clients must send Authorization: Bearer <token>"
     end
 
-    if config.dig("retries", "max_attempts") && config.dig("retries", "max_attempts") > 5
-      warnings << "max_attempts > 5 may cause long retry loops"
+    if (n = config.dig("retries", "max_attempts"))
+      if !n.is_a?(Integer) || n < 1
+        errors << "retries.max_attempts must be a positive integer (got #{n.inspect})"
+      elsif n > MAX_MAX_ATTEMPTS
+        errors << "retries.max_attempts is #{n}, refusing (>#{MAX_MAX_ATTEMPTS}). Reduce to keep request latency bounded."
+      elsif n > 5
+        warnings << "max_attempts > 5 may cause long retry loops"
+      end
+    end
+
+    if (n = config.dig("retries", "backoff_base"))
+      if !n.is_a?(Numeric) || n <= 0 || n > MAX_BACKOFF_BASE
+        errors << "retries.backoff_base must be between 0 and #{MAX_BACKOFF_BASE} seconds (got #{n.inspect})"
+      end
+    end
+
+    if (n = config.dig("performance", "probe_interval"))
+      if !n.is_a?(Integer) || n < 1 || n > MAX_PROBE_INTERVAL
+        errors << "performance.probe_interval must be 1..#{MAX_PROBE_INTERVAL} (got #{n.inspect})"
+      end
+    end
+
+    if (n = config.dig("performance", "sample_window"))
+      if !n.is_a?(Integer) || n < 1 || n > MAX_SAMPLE_WINDOW
+        errors << "performance.sample_window must be 1..#{MAX_SAMPLE_WINDOW} seconds (got #{n.inspect})"
+      end
+    end
+
+    if (n = config.dig("limits", "max_request_body"))
+      if !n.is_a?(Integer) || n < 1024 || n > MAX_MAX_REQUEST_BODY
+        errors << "limits.max_request_body must be 1024..#{MAX_MAX_REQUEST_BODY} bytes (got #{n.inspect})"
+      end
+    end
+
+    %w[open read write].each do |kind|
+      if (n = config.dig("timeouts", kind))
+        if !n.is_a?(Numeric) || n < 1 || n > 86_400
+          errors << "timeouts.#{kind} must be 1..86400 seconds (got #{n.inspect})"
+        end
+      end
     end
 
     [errors, warnings]

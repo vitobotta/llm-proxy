@@ -128,6 +128,22 @@ class TestHTTPSupport < Minitest::Test
     assert_equal "Test", request["X-Title"]
   end
 
+  def test_build_upstream_request_strips_protected_provider_headers
+    provider_config = {
+      "provider" => "openai",
+      "base_url" => "https://api.openai.com/v1",
+      "api_key" => "real-key",
+      "model" => "m",
+      "headers" => { "Authorization" => "Bearer hijack", "Host" => "evil.example.com", "X-Custom" => "ok" }
+    }
+    _uri, request = HTTPSupport.build_upstream_request(
+      provider_config, "chat/completions", {}, "m", nil, stream: true
+    )
+    assert_equal "Bearer real-key", request["Authorization"], "provider config Authorization must not override real auth"
+    assert_equal "ok", request["X-Custom"]
+    refute_equal "evil.example.com", request["Host"]
+  end
+
   def test_build_upstream_request_protects_incoming_headers
     provider_config = {
       "provider" => "openai",
@@ -166,6 +182,58 @@ class TestHTTPSupport < Minitest::Test
     past = Time.utc(2026, 5, 26, 13, 0, 0).httpdate
     val = HTTPSupport.parse_retry_after(past, now: now)
     assert val <= 0, "past date should yield non-positive delay, got: #{val}"
+  end
+
+  class FakeResponse
+    def initialize(body:, content_length: nil)
+      @body = body
+      @headers = {}
+      @headers["Content-Length"] = content_length.to_s if content_length
+    end
+
+    def [](k)
+      @headers[k]
+    end
+
+    def body
+      @body
+    end
+  end
+
+  def test_read_capped_error_body_truncates_oversize
+    big = "x" * (HTTPSupport::MAX_UPSTREAM_BODY_SIZE + 100)
+    r = FakeResponse.new(body: big)
+    out = HTTPSupport.read_capped_error_body(r)
+    assert out.end_with?("... (truncated)")
+    assert_equal HTTPSupport::MAX_UPSTREAM_BODY_SIZE + "... (truncated)".bytesize, out.bytesize
+  end
+
+  def test_read_capped_error_body_short_circuits_on_content_length
+    # 1 GB Content-Length — we should refuse to even call .body.
+    body_invoked = false
+    fake = Class.new do
+      define_method(:initialize) { @hdr = { "Content-Length" => (1024 * 1024 * 1024).to_s } }
+      define_method(:[]) { |k| @hdr[k] }
+      define_method(:body) do
+        body_invoked = true
+        "x" * (1024 * 1024 * 1024)
+      end
+    end.new
+
+    out = HTTPSupport.read_capped_error_body(fake)
+    refute body_invoked, "body() must not be invoked when Content-Length exceeds cap"
+    assert_includes out, "exceeds"
+    assert_includes out, "suppressed"
+  end
+
+  def test_read_capped_error_body_handles_read_failure
+    fake = Class.new do
+      def [](_); nil; end
+      def body; raise IOError, "stream broken"; end
+    end.new
+    out = HTTPSupport.read_capped_error_body(fake)
+    assert_includes out, "failed to read"
+    assert_includes out, "IOError"
   end
 
   def test_uri_cache_evicts_oldest_at_capacity

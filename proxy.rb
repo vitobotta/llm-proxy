@@ -2,6 +2,7 @@
 # frozen_string_literal: true
 
 require "sinatra/base"
+require "rack/utils"
 require "json"
 require "yaml"
 require "net/http"
@@ -22,7 +23,7 @@ require_relative "provider_selector"
 CONFIG_PATH = ENV.fetch("CONFIG_FILE", File.join(__dir__, "config", "config.yaml"))
 
 def self.load_raw_config!(path)
-  YAML.unsafe_load_file(path)
+  ConfigStore.load_yaml_file(path)
 rescue Errno::ENOENT
   warn("[BOOT] Config file not found at #{path}.")
   warn("[BOOT] Set CONFIG_FILE or copy config/config.yaml.example to #{path} and edit it.")
@@ -30,7 +31,7 @@ rescue Errno::ENOENT
 rescue Errno::EACCES => e
   warn("[BOOT] Cannot read config file at #{path}: #{e.message}")
   exit(78)
-rescue Psych::SyntaxError => e
+rescue Psych::SyntaxError, Psych::DisallowedClass => e
   warn("[BOOT] Config file at #{path} has invalid YAML: #{e.message}")
   exit(78)
 rescue => e
@@ -76,17 +77,36 @@ class LLMProxy < Sinatra::Base
   end
 
   before do
-    @request_id = SecureRandom.uuid[0..7]
+    @request_id = SecureRandom.hex(8)
     @request_start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
     settings.logger.info("[#{@request_id}] #{request.request_method} #{request.path}")
 
     auth_token = ConfigStore.auth_token
-    if auth_token
+    if auth_token && requires_auth?(request.path)
       auth_header = request.env["HTTP_AUTHORIZATION"].to_s
       token = auth_header.start_with?("Bearer ") ? auth_header[7..] : auth_header
-      unless token && token == auth_token
+      unless token && Rack::Utils.secure_compare(token, auth_token)
         halt json_error(status: 401, message: "Unauthorized", type: "authentication_error")
       end
+    end
+  end
+
+  def requires_auth?(path)
+    # /health is always public so load balancers can probe.
+    # /metrics is public by default; if auth.metrics_token is set,
+    # it is gated separately below via metrics_token_required!
+    return false if path == "/health"
+    return false if path == "/metrics"
+    true
+  end
+
+  def metrics_token_required!
+    token = ConfigStore.metrics_token
+    return unless token
+    auth_header = request.env["HTTP_AUTHORIZATION"].to_s
+    provided = auth_header.start_with?("Bearer ") ? auth_header[7..] : auth_header
+    unless provided && Rack::Utils.secure_compare(provided, token)
+      halt json_error(status: 401, message: "Unauthorized", type: "authentication_error")
     end
   end
 
@@ -178,6 +198,7 @@ class LLMProxy < Sinatra::Base
   end
 
   get "/metrics" do
+    metrics_token_required!
     content_type "text/plain; version=0.0.4"
     Metrics.to_prometheus
   end
@@ -205,10 +226,17 @@ class LLMProxy < Sinatra::Base
     }.compact.to_json
   end
 
+  not_found do
+    json_error(status: 404, message: "Not Found", detail: request.path, type: "not_found")
+  end
+
   error do
     e = env["sinatra.error"]
     settings.logger.error("[#{@request_id}] Unhandled error: #{e.class}: #{e.message}")
-    settings.logger.error(e.backtrace[0..10].join("\n")) if e.backtrace
+    if e.backtrace
+      settings.logger.error(e.backtrace.first(20).join("\n"))
+      settings.logger.debug(e.backtrace.join("\n"))
+    end
     json_error(status: 500, message: "Internal server error", detail: e.message, type: "internal_error")
   end
 end

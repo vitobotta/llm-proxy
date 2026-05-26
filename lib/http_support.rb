@@ -46,6 +46,25 @@ module HTTPSupport
   }.freeze
   DEFAULT_AUTH = ->(req, key) { req["Authorization"] = "Bearer #{key}" }
 
+  # Reads an upstream error response body, capping memory use.
+  # If Content-Length advertises an oversized body, we skip the read
+  # entirely so a buggy or hostile upstream can't force a multi-GB allocation.
+  def self.read_capped_error_body(response)
+    cl = response["Content-Length"]&.to_i
+    if cl && cl > MAX_UPSTREAM_BODY_SIZE
+      return "[upstream error body of #{cl} bytes exceeds #{MAX_UPSTREAM_BODY_SIZE}-byte cap, suppressed]"
+    end
+
+    body = begin
+      response.body
+    rescue StandardError => e
+      "[failed to read upstream body: #{e.class}: #{e.message}]"
+    end
+
+    return body if body.nil? || body.bytesize <= MAX_UPSTREAM_BODY_SIZE
+    body.byteslice(0, MAX_UPSTREAM_BODY_SIZE) + "... (truncated)"
+  end
+
   # Parses an RFC 7231 Retry-After value (either a delta-seconds integer
   # or an HTTP-date) into a Float number of seconds from now.
   # Returns 0.0 if the value can't be parsed.
@@ -82,7 +101,12 @@ module HTTPSupport
 
     (AUTH_STRATEGIES[provider_config["provider"]] || DEFAULT_AUTH).call(request, provider_config["api_key"])
 
-    provider_config["headers"]&.each { |k, v| request[k] = v }
+    provider_config["headers"]&.each do |k, v|
+      # PROTECTED_HEADERS are stripped from provider config too so a fat-fingered
+      # `Authorization:` or `Host:` in config can't override the auth strategy.
+      next if PROTECTED_HEADERS.include?(k.to_s.downcase)
+      request[k] = v
+    end
 
     incoming_headers&.each do |key, value|
       next if PROTECTED_HEADERS.include?(key.downcase)
@@ -207,10 +231,7 @@ module HTTPSupport
 
   def handle_upstream_error(response, log_prefix)
     code = response.code.to_i
-    error_body = response.body
-    if error_body && error_body.bytesize > MAX_UPSTREAM_BODY_SIZE
-      error_body = error_body.byteslice(0, MAX_UPSTREAM_BODY_SIZE) + "... (truncated)"
-    end
+    error_body = HTTPSupport.read_capped_error_body(response)
     error_msg = "HTTP #{code}: #{error_body}"
     settings.logger.warn("#{log_prefix} Failed: #{error_msg}")
 

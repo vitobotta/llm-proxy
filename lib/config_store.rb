@@ -1,10 +1,22 @@
 # frozen_string_literal: true
 
 require "logger"
+require "yaml"
+require "date"
 require_relative "config_validator"
 
 module ConfigStore
   DEFAULT_CONFIG_PATH = File.join(File.dirname(__dir__), "config", "config.yaml")
+
+  # Permitted classes for YAML parsing. Config schema is strings, integers,
+  # floats, booleans, hashes, arrays — nothing exotic. Keeping this strict
+  # means a malicious config (e.g. from a compromised host volume) can't
+  # trigger Ruby object deserialization.
+  YAML_PERMITTED_CLASSES = [Symbol, Date, Time].freeze
+
+  def self.load_yaml_file(path)
+    YAML.safe_load(File.read(path), permitted_classes: YAML_PERMITTED_CLASSES, aliases: true)
+  end
 
   @lock = Mutex.new
   @data = {}
@@ -35,7 +47,7 @@ module ConfigStore
   def self.config_path = @config_path
 
   def self.reload!(logger:)
-    raw = YAML.unsafe_load_file(config_path)
+    raw = load_yaml_file(config_path)
     errors, warnings = ConfigValidator.validate(raw, logger)
     unless errors.empty?
       errors.each { |e| logger.error("Config reload error: #{e}") }
@@ -64,6 +76,7 @@ module ConfigStore
   def self.selectors = @lock.synchronize { @data[:selectors] }
   def self.timeouts = @lock.synchronize { @data[:timeouts] }
   def self.auth_token = @lock.synchronize { @data[:auth_token] }
+  def self.metrics_token = @lock.synchronize { @data[:metrics_token] }
   def self.max_body_size = @lock.synchronize { @data[:max_body_size] }
   def self.tracking_enabled = @lock.synchronize { @data[:tracking_enabled] }
   def self.probing_enabled = @lock.synchronize { @data[:probing_enabled] }
@@ -125,6 +138,7 @@ module ConfigStore
         write: raw.dig("timeouts", "write") || 60
       }.freeze,
       auth_token: raw.dig("auth", "token"),
+      metrics_token: raw.dig("auth", "metrics_token"),
       max_body_size: raw.dig("limits", "max_request_body") || 10 * 1024 * 1024,
       tracking_enabled: tracking_enabled,
       probing_enabled: probing_enabled,

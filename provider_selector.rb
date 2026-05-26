@@ -25,7 +25,7 @@ class ProviderSelector
 
   def self.persist_active_provider(model_name, provider_index, logger: nil)
     CONFIG_LOCK.synchronize do
-      raw = YAML.unsafe_load_file(config_path)
+      raw = defined?(ConfigStore) ? ConfigStore.load_yaml_file(config_path) : YAML.safe_load(File.read(config_path), permitted_classes: [Symbol, Date, Time], aliases: true)
       model_entry = raw["models"].find { |m| m["name"] == model_name }
       return unless model_entry && model_entry["providers"]
 
