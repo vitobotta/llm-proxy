@@ -2,6 +2,7 @@
 
 require_relative "test_helper"
 require "tmpdir"
+require "set"
 require_relative "../lib/config_validator"
 require_relative "../lib/config_store"
 
@@ -108,6 +109,61 @@ class TestConfigStore < Minitest::Test
       if method_defined?(:__orig_prewarm3) || private_method_defined?(:__orig_prewarm3)
         alias_method :prewarm_connections!, :__orig_prewarm3
         remove_method :__orig_prewarm3
+      end
+    end
+  end
+
+  def test_concurrent_snapshot_reads_during_reload_are_internally_consistent
+    # Each call to ConfigStore.<accessor> is atomic on its own (single ivar
+    # read under MRI's GVL), but two separate calls are NOT guaranteed to
+    # come from the same snapshot — a reload may happen between them.
+    # Consumers that need a consistent view of multiple fields must grab the
+    # @data snapshot once and read fields off it. This test pins that
+    # invariant: snapshot-based reads must never mix old + new values.
+    HTTPSupport.singleton_class.class_eval do
+      alias_method :__orig_prewarm_stress, :prewarm_connections!
+      define_method(:prewarm_connections!) { |*_args, **_kw| nil }
+    end
+
+    cfg_a = MOCK_CONFIG.merge("retries" => { "max_attempts" => 2, "backoff_base" => 1 })
+    cfg_b = MOCK_CONFIG.merge("retries" => { "max_attempts" => 7, "backoff_base" => 3 })
+
+    stop = false
+    seen_combos = Set.new
+    seen_lock = Mutex.new
+
+    readers = 8.times.map do
+      Thread.new do
+        until stop
+          snap = ConfigStore.instance_variable_get(:@data)
+          ma = snap[:max_attempts]
+          bb = snap[:backoff_base]
+          seen_lock.synchronize { seen_combos << [ma, bb] }
+        end
+      end
+    end
+
+    writer = Thread.new do
+      30.times do |i|
+        cfg = i.even? ? cfg_a : cfg_b
+        File.write(@config_path, YAML.dump(cfg))
+        ConfigStore.reload!(logger: NullLogger.new)
+      end
+    end
+
+    writer.join
+    stop = true
+    readers.each(&:join)
+
+    allowed = [[2, 1], [7, 3]]
+    torn = seen_combos.reject { |c| allowed.include?(c) }
+    assert_empty torn, "snapshot reads must never see torn combos; got: #{torn.inspect}"
+    refute_empty seen_combos
+  ensure
+    HTTPSupport.singleton_class.class_eval do
+      if method_defined?(:__orig_prewarm_stress) || private_method_defined?(:__orig_prewarm_stress)
+        alias_method :prewarm_connections!, :__orig_prewarm_stress
+        remove_method :__orig_prewarm_stress
       end
     end
   end

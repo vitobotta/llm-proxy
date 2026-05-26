@@ -18,25 +18,36 @@ module ConfigStore
     YAML.safe_load(File.read(path), permitted_classes: YAML_PERMITTED_CLASSES, aliases: true)
   end
 
+  # Writer-side lock: only serializes concurrent load!/reload! callers.
+  # READS DO NOT TAKE THIS LOCK.
+  #
+  # @data is replaced with a fully-built snapshot via a single assignment.
+  # Under MRI's GVL, ivar assignment is atomic — readers always see either
+  # the old snapshot or the new one, never a torn read. Writers must compute
+  # the new snapshot (including merge_selectors!) in full before swapping.
   @lock = Mutex.new
   @data = {}
   @config_path = ENV.fetch("CONFIG_FILE", DEFAULT_CONFIG_PATH)
   @app_ref = nil
+  @last_added_provider_keys = [].freeze
 
   def self.load!(raw_config, logger:)
     new_data = build_data(raw_config, logger)
     @lock.synchronize do
       old_data = @data
       old_provider_keys = (old_data[:providers] || {}).keys
-      @data = new_data
+      # Mutate new_data into final form (carry over preserved selectors)
+      # BEFORE swapping so readers never observe an in-progress merge.
       merge_selectors!(old_data, new_data)
-      @last_added_provider_keys = (new_data[:providers] || {}).keys - old_provider_keys
+      added = (new_data[:providers] || {}).keys - old_provider_keys
+      @last_added_provider_keys = added.freeze
+      @data = new_data
     end
     self
   end
 
   def self.last_added_provider_keys
-    @lock.synchronize { (@last_added_provider_keys || []).dup }
+    (@last_added_provider_keys || []).dup
   end
 
   def self.register_app!(app)
@@ -70,30 +81,31 @@ module ConfigStore
     false
   end
 
-  def self.config = @lock.synchronize { @data[:config] }
-  def self.providers = @lock.synchronize { @data[:providers] }
-  def self.models = @lock.synchronize { @data[:models] }
-  def self.selectors = @lock.synchronize { @data[:selectors] }
-  def self.timeouts = @lock.synchronize { @data[:timeouts] }
-  def self.auth_token = @lock.synchronize { @data[:auth_token] }
-  def self.metrics_token = @lock.synchronize { @data[:metrics_token] }
-  def self.max_body_size = @lock.synchronize { @data[:max_body_size] }
-  def self.tracking_enabled = @lock.synchronize { @data[:tracking_enabled] }
-  def self.probing_enabled = @lock.synchronize { @data[:probing_enabled] }
-  def self.auto_switch = @lock.synchronize { @data[:auto_switch] }
-  def self.probe_interval = @lock.synchronize { @data[:probe_interval] }
-  def self.sample_window = @lock.synchronize { @data[:sample_window] }
-  def self.max_attempts = @lock.synchronize { @data[:max_attempts] }
-  def self.backoff_base = @lock.synchronize { @data[:backoff_base] }
+  # All accessors below are LOCK-FREE — they perform a single ivar read
+  # plus a hash lookup. Safe under MRI's GVL; see the @data comment above.
+  def self.config = @data[:config]
+  def self.providers = @data[:providers]
+  def self.models = @data[:models]
+  def self.selectors = @data[:selectors]
+  def self.timeouts = @data[:timeouts]
+  def self.auth_token = @data[:auth_token]
+  def self.metrics_token = @data[:metrics_token]
+  def self.max_body_size = @data[:max_body_size]
+  def self.tracking_enabled = @data[:tracking_enabled]
+  def self.probing_enabled = @data[:probing_enabled]
+  def self.auto_switch = @data[:auto_switch]
+  def self.probe_interval = @data[:probe_interval]
+  def self.sample_window = @data[:sample_window]
+  def self.max_attempts = @data[:max_attempts]
+  def self.backoff_base = @data[:backoff_base]
 
-  def self.model(name) = @lock.synchronize { @data[:models][name] }
-  def self.selector(name) = @lock.synchronize { @data[:selectors][name] }
+  def self.model(name) = @data[:models][name]
+  def self.selector(name) = @data[:selectors][name]
 
   def self.update_settings!(app)
-    @lock.synchronize do
-      app.set :max_attempts, @data[:max_attempts]
-      app.set :backoff_base, @data[:backoff_base]
-    end
+    snapshot = @data
+    app.set :max_attempts, snapshot[:max_attempts]
+    app.set :backoff_base, snapshot[:backoff_base]
   end
 
   private

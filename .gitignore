@@ -16,7 +16,6 @@ data/provider_state.json
 /test/tmp/
 /test/version_tmp/
 /tmp/
-Gemfile.lock
 
 # Bundler
 /.bundle/

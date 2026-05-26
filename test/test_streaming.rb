@@ -32,6 +32,38 @@ class TestStreaming < Minitest::Test
     assert_equal({ "prompt_tokens" => 10, "completion_tokens" => 50 }, cr.usage)
   end
 
+  def test_parse_chunk_word_usage_in_content_is_not_treated_as_usage_block
+    # The fast-path `chunk.include?("usage")` will fire, but the actual
+    # JSON has no `usage` key — so parse_chunk should return usage=nil.
+    chunk = 'data: {"choices":[{"delta":{"content":"Check your usage limit"}}]}' + "\n\n"
+    cr = Streaming.parse_chunk(chunk)
+    assert_nil cr.usage
+    assert cr.has_content
+  end
+
+  def test_parse_chunk_word_content_inside_string_does_not_set_has_content
+    # The substring "content" appears inside a string value, not as a JSON key.
+    # The regex requires it to be preceded by a non-identifier char and followed
+    # by `:`, so it must not match here.
+    chunk = 'data: {"choices":[{"delta":{"role":"assistant","name":"my_content_helper"}}]}' + "\n\n"
+    cr = Streaming.parse_chunk(chunk)
+    refute cr.has_content, "content substring inside a value must not flip has_content"
+  end
+
+  def test_parse_chunk_handles_chunk_with_only_done
+    cr = Streaming.parse_chunk("data: [DONE]\n\n")
+    refute cr.has_content
+    refute cr.has_thinking
+    assert_nil cr.usage
+  end
+
+  def test_parse_chunk_oversize_chunk_does_not_blow_up
+    # A 1 MB chunk built from many tiny SSE lines — parse_chunk must complete.
+    chunk = "data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n" * 10_000
+    cr = Streaming.parse_chunk(chunk)
+    assert cr.has_content
+  end
+
   def test_parse_chunk_ignores_done_line
     chunk = "data: [DONE]\n\n"
     cr = Streaming.parse_chunk(chunk)

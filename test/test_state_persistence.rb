@@ -185,6 +185,52 @@ class TestStatePersistence < Minitest::Test
     end
   end
 
+  def test_load_returns_nil_for_malformed_json
+    old_env = ENV["STATE_DIR"]
+    ENV["STATE_DIR"] = @tmpdir
+    begin
+      File.write(File.join(@tmpdir, "provider_state.json"), "{not valid json")
+      assert_nil StatePersistence.load
+    ensure
+      ENV["STATE_DIR"] = old_env
+    end
+  end
+
+  def test_load_returns_nil_when_not_a_hash
+    old_env = ENV["STATE_DIR"]
+    ENV["STATE_DIR"] = @tmpdir
+    begin
+      File.write(File.join(@tmpdir, "provider_state.json"), JSON.generate([1, 2, 3]))
+      assert_nil StatePersistence.load
+    ensure
+      ENV["STATE_DIR"] = old_env
+    end
+  end
+
+  def test_load_returns_nil_when_version_missing
+    old_env = ENV["STATE_DIR"]
+    ENV["STATE_DIR"] = @tmpdir
+    begin
+      File.write(File.join(@tmpdir, "provider_state.json"), JSON.generate({ "models" => {} }))
+      assert_nil StatePersistence.load
+    ensure
+      ENV["STATE_DIR"] = old_env
+    end
+  end
+
+  def test_load_returns_nil_for_truncated_file
+    old_env = ENV["STATE_DIR"]
+    ENV["STATE_DIR"] = @tmpdir
+    begin
+      full = JSON.generate({ "version" => 1, "saved_at" => 1.0, "models" => { "x" => { "active_provider" => "y" } } })
+      truncated = full[0..(full.bytesize / 2)]
+      File.write(File.join(@tmpdir, "provider_state.json"), truncated)
+      assert_nil StatePersistence.load
+    ensure
+      ENV["STATE_DIR"] = old_env
+    end
+  end
+
   def test_save_cleans_up_temp_file_on_rename_failure
     old_env = ENV["STATE_DIR"]
     ENV["STATE_DIR"] = @tmpdir

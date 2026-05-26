@@ -88,13 +88,13 @@ module Streaming
       end
     end
 
-    result.has_thinking = true if !result.has_thinking && THINKING_PATTERNS.any? { |r| chunk.match?(r) }
+    result.has_thinking = THINKING_PATTERNS.any? { |r| chunk.match?(r) }
 
     if chunk.match?(TOOL_CALL_PATTERN)
       result.has_tool_call = true
       result.has_content = true
-    elsif !result.has_content
-      result.has_content = true if CONTENT_PATTERNS.any? { |r| chunk.match?(r) }
+    else
+      result.has_content = CONTENT_PATTERNS.any? { |r| chunk.match?(r) }
     end
 
     result
