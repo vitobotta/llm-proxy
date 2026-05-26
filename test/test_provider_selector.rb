@@ -30,6 +30,23 @@ class TestProviderSelector < Minitest::Test
     end
   end
 
+  def test_provider_stats_tracks_last_success_at
+    selector
+    @selector.record_success("prov_a")
+    sleep(0.01)
+    @selector.record_success("prov_a")
+
+    stats = @selector.provider_stats["prov_a"]
+    refute_nil stats[:last_success_at], "last_success_at must be set"
+    assert stats[:last_success_age_seconds] >= 0
+    assert stats[:last_success_age_seconds] < 5, "should be fresh, got #{stats[:last_success_age_seconds]}"
+
+    # Provider that's never succeeded gets nil
+    other = @selector.provider_stats["prov_b"]
+    assert_nil other[:last_success_at]
+    assert_nil other[:last_success_age_seconds]
+  end
+
   def setup
     @providers = [
       { "provider" => "prov_a", "model" => "m-a", "base_url" => "https://a.example.com/v1", "api_key" => "ka" }.freeze,

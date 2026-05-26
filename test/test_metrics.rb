@@ -76,6 +76,23 @@ class TestMetrics < Minitest::Test
     assert_match %r{llm_proxy_requests_total\{status="200"\} #{expected}}, out
   end
 
+  def test_upstream_ttft_histogram_emits_with_provider_label
+    Metrics.observe(:upstream_ttft_seconds, 0.3, labels: { provider: "wafer", model: "glm-5" })
+    Metrics.observe(:upstream_ttft_seconds, 1.5, labels: { provider: "wafer", model: "glm-5" })
+    out = Metrics.to_prometheus
+    assert_includes out, "# TYPE llm_proxy_upstream_ttft_seconds histogram"
+    assert_includes out, %{llm_proxy_upstream_ttft_seconds_count{provider="wafer",model="glm-5"} 2}
+    assert_match(/llm_proxy_upstream_ttft_seconds_bucket\{provider="wafer",model="glm-5",le="0\.5"\} 1/, out)
+  end
+
+  def test_provider_failure_reason_label
+    Metrics.increment(:provider_failure, labels: { provider: "wafer", model: "glm-5", reason: "rate_limited" })
+    Metrics.increment(:provider_failure, labels: { provider: "wafer", model: "glm-5", reason: "timeout" })
+    out = Metrics.to_prometheus
+    assert_match(/provider_failure_total\{[^}]*reason="rate_limited"\} 1/, out)
+    assert_match(/provider_failure_total\{[^}]*reason="timeout"\} 1/, out)
+  end
+
   def test_label_values_are_escaped
     Metrics.increment(:provider_failure, labels: { provider: %(weird"value\nwith\\backslash) })
     out = Metrics.to_prometheus

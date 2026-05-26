@@ -14,7 +14,8 @@ module Metrics
   }.freeze
 
   HISTOGRAM_HELP = {
-    request_duration_seconds: "End-to-end request duration in seconds"
+    request_duration_seconds: "End-to-end request duration in seconds",
+    upstream_ttft_seconds: "Per-provider time-to-first-token in seconds"
   }.freeze
 
   def self.increment(name, labels: {})

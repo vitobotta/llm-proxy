@@ -51,12 +51,28 @@ LOG_LEVELS = {
 BOOT_LOGGER.level = LOG_LEVELS.fetch(RAW_CONFIG.dig("logging", "level"), Logger::INFO)
 
 if RAW_CONFIG.dig("logging", "format") == "json"
+  # JSON formatter: caller can pass a String (becomes `message` field) or a
+  # Hash (fields spread into the JSON record). Thread-local request_id is
+  # included automatically when set by the before-hook.
   BOOT_LOGGER.formatter = proc do |severity, datetime, _progname, msg|
-    { timestamp: datetime.iso8601, level: severity, message: msg }.to_json + "\n"
+    record = { timestamp: datetime.iso8601, level: severity }
+    rid = Thread.current[:request_id]
+    record[:request_id] = rid if rid
+    if msg.is_a?(Hash)
+      record.merge!(msg)
+    else
+      record[:message] = msg.to_s
+    end
+    record.to_json + "\n"
   end
 else
   BOOT_LOGGER.formatter = proc do |severity, datetime, _progname, msg|
-    "[#{datetime.iso8601}] #{severity}: #{msg}\n"
+    if msg.is_a?(Hash)
+      pairs = msg.map { |k, v| "#{k}=#{v.is_a?(String) && v.include?(" ") ? v.inspect : v}" }
+      "[#{datetime.iso8601}] #{severity}: #{pairs.join(' ')}\n"
+    else
+      "[#{datetime.iso8601}] #{severity}: #{msg}\n"
+    end
   end
 end
 
@@ -79,7 +95,9 @@ class LLMProxy < Sinatra::Base
   before do
     @request_id = SecureRandom.hex(8)
     @request_start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-    settings.logger.info("[#{@request_id}] #{request.request_method} #{request.path}")
+    @client_ip = request.ip
+    Thread.current[:request_id] = @request_id
+    settings.logger.info("[#{@request_id}] #{request.request_method} #{request.path} from #{@client_ip}")
 
     auth_token = ConfigStore.auth_token
     if auth_token && requires_auth?(request.path)
@@ -115,6 +133,7 @@ class LLMProxy < Sinatra::Base
     settings.logger.info("[#{@request_id}] Completed #{response.status} in #{elapsed.round(3)}s")
     Metrics.increment(:requests_total, labels: { status: response.status })
     Metrics.observe(:request_duration_seconds, elapsed)
+    Thread.current[:request_id] = nil
   end
 
   def json_error(status:, message:, detail: nil, type: "proxy_error")
@@ -158,11 +177,25 @@ class LLMProxy < Sinatra::Base
         HTTPSupport::SSE_HEADERS.each { |k, v| headers[k] = v }
 
         stream do |out|
-          result = with_auto_select(
-            model: req[:model], model_name: req[:model_name],
-            path: endpoint, body: req[:body], headers: req[:headers]
-          ) { |pc, p, b, pm, h, lp| try_stream(pc, p, b, pm, h, out: out, log_prefix: lp) }
-          handle_streaming_error(result, out)
+          begin
+            result = with_auto_select(
+              model: req[:model], model_name: req[:model_name],
+              path: endpoint, body: req[:body], headers: req[:headers]
+            ) { |pc, p, b, pm, h, lp| try_stream(pc, p, b, pm, h, out: out, log_prefix: lp) }
+            handle_streaming_error(result, out)
+          rescue HTTPSupport::ClientDisconnected
+            # Expected: client closed the connection mid-stream.
+            settings.logger.info("[#{@request_id}] Client disconnected mid-stream")
+          rescue => e
+            settings.logger.error("[#{@request_id}] Streaming error: #{e.class}: #{e.message}")
+            settings.logger.debug(e.backtrace.join("\n")) if e.backtrace
+            begin
+              out << streaming_error("Streaming error: #{e.class}", detail: e.message)
+              out << "data: [DONE]\n\n"
+            rescue StandardError
+              nil
+            end
+          end
         end
       else
         result = with_auto_select(

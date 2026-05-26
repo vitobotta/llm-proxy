@@ -14,14 +14,24 @@ module RequestHandler
     deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + REQUEST_DEADLINE
 
     result = nil
+    attempts = []
+    deadline_hit = false
+
     providers.each_with_index do |provider_config, i|
       if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
-        settings.logger.warn("[#{@request_id}/#{model_name}] Request deadline exceeded, aborting")
+        deadline_hit = true
+        settings.logger.warn("[#{@request_id}/#{model_name}] Request deadline exceeded after trying #{attempts.size} provider(s), aborting")
         break
       end
       p_name = provider_config["provider"]
       p_model = provider_config["model"]
-      settings.logger.info("[#{@request_id}/#{model_name}] #{i == 0 ? 'Using' : 'Fallback to'} #{p_name} (#{p_model})")
+      if i == 0
+        settings.logger.info("[#{@request_id}/#{model_name}] Using #{p_name} (#{p_model})")
+      else
+        prev = attempts.last
+        prev_reason = prev ? "#{prev[:provider]} #{prev[:reason]}#{prev[:status] ? " (status=#{prev[:status]})" : ""}" : "previous failure"
+        settings.logger.info("[#{@request_id}/#{model_name}] Fallback to #{p_name} (#{p_model}) because #{prev_reason}")
+      end
 
       log_prefix = "[#{@request_id}/#{model_name}/#{p_name}]"
       result = yield(provider_config, path, body, p_model, headers, log_prefix)
@@ -29,10 +39,15 @@ module RequestHandler
         record_metrics(selector, p_name, result) if probing
         selector.record_success(p_name)
         Metrics.increment(:provider_success, labels: { provider: p_name, model: model_name })
+        if result[:ttft]
+          Metrics.observe(:upstream_ttft_seconds, result[:ttft], labels: { provider: p_name, model: model_name })
+        end
         break
       else
+        reason = RequestHandler.failure_reason(result)
+        attempts << { provider: p_name, status: result.is_a?(Hash) ? result[:status] : nil, error: result.is_a?(Hash) ? result[:error] : nil, reason: reason }
         selector.record_failure(p_name)
-        Metrics.increment(:provider_failure, labels: { provider: p_name, model: model_name })
+        Metrics.increment(:provider_failure, labels: { provider: p_name, model: model_name, reason: reason })
       end
     end
 
@@ -40,12 +55,54 @@ module RequestHandler
       ProbeManager.launch(selector, model_name, path, headers, timeouts: ConfigStore.timeouts, auto_switch: auto_switch, logger: settings.logger)
     end
 
-    result || { success: false, error: "All providers failed" }
+    return result if result&.dig(:success)
+
+    # All providers failed (or deadline hit). Synthesize a final result that
+    # carries enough context for operators to debug from the response alone.
+    failure_summary = build_failure_summary(attempts, deadline_hit)
+    settings.logger.warn("[#{@request_id}/#{model_name}] #{failure_summary[:error]}")
+    failure_summary
+  end
+
+  def build_failure_summary(attempts, deadline_hit)
+    if attempts.empty?
+      return { success: false, error: deadline_hit ? "Request deadline exceeded before any provider attempted" : "No providers available", status: 503 }
+    end
+
+    summary_lines = attempts.map { |a| "#{a[:provider]}: #{a[:reason]}#{a[:status] ? " (status=#{a[:status]})" : ""}" }
+    last_status = attempts.last[:status]
+    fallback_status = (last_status && last_status >= 400 && last_status < 600) ? last_status : 502
+
+    msg = deadline_hit ? "All providers failed (request deadline exceeded)" : "All providers failed"
+    {
+      success: false,
+      error: "#{msg}: #{summary_lines.join("; ")}",
+      detail: { attempts: attempts, deadline_hit: deadline_hit },
+      status: fallback_status
+    }
   end
 
   def record_metrics(selector, provider_name, result)
     tps = result[:total_tps] || result[:content_tps]
     selector.update_metrics(provider_name, result[:ttft], tps) if result[:ttft]
+  end
+
+  # Categorize a failure result into a stable Prometheus label.
+  # Keep cardinality bounded — don't use raw exception messages.
+  def self.failure_reason(result)
+    return "unknown" unless result.is_a?(Hash)
+    status = result[:status]
+    err = result[:error].to_s
+    if status
+      return "rate_limited" if status == 429
+      return "client_error" if status >= 400 && status < 500
+      return "server_error" if status >= 500
+    end
+    return "timeout" if err.include?("Timeout")
+    return "client_disconnect" if err == "Client disconnected"
+    return "rate_limited" if err.include?("Rate limited")
+    return "connection_reset" if err.include?("Connection reset")
+    "error"
   end
 
   MAX_ACCUMULATED_SIZE = 512 * 1024

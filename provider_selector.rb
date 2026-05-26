@@ -58,6 +58,7 @@ class ProviderSelector
     @circuits = providers.each_with_object({}) { |p, h| h[p["provider"]] = CircuitState.new(failures: 0, opened_at: nil) }
     @error_counts = providers.each_with_object({}) { |p, h| h[p["provider"]] = 0 }
     @total_requests = providers.each_with_object({}) { |p, h| h[p["provider"]] = 0 }
+    @last_success_at = providers.each_with_object({}) { |p, h| h[p["provider"]] = nil }
     @model_config = model_config
   end
 
@@ -174,6 +175,7 @@ class ProviderSelector
   def record_success(provider_name)
     @lock.synchronize do
       @total_requests[provider_name] = (@total_requests[provider_name] || 0) + 1
+      @last_success_at[provider_name] = Time.now.to_f
       circuit = @circuits[provider_name]
       return unless circuit
       circuit.failures = 0
@@ -213,12 +215,16 @@ class ProviderSelector
 
   def provider_stats
     @lock.synchronize do
+      now = Time.now.to_f
       @providers.each_with_object({}) do |p, h|
         name = p["provider"]
+        last = @last_success_at[name]
         h[name] = {
           errors: @error_counts[name] || 0,
           successes: @total_requests[name] || 0,
-          circuit_open: !@circuits[name]&.opened_at.nil?
+          circuit_open: !@circuits[name]&.opened_at.nil?,
+          last_success_at: last ? Time.at(last).iso8601 : nil,
+          last_success_age_seconds: last ? (now - last).round(1) : nil
         }
       end
     end
