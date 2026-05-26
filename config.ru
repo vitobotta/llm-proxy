@@ -1,3 +1,3 @@
-require_relative 'proxy'
+require_relative "proxy"
 
 run LLMProxy

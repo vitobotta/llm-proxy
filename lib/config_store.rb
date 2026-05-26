@@ -15,7 +15,7 @@ module ConfigStore
   YAML_PERMITTED_CLASSES = [Symbol, Date, Time].freeze
 
   def self.load_yaml_file(path)
-    YAML.safe_load(File.read(path), permitted_classes: YAML_PERMITTED_CLASSES, aliases: true)
+    YAML.safe_load_file(path, permitted_classes: YAML_PERMITTED_CLASSES, aliases: true)
   end
 
   # Writer-side lock: only serializes concurrent load!/reload! callers.
@@ -109,7 +109,9 @@ module ConfigStore
     app.set :backoff_base, snapshot[:backoff_base]
   end
 
-  private
+  # `private` is a no-op on `def self.foo` definitions in modules; use
+  # `private_class_method` (at the bottom) instead. These are conceptually
+  # private — internal helpers, not part of the public ConfigStore API.
 
   def self.build_data(raw, logger)
     providers = (raw["providers"] || {}).transform_values(&:freeze).freeze
@@ -146,8 +148,8 @@ module ConfigStore
       models: models.freeze,
       selectors: selectors,
       timeouts: {
-        open:  raw.dig("timeouts", "open")  || 30,
-        read:  raw.dig("timeouts", "read")  || 300,
+        open: raw.dig("timeouts", "open") || 30,
+        read: raw.dig("timeouts", "read") || 300,
         write: raw.dig("timeouts", "write") || 60
       }.freeze,
       auth_token: raw.dig("auth", "token"),
@@ -195,15 +197,17 @@ module ConfigStore
     {
       "provider" => provider_name,
       "base_url" => provider["base_url"],
-      "api_key"  => provider["api_key"],
-      "model"    => model_id,
-      "headers"  => provider["headers"]&.merge(model_headers || {}) || model_headers || {},
-      "primary"  => primary
+      "api_key" => provider["api_key"],
+      "model" => model_id,
+      "headers" => provider["headers"]&.merge(model_headers || {}) || model_headers || {},
+      "primary" => primary
     }.compact.freeze
   end
 
   def self.update_logger_level!(raw, logger)
-    levels = { "debug" => Logger::DEBUG, "info" => Logger::INFO, "warn" => Logger::WARN, "error" => Logger::ERROR }
+    levels = {"debug" => Logger::DEBUG, "info" => Logger::INFO, "warn" => Logger::WARN, "error" => Logger::ERROR}
     logger.level = levels.fetch(raw.dig("logging", "level"), Logger::INFO)
   end
+
+  private_class_method :build_data, :merge_selectors!, :provider_lists_match?, :resolve_provider, :update_logger_level!
 end

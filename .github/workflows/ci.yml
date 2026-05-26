@@ -18,6 +18,9 @@ jobs:
           ruby-version: "4.0"
           bundler-cache: true
 
+      - name: Lint with standardrb
+        run: bundle exec standardrb
+
       - name: Run tests
         run: bundle exec ruby -I. -e 'Dir["test/test_*.rb"].each { |f| load f }'
 

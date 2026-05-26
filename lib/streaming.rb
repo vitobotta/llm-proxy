@@ -34,8 +34,8 @@ module Streaming
 
   class TimerTracker
     attr_reader :first_token, :first_thinking, :last_thinking,
-                :first_content, :last_content, :last_any_token,
-                :thinking_detected, :content_detected
+      :first_content, :last_content, :last_any_token,
+      :thinking_detected, :content_detected
 
     def initialize
       @first_token = nil
@@ -118,24 +118,24 @@ module Streaming
       end
     end
 
-    { content_len: content_len, thinking_len: thinking_len }
+    {content_len: content_len, thinking_len: thinking_len}
   end
 
   def self.extract_token_counts(usage_data)
     completion = usage_data.dig("completion_tokens") || usage_data.dig("output_tokens")
     thinking = usage_data.dig("completion_tokens_details", "reasoning_tokens") ||
-               usage_data.dig("output_tokens_details", "reasoning_tokens") ||
-               usage_data.dig("reasoning_tokens") || 0
+      usage_data.dig("output_tokens_details", "reasoning_tokens") ||
+      usage_data.dig("reasoning_tokens") || 0
     raw_content = completion ? completion - thinking : nil
     clamped = !raw_content.nil? && raw_content < 0
     content = clamped ? 0 : raw_content
-    { completion: completion, thinking: thinking, content: content, content_clamped: clamped }
+    {completion: completion, thinking: thinking, content: content, content_clamped: clamped}
   end
 
   def self.compute_tps(token_count, first_time, last_time)
     return nil unless token_count && token_count > 0 && first_time && last_time
     elapsed = last_time - first_time
-    elapsed > 0 ? (token_count / elapsed).round(1) : nil
+    (elapsed > 0) ? (token_count / elapsed).round(1) : nil
   end
 
   # Walks response.read_body, parsing each chunk and updating `tracker`
@@ -173,7 +173,7 @@ module Streaming
     end
 
     if error
-      { error: error }
+      {error: error}
     else
       {
         first_token_time: timers.first_token,
@@ -213,15 +213,15 @@ module Streaming
       log_parts << "thinking_tps=#{thinking_tps}" if thinking_tps&.positive?
       log_parts << "total_tps=#{total_tps}" if total_tps&.positive?
 
-      settings.logger.info("#{log_prefix} Success | #{log_parts.join(' ')}")
-      { success: true, content_tokens: tokens[:content], thinking_tokens: tokens[:thinking], ttft: ttft, content_tps: content_tps, thinking_tps: thinking_tps, total_tps: total_tps }
+      settings.logger.info("#{log_prefix} Success | #{log_parts.join(" ")}")
+      {success: true, content_tokens: tokens[:content], thinking_tokens: tokens[:thinking], ttft: ttft, content_tps: content_tps, thinking_tps: thinking_tps, total_tps: total_tps}
     else
       settings.logger.info("#{log_prefix} Success | ttft=#{ttft}s (no usage data from provider)")
-      { success: true, content_tokens: nil, thinking_tokens: nil, ttft: ttft, content_tps: nil, thinking_tps: nil }
+      {success: true, content_tokens: nil, thinking_tokens: nil, ttft: ttft, content_tps: nil, thinking_tps: nil}
     end
   end
 
   def streaming_error(message, detail: nil)
-    "data: #{ { error: { message: message, detail: detail } }.to_json }\n\n"
+    "data: #{{error: {message: message, detail: detail}}.to_json}\n\n"
   end
 end

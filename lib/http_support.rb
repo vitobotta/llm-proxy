@@ -9,6 +9,7 @@ require "securerandom"
 module HTTPSupport
   class RetryableError < StandardError; end
   class ClientDisconnected < StandardError; end
+
   class RateLimitedError < RetryableError
     attr_reader :retry_after
 
@@ -57,7 +58,7 @@ module HTTPSupport
 
     body = begin
       response.body
-    rescue StandardError => e
+    rescue => e
       "[failed to read upstream body: #{e.class}: #{e.message}]"
     end
 
@@ -71,7 +72,7 @@ module HTTPSupport
   def self.parse_retry_after(value, now: Time.now)
     return 0.0 if value.nil? || value.to_s.strip.empty?
     stripped = value.to_s.strip
-    if stripped =~ /\A\d+(\.\d+)?\z/
+    if /\A\d+(\.\d+)?\z/.match?(stripped)
       stripped.to_f
     else
       begin
@@ -116,7 +117,7 @@ module HTTPSupport
     request_body = body.dup
     request_body["model"] = body_model if body_model
     request_body["stream"] = stream
-    request_body["stream_options"] = { "include_usage" => true } if stream
+    request_body["stream_options"] = {"include_usage" => true} if stream
     request.body = request_body.to_json
 
     [uri, request]
@@ -142,15 +143,13 @@ module HTTPSupport
     Thread.new do
       logger.info("Pre-warming HTTP connections to providers...")
       providers.values.map { |p| p["base_url"] }.uniq.each do |base_url|
-        begin
-          uri = URI.parse(base_url)
-          http = create_http(uri, timeouts: timeouts)
-          http.start unless http.started?
-          http.finish
-          logger.info("  \u2713 #{base_url}")
-        rescue StandardError => e
-          logger.warn("  \u2717 #{base_url} (#{e.class}: #{e.message})")
-        end
+        uri = URI.parse(base_url)
+        http = create_http(uri, timeouts: timeouts)
+        http.start unless http.started?
+        http.finish
+        logger.info("  \u2713 #{base_url}")
+      rescue => e
+        logger.warn("  \u2717 #{base_url} (#{e.class}: #{e.message})")
       end
     end
   end
@@ -185,7 +184,7 @@ module HTTPSupport
 
   def retry_or_fail(log_prefix, error_label:, detail: nil)
     settings.logger.error("#{log_prefix} All #{settings.max_attempts} attempts failed")
-    result = { success: false, error: "#{error_label} after #{settings.max_attempts} attempts" }
+    result = {success: false, error: "#{error_label} after #{settings.max_attempts} attempts"}
     result[:detail] = detail if detail
     result
   end
@@ -208,7 +207,7 @@ module HTTPSupport
         return retry_or_fail(log_prefix, error_label: "Failed", detail: e.message) unless maybe_retry(attempts)
       rescue ClientDisconnected
         settings.logger.info("#{log_prefix} Client disconnected")
-        return { success: false, error: "Client disconnected" }
+        return {success: false, error: "Client disconnected"}
       rescue EOFError
         eof_retries += 1
         if eof_retries <= MAX_EOF_RETRIES
@@ -220,7 +219,7 @@ module HTTPSupport
       rescue *TIMEOUT_EXCEPTIONS => e
         settings.logger.warn("#{log_prefix} Timeout: #{e.message}")
         return retry_or_fail(log_prefix, error_label: "Timeout") unless maybe_retry(attempts)
-      rescue StandardError => e
+      rescue => e
         settings.logger.warn("#{log_prefix} Error: #{e.message}")
         return retry_or_fail(log_prefix, error_label: "Error", detail: e.message) unless maybe_retry(attempts)
       end
@@ -246,6 +245,6 @@ module HTTPSupport
       raise RetryableError, error_msg
     end
 
-    { success: false, error: error_msg, status: code }
+    {success: false, error: error_msg, status: code}
   end
 end

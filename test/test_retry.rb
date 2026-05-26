@@ -26,7 +26,7 @@ class TestRetryLogic < Minitest::Test
   def test_successful_first_attempt
     app = MockApp.new
     result = app.try_with_retries(log_prefix: "[test]", body_model: "m") do
-      { success: true }
+      {success: true}
     end
 
     assert result[:success]
@@ -40,7 +40,7 @@ class TestRetryLogic < Minitest::Test
       if call_count < 2
         raise HTTPSupport::RetryableError, "temporary failure"
       end
-      { success: true }
+      {success: true}
     end
 
     assert result[:success]
@@ -76,7 +76,7 @@ class TestRetryLogic < Minitest::Test
       if eof_count <= 1
         raise EOFError
       end
-      { success: true }
+      {success: true}
     end
 
     assert result[:success]

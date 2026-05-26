@@ -29,7 +29,7 @@ module RequestHandler
         settings.logger.info("[#{@request_id}/#{model_name}] Using #{p_name} (#{p_model})")
       else
         prev = attempts.last
-        prev_reason = prev ? "#{prev[:provider]} #{prev[:reason]}#{prev[:status] ? " (status=#{prev[:status]})" : ""}" : "previous failure"
+        prev_reason = prev ? "#{prev[:provider]} #{prev[:reason]}#{" (status=#{prev[:status]})" if prev[:status]}" : "previous failure"
         settings.logger.info("[#{@request_id}/#{model_name}] Fallback to #{p_name} (#{p_model}) because #{prev_reason}")
       end
 
@@ -38,16 +38,16 @@ module RequestHandler
       if result&.dig(:success)
         record_metrics(selector, p_name, result) if probing
         selector.record_success(p_name)
-        Metrics.increment(:provider_success, labels: { provider: p_name, model: model_name })
+        Metrics.increment(:provider_success, labels: {provider: p_name, model: model_name})
         if result[:ttft]
-          Metrics.observe(:upstream_ttft_seconds, result[:ttft], labels: { provider: p_name, model: model_name })
+          Metrics.observe(:upstream_ttft_seconds, result[:ttft], labels: {provider: p_name, model: model_name})
         end
         break
       else
         reason = RequestHandler.failure_reason(result)
-        attempts << { provider: p_name, status: result.is_a?(Hash) ? result[:status] : nil, error: result.is_a?(Hash) ? result[:error] : nil, reason: reason }
+        attempts << {provider: p_name, status: result.is_a?(Hash) ? result[:status] : nil, error: result.is_a?(Hash) ? result[:error] : nil, reason: reason}
         selector.record_failure(p_name)
-        Metrics.increment(:provider_failure, labels: { provider: p_name, model: model_name, reason: reason })
+        Metrics.increment(:provider_failure, labels: {provider: p_name, model: model_name, reason: reason})
       end
     end
 
@@ -68,10 +68,10 @@ module RequestHandler
 
   def build_failure_summary(attempts, deadline_hit)
     if attempts.empty?
-      return { success: false, error: deadline_hit ? "Request deadline exceeded before any provider attempted" : "No providers available", status: 503 }
+      return {success: false, error: deadline_hit ? "Request deadline exceeded before any provider attempted" : "No providers available", status: 503}
     end
 
-    summary_lines = attempts.map { |a| "#{a[:provider]}: #{a[:reason]}#{a[:status] ? " (status=#{a[:status]})" : ""}" }
+    summary_lines = attempts.map { |a| "#{a[:provider]}: #{a[:reason]}#{" (status=#{a[:status]})" if a[:status]}" }
     last_status = attempts.last[:status]
     fallback_status = (last_status && last_status >= 400 && last_status < 600) ? last_status : 502
 
@@ -79,7 +79,7 @@ module RequestHandler
     {
       success: false,
       error: "#{msg}: #{summary_lines.join("; ")}",
-      detail: { attempts: attempts, deadline_hit: deadline_hit },
+      detail: {attempts: attempts, deadline_hit: deadline_hit},
       status: fallback_status
     }
   end
@@ -154,7 +154,7 @@ module RequestHandler
                   if total > 0
                     usage_data = {
                       "completion_tokens" => total,
-                      "completion_tokens_details" => { "reasoning_tokens" => counts[:thinking_len] }
+                      "completion_tokens_details" => {"reasoning_tokens" => counts[:thinking_len]}
                     }
                   end
                 end
@@ -162,7 +162,7 @@ module RequestHandler
 
               stream_result = build_stream_result(log_prefix, timers, usage_data)
             else
-              stream_result = { success: true }
+              stream_result = {success: true}
             end
           else
             stream_result = handle_upstream_error(response, log_prefix)
@@ -186,7 +186,7 @@ module RequestHandler
 
         if response.is_a?(Net::HTTPSuccess)
           settings.logger.info("#{log_prefix} Success")
-          { success: true, response: [response.code.to_i, { "Content-Type" => "application/json" }, [response.body]] }
+          {success: true, response: [response.code.to_i, {"Content-Type" => "application/json"}, [response.body]]}
         else
           handle_upstream_error(response, log_prefix)
         end

@@ -16,7 +16,7 @@ module Routes
             providers: selector.provider_stats
           }
         end
-        { status: "ok", models: ConfigStore.models.keys, providers: provider_status, timestamp: Time.now.iso8601 }.to_json
+        {status: "ok", models: ConfigStore.models.keys, providers: provider_status, timestamp: Time.now.iso8601}.to_json
       end
 
       app.get "/metrics" do
@@ -30,7 +30,7 @@ module Routes
         models = ConfigStore.models
         {
           object: "list",
-          data: models.keys.map { |name| { id: name, object: "model", owned_by: "proxy", context_length: models[name]["context_length"] }.compact }
+          data: models.keys.map { |name| {id: name, object: "model", owned_by: "proxy", context_length: models[name]["context_length"]}.compact }
         }.to_json
       end
 
@@ -44,7 +44,7 @@ module Routes
           object: "model",
           owned_by: "proxy",
           context_length: model["context_length"],
-          providers: model["providers"].map { |p| { provider: p["provider"], model: p["model"] } }
+          providers: model["providers"].map { |p| {provider: p["provider"], model: p["model"]} }
         }.compact.to_json
       end
     end

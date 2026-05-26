@@ -4,7 +4,7 @@ require "securerandom"
 
 module ProbeManager
   PROBE_BODY = {
-    "messages" => [{ "role" => "user", "content" => "Write a brief paragraph about the weather" }],
+    "messages" => [{"role" => "user", "content" => "Write a brief paragraph about the weather"}],
     "max_tokens" => 100
   }.freeze
 
@@ -44,44 +44,42 @@ module ProbeManager
     probe_id = SecureRandom.uuid[0..7]
 
     Thread.new do
-      begin
-        named_threads = selector.other_providers.map do |provider_config|
-          p_name = provider_config["provider"]
-          thread = Thread.new do
-            Thread.current.report_on_exception = false
-            begin
-              metrics = probe_provider(provider_config, path, PROBE_BODY, provider_config["model"], headers, timeouts: timeouts, logger: logger)
-              [p_name, metrics]
-            rescue => e
-              logger.error("[probe:#{probe_id}] #{p_name} thread error: #{e.class}: #{e.message}")
-              [p_name, { ttft: Float::INFINITY, tps: nil }]
-            end
-          end
-          [p_name, thread]
-        end
-
-        results = named_threads.map do |p_name, t|
-          if t.join(deadline_seconds).nil?
-            logger.warn("[probe:#{probe_id}] #{p_name} exceeded #{deadline_seconds}s deadline, killing thread")
-            t.kill
-            [p_name, { ttft: Float::INFINITY, tps: nil }]
-          else
-            t.value
+      named_threads = selector.other_providers.map do |provider_config|
+        p_name = provider_config["provider"]
+        thread = Thread.new do
+          Thread.current.report_on_exception = false
+          begin
+            metrics = probe_provider(provider_config, path, PROBE_BODY, provider_config["model"], headers, timeouts: timeouts, logger: logger)
+            [p_name, metrics]
+          rescue => e
+            logger.error("[probe:#{probe_id}] #{p_name} thread error: #{e.class}: #{e.message}")
+            [p_name, {ttft: Float::INFINITY, tps: nil}]
           end
         end
-
-        results.each do |p_name, m|
-          selector.update_metrics(p_name, m[:ttft], m[:tps])
-          tps_str = m[:tps] ? m[:tps].to_s : "N/A"
-          logger.info("[probe:#{probe_id}] #{model_name}/#{p_name}: ttft=#{m[:ttft]}s tps=#{tps_str}")
-        end
-
-        selector.evaluate_and_select(logger, auto_switch: auto_switch)
-      rescue => e
-        logger.error("[probe:#{probe_id}] #{model_name} error: #{e.message}")
-      ensure
-        selector.probe_finished
+        [p_name, thread]
       end
+
+      results = named_threads.map do |p_name, t|
+        if t.join(deadline_seconds).nil?
+          logger.warn("[probe:#{probe_id}] #{p_name} exceeded #{deadline_seconds}s deadline, killing thread")
+          t.kill
+          [p_name, {ttft: Float::INFINITY, tps: nil}]
+        else
+          t.value
+        end
+      end
+
+      results.each do |p_name, m|
+        selector.update_metrics(p_name, m[:ttft], m[:tps])
+        tps_str = m[:tps] ? m[:tps].to_s : "N/A"
+        logger.info("[probe:#{probe_id}] #{model_name}/#{p_name}: ttft=#{m[:ttft]}s tps=#{tps_str}")
+      end
+
+      selector.evaluate_and_select(logger, auto_switch: auto_switch)
+    rescue => e
+      logger.error("[probe:#{probe_id}] #{model_name} error: #{e.message}")
+    ensure
+      selector.probe_finished
     end
   end
 
@@ -100,14 +98,14 @@ module ProbeManager
 
       if result[:error]
         logger.warn("[probe] #{pname}: #{result[:error]}")
-        return { ttft: Float::INFINITY, tps: nil }
+        return {ttft: Float::INFINITY, tps: nil}
       end
 
       ttft = result[:first_token_time] ? (result[:first_token_time] - request_start).round(3) : Float::INFINITY
 
       unless result[:usage_data]
         logger.debug("[probe] #{pname}: usage_data absent (provider ignored stream_options)")
-        return { ttft: ttft, tps: nil }
+        return {ttft: ttft, tps: nil}
       end
 
       tokens = Streaming.extract_token_counts(result[:usage_data])
@@ -136,14 +134,14 @@ module ProbeManager
         logger.debug("[probe] #{pname}: TPS=0 diag: #{diag.join(", ")}")
       end
 
-      { ttft: ttft, tps: tps }
+      {ttft: ttft, tps: tps}
     rescue => e
       logger.debug("[probe] #{pname}: #{e.message}")
-      { ttft: Float::INFINITY, tps: nil }
+      {ttft: Float::INFINITY, tps: nil}
     ensure
       begin
         http.finish if http&.started?
-      rescue StandardError
+      rescue
         nil
       end
     end

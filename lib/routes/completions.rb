@@ -14,23 +14,21 @@ module Routes
             HTTPSupport::SSE_HEADERS.each { |k, v| headers[k] = v }
 
             stream do |out|
+              result = with_auto_select(
+                model: req[:model], model_name: req[:model_name],
+                path: endpoint, body: req[:body], headers: req[:headers]
+              ) { |pc, p, b, pm, h, lp| try_stream(pc, p, b, pm, h, out: out, log_prefix: lp) }
+              handle_streaming_error(result, out)
+            rescue HTTPSupport::ClientDisconnected
+              settings.logger.info("[#{@request_id}] Client disconnected mid-stream")
+            rescue => e
+              settings.logger.error("[#{@request_id}] Streaming error: #{e.class}: #{e.message}")
+              settings.logger.debug(e.backtrace.join("\n")) if e.backtrace
               begin
-                result = with_auto_select(
-                  model: req[:model], model_name: req[:model_name],
-                  path: endpoint, body: req[:body], headers: req[:headers]
-                ) { |pc, p, b, pm, h, lp| try_stream(pc, p, b, pm, h, out: out, log_prefix: lp) }
-                handle_streaming_error(result, out)
-              rescue HTTPSupport::ClientDisconnected
-                settings.logger.info("[#{@request_id}] Client disconnected mid-stream")
-              rescue => e
-                settings.logger.error("[#{@request_id}] Streaming error: #{e.class}: #{e.message}")
-                settings.logger.debug(e.backtrace.join("\n")) if e.backtrace
-                begin
-                  out << streaming_error("Streaming error: #{e.class}", detail: e.message)
-                  out << "data: [DONE]\n\n"
-                rescue StandardError
-                  nil
-                end
+                out << streaming_error("Streaming error: #{e.class}", detail: e.message)
+                out << "data: [DONE]\n\n"
+              rescue
+                nil
               end
             end
           else

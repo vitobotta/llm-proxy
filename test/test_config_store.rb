@@ -2,7 +2,6 @@
 
 require_relative "test_helper"
 require "tmpdir"
-require "set"
 require_relative "../lib/config_validator"
 require_relative "../lib/config_store"
 
@@ -52,7 +51,7 @@ class TestConfigStore < Minitest::Test
     ConfigStore.register_app!(app)
     assert_equal 2, app.settings_hash[:max_attempts]
 
-    new_cfg = MOCK_CONFIG.merge("retries" => { "max_attempts" => 7, "backoff_base" => 3 })
+    new_cfg = MOCK_CONFIG.merge("retries" => {"max_attempts" => 7, "backoff_base" => 3})
     write_config(new_cfg)
 
     # Stub prewarm_connections! to avoid spawning a thread that hits real URLs
@@ -63,8 +62,14 @@ class TestConfigStore < Minitest::Test
 
     err_logger = Class.new(NullLogger) do
       attr_reader :errors
-      def initialize; super; @errors = []; end
-      def error(msg); @errors << msg; end
+      def initialize
+        super
+        @errors = []
+      end
+
+      def error(msg)
+        @errors << msg
+      end
     end.new
 
     ok = ConfigStore.reload!(logger: err_logger)
@@ -98,7 +103,7 @@ class TestConfigStore < Minitest::Test
 
     # Reload with a new provider added — SHOULD prewarm.
     cfg_with_new = Marshal.load(Marshal.dump(MOCK_CONFIG)) # deep copy
-    cfg_with_new["providers"]["prov_c"] = { "base_url" => "https://c.example.com/v1", "api_key" => "kc" }
+    cfg_with_new["providers"]["prov_c"] = {"base_url" => "https://c.example.com/v1", "api_key" => "kc"}
     write_config(cfg_with_new)
     assert ConfigStore.reload!(logger: NullLogger.new)
 
@@ -125,8 +130,8 @@ class TestConfigStore < Minitest::Test
       define_method(:prewarm_connections!) { |*_args, **_kw| nil }
     end
 
-    cfg_a = MOCK_CONFIG.merge("retries" => { "max_attempts" => 2, "backoff_base" => 1 })
-    cfg_b = MOCK_CONFIG.merge("retries" => { "max_attempts" => 7, "backoff_base" => 3 })
+    cfg_a = MOCK_CONFIG.merge("retries" => {"max_attempts" => 2, "backoff_base" => 1})
+    cfg_b = MOCK_CONFIG.merge("retries" => {"max_attempts" => 7, "backoff_base" => 3})
 
     stop = false
     seen_combos = Set.new
@@ -169,7 +174,7 @@ class TestConfigStore < Minitest::Test
   end
 
   def test_reload_without_registered_app_does_not_raise
-    new_cfg = MOCK_CONFIG.merge("retries" => { "max_attempts" => 5, "backoff_base" => 2 })
+    new_cfg = MOCK_CONFIG.merge("retries" => {"max_attempts" => 5, "backoff_base" => 2})
     write_config(new_cfg)
     HTTPSupport.singleton_class.class_eval do
       alias_method :__orig_prewarm2, :prewarm_connections!

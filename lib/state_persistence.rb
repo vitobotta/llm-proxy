@@ -34,7 +34,7 @@ module StatePersistence
     logger&.error("[StatePersistence] Failed to save state: #{e.class}: #{e.message}")
     begin
       File.delete(tmp) if tmp && File.exist?(tmp)
-    rescue StandardError
+    rescue
       nil
     end
   end
@@ -96,7 +96,7 @@ module StatePersistence
       return nil
     end
     state
-  rescue => e
+  rescue
     nil
   end
 end

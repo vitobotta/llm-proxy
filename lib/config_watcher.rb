@@ -47,7 +47,7 @@ module ConfigWatcher
     end
   end
 
-  private
+  # `private` on `def self.x` in a module is a no-op — see private_class_method below.
 
   def self.file_hash
     Digest::SHA256.file(ConfigStore.config_path).hexdigest
@@ -77,4 +77,6 @@ module ConfigWatcher
   rescue => e
     @logger&.error("ConfigWatcher reload error: #{e.message}")
   end
+
+  private_class_method :file_hash, :check_and_reload, :trigger_reload
 end

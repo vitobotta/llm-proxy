@@ -46,18 +46,18 @@ RAW_CONFIG = load_raw_config!(CONFIG_PATH)
 BOOT_LOGGER = Logger.new($stdout)
 LOG_LEVELS = {
   "debug" => Logger::DEBUG,
-  "info"  => Logger::INFO,
-  "warn"  => Logger::WARN,
+  "info" => Logger::INFO,
+  "warn" => Logger::WARN,
   "error" => Logger::ERROR
 }.freeze
 BOOT_LOGGER.level = LOG_LEVELS.fetch(RAW_CONFIG.dig("logging", "level"), Logger::INFO)
 
-if RAW_CONFIG.dig("logging", "format") == "json"
+BOOT_LOGGER.formatter = if RAW_CONFIG.dig("logging", "format") == "json"
   # JSON formatter: caller can pass a String (becomes `message` field) or a
   # Hash (fields spread into the JSON record). Thread-local request_id is
   # included automatically when set by the before-hook.
-  BOOT_LOGGER.formatter = proc do |severity, datetime, _progname, msg|
-    record = { timestamp: datetime.iso8601, level: severity }
+  proc do |severity, datetime, _progname, msg|
+    record = {timestamp: datetime.iso8601, level: severity}
     rid = Thread.current[:request_id]
     record[:request_id] = rid if rid
     if msg.is_a?(Hash)
@@ -68,10 +68,10 @@ if RAW_CONFIG.dig("logging", "format") == "json"
     record.to_json + "\n"
   end
 else
-  BOOT_LOGGER.formatter = proc do |severity, datetime, _progname, msg|
+  proc do |severity, datetime, _progname, msg|
     if msg.is_a?(Hash)
-      pairs = msg.map { |k, v| "#{k}=#{v.is_a?(String) && v.include?(" ") ? v.inspect : v}" }
-      "[#{datetime.iso8601}] #{severity}: #{pairs.join(' ')}\n"
+      pairs = msg.map { |k, v| "#{k}=#{(v.is_a?(String) && v.include?(" ")) ? v.inspect : v}" }
+      "[#{datetime.iso8601}] #{severity}: #{pairs.join(" ")}\n"
     else
       "[#{datetime.iso8601}] #{severity}: #{msg}\n"
     end
@@ -133,15 +133,15 @@ class LLMProxy < Sinatra::Base
   after do
     elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - @request_start
     settings.logger.info("[#{@request_id}] Completed #{response.status} in #{elapsed.round(3)}s")
-    Metrics.increment(:requests_total, labels: { status: response.status })
+    Metrics.increment(:requests_total, labels: {status: response.status})
     Metrics.observe(:request_duration_seconds, elapsed)
     Thread.current[:request_id] = nil
   end
 
   def json_error(status:, message:, detail: nil, type: "proxy_error")
     content_type :json
-    body = { error: { message: message, type: type } }
-    body[:error].merge!(detail: detail) if detail
+    body = {error: {message: message, type: type}}
+    body[:error][:detail] = detail if detail
     [status, body.to_json]
   end
 
@@ -161,11 +161,11 @@ class LLMProxy < Sinatra::Base
 
     incoming_headers = {}
     allowed_headers.each do |h|
-      env_key = "HTTP_#{h.upcase.tr('-', '_')}"
+      env_key = "HTTP_#{h.upcase.tr("-", "_")}"
       incoming_headers[h] = request.env[env_key] if request.env[env_key]
     end
 
-    { body: body, model: model, model_name: model_name, headers: incoming_headers }
+    {body: body, model: model, model_name: model_name, headers: incoming_headers}
   rescue JSON::ParserError
     halt json_error(status: 400, message: "Invalid JSON body", type: "invalid_request")
   end

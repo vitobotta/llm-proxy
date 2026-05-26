@@ -62,7 +62,7 @@ class TestConfigWatcher < Minitest::Test
   end
 
   def test_check_and_reload_triggers_on_hash_change
-    new_cfg = MOCK_CONFIG.merge("retries" => { "max_attempts" => 5, "backoff_base" => 1 })
+    new_cfg = MOCK_CONFIG.merge("retries" => {"max_attempts" => 5, "backoff_base" => 1})
     File.write(@config_path, YAML.dump(new_cfg))
 
     before_count = ConfigStore.__reload_counter.size
@@ -71,7 +71,7 @@ class TestConfigWatcher < Minitest::Test
   end
 
   def test_expecting_write_suppresses_self_triggered_reload
-    new_cfg = MOCK_CONFIG.merge("retries" => { "max_attempts" => 9, "backoff_base" => 1 })
+    new_cfg = MOCK_CONFIG.merge("retries" => {"max_attempts" => 9, "backoff_base" => 1})
 
     # Mimic the ProviderSelector.persist_active_provider flow:
     # 1. compute the future file hash, 2. write the file
@@ -88,11 +88,11 @@ class TestConfigWatcher < Minitest::Test
   end
 
   def test_consecutive_external_writes_still_trigger
-    File.write(@config_path, YAML.dump(MOCK_CONFIG.merge("retries" => { "max_attempts" => 5, "backoff_base" => 1 })))
+    File.write(@config_path, YAML.dump(MOCK_CONFIG.merge("retries" => {"max_attempts" => 5, "backoff_base" => 1})))
     ConfigWatcher.send(:check_and_reload)
     after_first = ConfigStore.__reload_counter.size
 
-    File.write(@config_path, YAML.dump(MOCK_CONFIG.merge("retries" => { "max_attempts" => 6, "backoff_base" => 1 })))
+    File.write(@config_path, YAML.dump(MOCK_CONFIG.merge("retries" => {"max_attempts" => 6, "backoff_base" => 1})))
     ConfigWatcher.send(:check_and_reload)
     assert_equal after_first + 1, ConfigStore.__reload_counter.size
   end

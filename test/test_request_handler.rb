@@ -5,27 +5,27 @@ require_relative "../lib/request_handler"
 
 class TestRequestHandler < Minitest::Test
   def test_failure_reason_rate_limited_from_status
-    assert_equal "rate_limited", RequestHandler.failure_reason({ status: 429, error: "HTTP 429: too many" })
+    assert_equal "rate_limited", RequestHandler.failure_reason({status: 429, error: "HTTP 429: too many"})
   end
 
   def test_failure_reason_server_error
-    assert_equal "server_error", RequestHandler.failure_reason({ status: 502, error: "HTTP 502: bad gateway" })
+    assert_equal "server_error", RequestHandler.failure_reason({status: 502, error: "HTTP 502: bad gateway"})
   end
 
   def test_failure_reason_client_error
-    assert_equal "client_error", RequestHandler.failure_reason({ status: 400, error: "bad request" })
+    assert_equal "client_error", RequestHandler.failure_reason({status: 400, error: "bad request"})
   end
 
   def test_failure_reason_timeout
-    assert_equal "timeout", RequestHandler.failure_reason({ error: "Timeout after 3 attempts" })
+    assert_equal "timeout", RequestHandler.failure_reason({error: "Timeout after 3 attempts"})
   end
 
   def test_failure_reason_client_disconnect
-    assert_equal "client_disconnect", RequestHandler.failure_reason({ error: "Client disconnected" })
+    assert_equal "client_disconnect", RequestHandler.failure_reason({error: "Client disconnected"})
   end
 
   def test_failure_reason_connection_reset
-    assert_equal "connection_reset", RequestHandler.failure_reason({ error: "Connection reset after 2 attempts" })
+    assert_equal "connection_reset", RequestHandler.failure_reason({error: "Connection reset after 2 attempts"})
   end
 
   def test_failure_reason_unknown_for_nil
@@ -33,12 +33,13 @@ class TestRequestHandler < Minitest::Test
   end
 
   def test_failure_reason_generic_error
-    assert_equal "error", RequestHandler.failure_reason({ error: "weird unexplained thing" })
+    assert_equal "error", RequestHandler.failure_reason({error: "weird unexplained thing"})
   end
 
   class FakeHelper
     extend RequestHandler::ClassMethods if defined?(RequestHandler::ClassMethods)
     include RequestHandler
+
     attr_accessor :logs
 
     def initialize
@@ -59,8 +60,8 @@ class TestRequestHandler < Minitest::Test
   def test_build_failure_summary_aggregates_attempts
     h = FakeHelper.new
     attempts = [
-      { provider: "p_a", status: 500, error: "boom", reason: "server_error" },
-      { provider: "p_b", status: 429, error: "rate", reason: "rate_limited" }
+      {provider: "p_a", status: 500, error: "boom", reason: "server_error"},
+      {provider: "p_b", status: 429, error: "rate", reason: "rate_limited"}
     ]
     result = h.build_failure_summary(attempts, false)
     refute result[:success]
@@ -80,7 +81,7 @@ class TestRequestHandler < Minitest::Test
 
   def test_build_failure_summary_falls_back_to_502_when_last_status_missing
     h = FakeHelper.new
-    attempts = [{ provider: "p_a", status: nil, error: "Timeout", reason: "timeout" }]
+    attempts = [{provider: "p_a", status: nil, error: "Timeout", reason: "timeout"}]
     result = h.build_failure_summary(attempts, false)
     assert_equal 502, result[:status]
   end

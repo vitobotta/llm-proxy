@@ -36,29 +36,44 @@ class TestProbeManager < Minitest::Test
     @captured_logs = []
     @logger = Class.new(NullLogger) do
       attr_reader :messages
-      def initialize(messages); super(); @messages = messages; end
-      def info(m); @messages << [:info, m]; end
-      def error(m); @messages << [:error, m]; end
-      def warn(m); @messages << [:warn, m]; end
-      def debug(m); @messages << [:debug, m]; end
+      def initialize(messages)
+        super()
+        @messages = messages
+      end
+
+      def info(m)
+        @messages << [:info, m]
+      end
+
+      def error(m)
+        @messages << [:error, m]
+      end
+
+      def warn(m)
+        @messages << [:warn, m]
+      end
+
+      def debug(m)
+        @messages << [:debug, m]
+      end
     end.new(@captured_logs)
   end
 
   def test_results_aggregated_from_many_concurrent_probes
     n = 20
-    others = (0...n).map { |i| { "provider" => "p#{i}", "model" => "m#{i}", "base_url" => "https://example.invalid/v1", "api_key" => "k" } }
+    others = (0...n).map { |i| {"provider" => "p#{i}", "model" => "m#{i}", "base_url" => "https://example.invalid/v1", "api_key" => "k"} }
 
     # Stub probe_provider to return distinct results, sleeping a bit so threads truly overlap.
     ProbeManager.singleton_class.class_eval do
       alias_method :__orig_probe_provider, :probe_provider
       define_method(:probe_provider) do |provider_config, *_args, **_kw|
         sleep(0.005)
-        { ttft: provider_config["provider"][1..].to_f * 0.01, tps: provider_config["provider"][1..].to_f * 10 }
+        {ttft: provider_config["provider"][1..].to_f * 0.01, tps: provider_config["provider"][1..].to_f * 10}
       end
     end
 
     selector = FakeSelector.new(others)
-    thread = ProbeManager.launch(selector, "test-model", "chat/completions", {}, timeouts: { open: 1, read: 1, write: 1 }, auto_switch: false, logger: @logger)
+    thread = ProbeManager.launch(selector, "test-model", "chat/completions", {}, timeouts: {open: 1, read: 1, write: 1}, auto_switch: false, logger: @logger)
     thread.join(5) or flunk("probe thread did not finish")
 
     assert_equal n, selector.metrics_calls.size, "every probe result must be recorded"
@@ -79,11 +94,11 @@ class TestProbeManager < Minitest::Test
 
   def test_global_rate_limit_skips_when_exceeded
     ProbeManager.reset_rate_limiter!
-    others = [{ "provider" => "p1", "model" => "m", "base_url" => "https://x", "api_key" => "k" }]
+    others = [{"provider" => "p1", "model" => "m", "base_url" => "https://x", "api_key" => "k"}]
 
     ProbeManager.singleton_class.class_eval do
       alias_method :__orig_probe_provider_rate, :probe_provider
-      define_method(:probe_provider) { |*_args, **_kw| { ttft: 0.01, tps: 100.0 } }
+      define_method(:probe_provider) { |*_args, **_kw| {ttft: 0.01, tps: 100.0} }
     end
 
     sel1 = FakeSelector.new(others)
@@ -91,9 +106,9 @@ class TestProbeManager < Minitest::Test
     sel3 = FakeSelector.new(others)
 
     # max_per_minute=2; first two launches proceed, third returns nil.
-    t1 = ProbeManager.launch(sel1, "m1", "p", {}, timeouts: { open: 1, read: 1, write: 1 }, auto_switch: false, logger: @logger, max_per_minute: 2)
-    t2 = ProbeManager.launch(sel2, "m2", "p", {}, timeouts: { open: 1, read: 1, write: 1 }, auto_switch: false, logger: @logger, max_per_minute: 2)
-    t3 = ProbeManager.launch(sel3, "m3", "p", {}, timeouts: { open: 1, read: 1, write: 1 }, auto_switch: false, logger: @logger, max_per_minute: 2)
+    t1 = ProbeManager.launch(sel1, "m1", "p", {}, timeouts: {open: 1, read: 1, write: 1}, auto_switch: false, logger: @logger, max_per_minute: 2)
+    t2 = ProbeManager.launch(sel2, "m2", "p", {}, timeouts: {open: 1, read: 1, write: 1}, auto_switch: false, logger: @logger, max_per_minute: 2)
+    t3 = ProbeManager.launch(sel3, "m3", "p", {}, timeouts: {open: 1, read: 1, write: 1}, auto_switch: false, logger: @logger, max_per_minute: 2)
 
     refute_nil t1
     refute_nil t2
@@ -122,8 +137,8 @@ class TestProbeManager < Minitest::Test
 
   def test_hung_probe_is_killed_after_deadline
     others = [
-      { "provider" => "fast", "model" => "m", "base_url" => "https://example.invalid/v1", "api_key" => "k" },
-      { "provider" => "hung", "model" => "m", "base_url" => "https://example.invalid/v1", "api_key" => "k" }
+      {"provider" => "fast", "model" => "m", "base_url" => "https://example.invalid/v1", "api_key" => "k"},
+      {"provider" => "hung", "model" => "m", "base_url" => "https://example.invalid/v1", "api_key" => "k"}
     ]
 
     ProbeManager.singleton_class.class_eval do
@@ -131,16 +146,16 @@ class TestProbeManager < Minitest::Test
       define_method(:probe_provider) do |provider_config, *_args, **_kw|
         if provider_config["provider"] == "hung"
           sleep(60)
-          { ttft: 0.01, tps: 999.0 }
+          {ttft: 0.01, tps: 999.0}
         else
-          { ttft: 0.05, tps: 50.0 }
+          {ttft: 0.05, tps: 50.0}
         end
       end
     end
 
     selector = FakeSelector.new(others)
     started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-    thread = ProbeManager.launch(selector, "test-model", "chat/completions", {}, timeouts: { open: 1, read: 1, write: 1 }, auto_switch: false, logger: @logger, deadline_seconds: 1)
+    thread = ProbeManager.launch(selector, "test-model", "chat/completions", {}, timeouts: {open: 1, read: 1, write: 1}, auto_switch: false, logger: @logger, deadline_seconds: 1)
     finished = thread.join(10)
     elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
 
@@ -166,20 +181,20 @@ class TestProbeManager < Minitest::Test
 
   def test_failing_probe_does_not_abort_other_probes
     others = [
-      { "provider" => "ok",   "model" => "m", "base_url" => "https://example.invalid/v1", "api_key" => "k" },
-      { "provider" => "fail", "model" => "m", "base_url" => "https://example.invalid/v1", "api_key" => "k" }
+      {"provider" => "ok", "model" => "m", "base_url" => "https://example.invalid/v1", "api_key" => "k"},
+      {"provider" => "fail", "model" => "m", "base_url" => "https://example.invalid/v1", "api_key" => "k"}
     ]
 
     ProbeManager.singleton_class.class_eval do
       alias_method :__orig_probe_provider2, :probe_provider
       define_method(:probe_provider) do |provider_config, *_args, **_kw|
         raise "kaboom" if provider_config["provider"] == "fail"
-        { ttft: 0.1, tps: 50.0 }
+        {ttft: 0.1, tps: 50.0}
       end
     end
 
     selector = FakeSelector.new(others)
-    thread = ProbeManager.launch(selector, "test-model", "chat/completions", {}, timeouts: { open: 1, read: 1, write: 1 }, auto_switch: false, logger: @logger)
+    thread = ProbeManager.launch(selector, "test-model", "chat/completions", {}, timeouts: {open: 1, read: 1, write: 1}, auto_switch: false, logger: @logger)
     thread.join(5)
 
     assert selector.probe_finished_called, "probe_finished must run even on inner failure"

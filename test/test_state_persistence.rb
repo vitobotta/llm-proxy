@@ -8,12 +8,12 @@ require "json"
 class TestStatePersistence < Minitest::Test
   def setup
     @providers = [
-      { "provider" => "prov_a", "model" => "m-a", "base_url" => "https://a.example.com/v1", "api_key" => "ka" }.freeze,
-      { "provider" => "prov_b", "model" => "m-b", "base_url" => "https://b.example.com/v1", "api_key" => "kb" }.freeze
+      {"provider" => "prov_a", "model" => "m-a", "base_url" => "https://a.example.com/v1", "api_key" => "ka"}.freeze,
+      {"provider" => "prov_b", "model" => "m-b", "base_url" => "https://b.example.com/v1", "api_key" => "kb"}.freeze
     ].freeze
-    @model_config = { "name" => "test-model", "providers" => [
-      { "provider" => "prov_a", "model" => "m-a", "primary" => true },
-      { "provider" => "prov_b", "model" => "m-b" }
+    @model_config = {"name" => "test-model", "providers" => [
+      {"provider" => "prov_a", "model" => "m-a", "primary" => true},
+      {"provider" => "prov_b", "model" => "m-b"}
     ]}
     @tmpdir = Dir.mktmpdir("state_persistence_test_")
   end
@@ -61,8 +61,8 @@ class TestStatePersistence < Minitest::Test
       "active_provider" => "prov_b",
       "samples" => {
         "prov_b" => [
-          { "ttft" => 0.5, "tps" => 120.0, "ts" => Time.now.to_f - 10 },
-          { "ttft" => 0.6, "tps" => 110.0, "ts" => Time.now.to_f - 5 }
+          {"ttft" => 0.5, "tps" => 120.0, "ts" => Time.now.to_f - 10},
+          {"ttft" => 0.6, "tps" => 110.0, "ts" => Time.now.to_f - 5}
         ]
       },
       "circuits" => {},
@@ -80,7 +80,7 @@ class TestStatePersistence < Minitest::Test
       "active_provider" => "prov_a",
       "samples" => {
         "prov_a" => [
-          { "ttft" => 1.0, "tps" => 50.0, "ts" => old_ts }
+          {"ttft" => 1.0, "tps" => 50.0, "ts" => old_ts}
         ]
       },
       "circuits" => {}
@@ -97,7 +97,7 @@ class TestStatePersistence < Minitest::Test
       "active_provider" => "prov_a",
       "samples" => {},
       "circuits" => {
-        "prov_b" => { "failures" => 3, "opened_at" => opened_at }
+        "prov_b" => {"failures" => 3, "opened_at" => opened_at}
       }
     }
 
@@ -110,8 +110,8 @@ class TestStatePersistence < Minitest::Test
   def test_restore_state_ignores_unknown_providers
     state = {
       "active_provider" => "prov_unknown",
-      "samples" => { "prov_unknown" => [{ "ttft" => 1.0, "ts" => Time.now.to_f }] },
-      "circuits" => { "prov_unknown" => { "failures" => 1, "opened_at" => nil } }
+      "samples" => {"prov_unknown" => [{"ttft" => 1.0, "ts" => Time.now.to_f}]},
+      "circuits" => {"prov_unknown" => {"failures" => 1, "opened_at" => nil}}
     }
 
     selector.restore_state!(state)
@@ -151,7 +151,7 @@ class TestStatePersistence < Minitest::Test
     old_env = ENV["STATE_DIR"]
     ENV["STATE_DIR"] = @tmpdir
     begin
-      File.write(File.join(@tmpdir, "provider_state.json"), JSON.generate({ "version" => 999, "models" => {} }))
+      File.write(File.join(@tmpdir, "provider_state.json"), JSON.generate({"version" => 999, "models" => {}}))
       assert_nil StatePersistence.load
     ensure
       ENV["STATE_DIR"] = old_env
@@ -211,7 +211,7 @@ class TestStatePersistence < Minitest::Test
     old_env = ENV["STATE_DIR"]
     ENV["STATE_DIR"] = @tmpdir
     begin
-      File.write(File.join(@tmpdir, "provider_state.json"), JSON.generate({ "models" => {} }))
+      File.write(File.join(@tmpdir, "provider_state.json"), JSON.generate({"models" => {}}))
       assert_nil StatePersistence.load
     ensure
       ENV["STATE_DIR"] = old_env
@@ -222,7 +222,7 @@ class TestStatePersistence < Minitest::Test
     old_env = ENV["STATE_DIR"]
     ENV["STATE_DIR"] = @tmpdir
     begin
-      full = JSON.generate({ "version" => 1, "saved_at" => 1.0, "models" => { "x" => { "active_provider" => "y" } } })
+      full = JSON.generate({"version" => 1, "saved_at" => 1.0, "models" => {"x" => {"active_provider" => "y"}}})
       truncated = full[0..(full.bytesize / 2)]
       File.write(File.join(@tmpdir, "provider_state.json"), truncated)
       assert_nil StatePersistence.load
@@ -238,7 +238,7 @@ class TestStatePersistence < Minitest::Test
       # Stub build_state to avoid needing ConfigStore.
       StatePersistence.singleton_class.class_eval do
         alias_method :__orig_build_state, :build_state
-        define_method(:build_state) { { "version" => StatePersistence::STATE_VERSION, "models" => {} } }
+        define_method(:build_state) { {"version" => StatePersistence::STATE_VERSION, "models" => {}} }
       end
 
       # Force File.rename to fail. Use the real File.rename via a stub.

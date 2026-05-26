@@ -8,9 +8,9 @@ module Metrics
   HISTOGRAM_BUCKETS = [0.1, 0.5, 1, 5, 10, 30, 60, 300].freeze
 
   COUNTER_HELP = {
-    requests_total:      "Total HTTP requests received",
-    provider_success:    "Successful upstream responses by provider/model",
-    provider_failure:    "Failed upstream attempts by provider/model"
+    requests_total: "Total HTTP requests received",
+    provider_success: "Successful upstream responses by provider/model",
+    provider_failure: "Failed upstream attempts by provider/model"
   }.freeze
 
   HISTOGRAM_HELP = {
@@ -28,7 +28,7 @@ module Metrics
   def self.observe(name, value, labels: {})
     LOCK.synchronize do
       key = [name, labels]
-      hist = (HISTOGRAMS[key] ||= { count: 0, sum: 0.0, buckets: Hash.new(0) })
+      hist = (HISTOGRAMS[key] ||= {count: 0, sum: 0.0, buckets: Hash.new(0)})
       hist[:count] += 1
       hist[:sum] += value
       HISTOGRAM_BUCKETS.each do |le|
@@ -101,6 +101,6 @@ module Metrics
   end
 
   def self.format_le(le)
-    le == le.to_i ? le.to_i.to_s : le.to_s
+    (le == le.to_i) ? le.to_i.to_s : le.to_s
   end
 end

@@ -61,7 +61,7 @@ class TestHTTPSupport < Minitest::Test
       "headers" => nil
     }
     _uri, request = HTTPSupport.build_upstream_request(
-      provider_config, "chat/completions", { "model" => "gpt-4" }, "gpt-4", nil, stream: true
+      provider_config, "chat/completions", {"model" => "gpt-4"}, "gpt-4", nil, stream: true
     )
     assert_equal "Bearer test-key", request["Authorization"]
   end
@@ -75,7 +75,7 @@ class TestHTTPSupport < Minitest::Test
       "headers" => nil
     }
     _uri, request = HTTPSupport.build_upstream_request(
-      provider_config, "messages", { "model" => "claude-4" }, "claude-4", nil, stream: true
+      provider_config, "messages", {"model" => "claude-4"}, "claude-4", nil, stream: true
     )
     assert_equal "ant-key", request["x-api-key"]
     assert_nil request["Authorization"]
@@ -94,7 +94,7 @@ class TestHTTPSupport < Minitest::Test
     )
     body = JSON.parse(request.body)
     assert_equal true, body["stream"]
-    assert_equal({ "include_usage" => true }, body["stream_options"])
+    assert_equal({"include_usage" => true}, body["stream_options"])
   end
 
   def test_build_upstream_request_no_stream_options_when_false
@@ -119,7 +119,7 @@ class TestHTTPSupport < Minitest::Test
       "base_url" => "https://openrouter.ai/api/v1",
       "api_key" => "key",
       "model" => "m",
-      "headers" => { "HTTP-Referer" => "https://test.com", "X-Title" => "Test" }
+      "headers" => {"HTTP-Referer" => "https://test.com", "X-Title" => "Test"}
     }
     _uri, request = HTTPSupport.build_upstream_request(
       provider_config, "chat/completions", {}, "m", nil, stream: true
@@ -134,7 +134,7 @@ class TestHTTPSupport < Minitest::Test
       "base_url" => "https://api.openai.com/v1",
       "api_key" => "real-key",
       "model" => "m",
-      "headers" => { "Authorization" => "Bearer hijack", "Host" => "evil.example.com", "X-Custom" => "ok" }
+      "headers" => {"Authorization" => "Bearer hijack", "Host" => "evil.example.com", "X-Custom" => "ok"}
     }
     _uri, request = HTTPSupport.build_upstream_request(
       provider_config, "chat/completions", {}, "m", nil, stream: true
@@ -152,7 +152,7 @@ class TestHTTPSupport < Minitest::Test
       "model" => "m",
       "headers" => nil
     }
-    incoming = { "Authorization" => "evil-token", "X-Custom" => "allowed" }
+    incoming = {"Authorization" => "evil-token", "X-Custom" => "allowed"}
     _uri, request = HTTPSupport.build_upstream_request(
       provider_config, "chat/completions", {}, "m", incoming, stream: true
     )
@@ -195,9 +195,7 @@ class TestHTTPSupport < Minitest::Test
       @headers[k]
     end
 
-    def body
-      @body
-    end
+    attr_reader :body
   end
 
   def test_read_capped_error_body_truncates_oversize
@@ -212,7 +210,7 @@ class TestHTTPSupport < Minitest::Test
     # 1 GB Content-Length — we should refuse to even call .body.
     body_invoked = false
     fake = Class.new do
-      define_method(:initialize) { @hdr = { "Content-Length" => (1024 * 1024 * 1024).to_s } }
+      define_method(:initialize) { @hdr = {"Content-Length" => (1024 * 1024 * 1024).to_s} }
       define_method(:[]) { |k| @hdr[k] }
       define_method(:body) do
         body_invoked = true
@@ -228,8 +226,13 @@ class TestHTTPSupport < Minitest::Test
 
   def test_read_capped_error_body_handles_read_failure
     fake = Class.new do
-      def [](_); nil; end
-      def body; raise IOError, "stream broken"; end
+      def [](_)
+        nil
+      end
+
+      def body
+        raise IOError, "stream broken"
+      end
     end.new
     out = HTTPSupport.read_capped_error_body(fake)
     assert_includes out, "failed to read"

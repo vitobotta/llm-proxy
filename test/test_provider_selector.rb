@@ -49,12 +49,12 @@ class TestProviderSelector < Minitest::Test
 
   def setup
     @providers = [
-      { "provider" => "prov_a", "model" => "m-a", "base_url" => "https://a.example.com/v1", "api_key" => "ka" }.freeze,
-      { "provider" => "prov_b", "model" => "m-b", "base_url" => "https://b.example.com/v1", "api_key" => "kb" }.freeze
+      {"provider" => "prov_a", "model" => "m-a", "base_url" => "https://a.example.com/v1", "api_key" => "ka"}.freeze,
+      {"provider" => "prov_b", "model" => "m-b", "base_url" => "https://b.example.com/v1", "api_key" => "kb"}.freeze
     ].freeze
-    @model_config = { "name" => "test-model", "providers" => [
-      { "provider" => "prov_a", "model" => "m-a", "primary" => true },
-      { "provider" => "prov_b", "model" => "m-b" }
+    @model_config = {"name" => "test-model", "providers" => [
+      {"provider" => "prov_a", "model" => "m-a", "primary" => true},
+      {"provider" => "prov_b", "model" => "m-b"}
     ]}
   end
 
@@ -67,9 +67,9 @@ class TestProviderSelector < Minitest::Test
   end
 
   def test_initial_active_index_without_primary
-    config = { "name" => "t", "providers" => [
-      { "provider" => "prov_a", "model" => "m-a" },
-      { "provider" => "prov_b", "model" => "m-b" }
+    config = {"name" => "t", "providers" => [
+      {"provider" => "prov_a", "model" => "m-a"},
+      {"provider" => "prov_b", "model" => "m-b"}
     ]}
     s = ProviderSelector.new("t", @providers, model_config: config)
     assert_equal 0, s.instance_variable_get(:@active_index)
@@ -105,7 +105,7 @@ class TestProviderSelector < Minitest::Test
   end
 
   def test_score_from_avg_ttft_saturation
-    avg = { avg_ttft: 2.0, avg_tps: 100.0, sample_count: 5 }
+    avg = {avg_ttft: 2.0, avg_tps: 100.0, sample_count: 5}
     score = selector.send(:score_from_avg, avg)
     ttft_score = [4.0 / 2.0, 1.0].min
     tps_score = [100.0 / 100.0, 3.0].min
@@ -114,7 +114,7 @@ class TestProviderSelector < Minitest::Test
   end
 
   def test_score_from_avg_ttft_cap
-    avg = { avg_ttft: 1.0, avg_tps: 50.0, sample_count: 3 }
+    avg = {avg_ttft: 1.0, avg_tps: 50.0, sample_count: 3}
     score = selector.send(:score_from_avg, avg)
     ttft_score = 1.0
     tps_score = [50.0 / 100.0, 3.0].min
@@ -128,7 +128,7 @@ class TestProviderSelector < Minitest::Test
   end
 
   def test_score_from_avg_tps_cap
-    avg = { avg_ttft: 4.0, avg_tps: 500.0, sample_count: 5 }
+    avg = {avg_ttft: 4.0, avg_tps: 500.0, sample_count: 5}
     score = selector.send(:score_from_avg, avg)
     tps_score = [500.0 / 100.0, 3.0].min
     assert_equal 3.0, tps_score
