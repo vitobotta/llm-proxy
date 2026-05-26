@@ -97,6 +97,65 @@ class TestHTTPSupport < Minitest::Test
     assert_equal({"include_usage" => true}, body["stream_options"])
   end
 
+  def test_build_upstream_request_preserves_reasoning_and_passthrough_fields
+    provider_config = {
+      "provider" => "openai",
+      "base_url" => "https://api.openai.com/v1",
+      "api_key" => "key",
+      "model" => "o1",
+      "headers" => nil
+    }
+    incoming_body = {
+      "model" => "client-supplied-model",
+      "messages" => [{"role" => "user", "content" => "hi"}],
+      "reasoning_effort" => "high",
+      "reasoning" => {"effort" => "medium", "summary" => "auto"},
+      "temperature" => 0.5,
+      "max_tokens" => 200,
+      "tools" => [{"type" => "function", "function" => {"name" => "x"}}],
+      "tool_choice" => "auto",
+      "response_format" => {"type" => "json_object"},
+      "metadata" => {"trace" => "abc"}
+    }
+    _uri, request = HTTPSupport.build_upstream_request(
+      provider_config, "chat/completions", incoming_body, "upstream-model-id", nil, stream: true
+    )
+    body = JSON.parse(request.body)
+
+    # Pass-through: every client-supplied field except `model` survives unchanged.
+    assert_equal "high", body["reasoning_effort"]
+    assert_equal({"effort" => "medium", "summary" => "auto"}, body["reasoning"])
+    assert_equal 0.5, body["temperature"]
+    assert_equal 200, body["max_tokens"]
+    assert_equal [{"type" => "function", "function" => {"name" => "x"}}], body["tools"]
+    assert_equal "auto", body["tool_choice"]
+    assert_equal({"type" => "json_object"}, body["response_format"])
+    assert_equal({"trace" => "abc"}, body["metadata"])
+
+    # Proxy-set: model rewritten to upstream's value, stream + stream_options added.
+    assert_equal "upstream-model-id", body["model"]
+    assert_equal true, body["stream"]
+    assert_equal({"include_usage" => true}, body["stream_options"])
+  end
+
+  def test_build_upstream_request_does_not_mutate_caller_body
+    provider_config = {
+      "provider" => "openai",
+      "base_url" => "https://api.openai.com/v1",
+      "api_key" => "key",
+      "model" => "o1",
+      "headers" => nil
+    }
+    incoming_body = {"model" => "client-id", "messages" => [], "reasoning_effort" => "high"}
+    original = Marshal.load(Marshal.dump(incoming_body))
+
+    HTTPSupport.build_upstream_request(provider_config, "chat/completions", incoming_body, "upstream-id", nil, stream: true)
+
+    # Caller's hash must be unchanged — important because the same body Hash
+    # is reused across fallback attempts in with_auto_select.
+    assert_equal original, incoming_body
+  end
+
   def test_build_upstream_request_no_stream_options_when_false
     provider_config = {
       "provider" => "openai",
