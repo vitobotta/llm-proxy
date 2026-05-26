@@ -59,14 +59,17 @@ Every incoming request follows this path:
 
 ### Performance
 
-- **Connection pooling** — `Net::HTTP` connections cached per thread per `scheme://host:port`; evicted after 300s age or 60s idle
 - **Boot-time pre-warm** — background connections opened to all providers at startup, so the first real request skips the TCP/TLS handshake
+- **Lock-free config reads** — config snapshot is swapped atomically; request-path accessors take no mutex
 - **Zero-overhead passthrough** — set `tracking.enabled: false` to skip all chunk parsing; raw bytes pass straight through with negligible CPU cost
+- **Bounded probe cost** — `performance.probe_max_per_minute` caps probe launches across all models with a sliding 60-second window
 
 ### Observability
 
 - **Per-request streaming stats** — TTFT, content/thinking token counts, and tokens-per-second logged for every streaming response
-- **Prometheus `/metrics`** — request counts/durations and per-provider success/failure counters in Prometheus-compatible format
+- **Prometheus `/metrics`** — request counts/durations, per-provider success/failure counters with a `reason` label, and a per-provider `upstream_ttft_seconds` histogram
+- **Structured JSON logs** — set `logging.format: json` to emit one JSON record per log line with `request_id` threaded through helper calls
+- **Per-provider freshness in `/health`** — `last_success_at` and `last_success_age_seconds` reveal stale "active" providers at a glance
 
 ### Operations
 
@@ -183,6 +186,7 @@ Retry behaviour:
 2. On exhaustion, fall through to next provider (ordered by score) and retry there.
 3. EOF on stale connection gets 2 fast retries that do **not** count against attempts; then counts as a normal failure.
 4. Timeouts count as failures and trigger retry/backoff.
+5. `Retry-After` on a 429 response is honored in both delta-seconds and HTTP-date formats (capped at 60s).
 
 ### Logging
 
@@ -209,18 +213,24 @@ performance:
   probing_enabled: true       # enable/disable background probing and auto-selection (default: true)
   auto_switch: false          # auto-switch active provider when better one found (requires probing_enabled)
   probe_interval: 3           # run background probe every N requests
+  probe_max_per_minute: 60    # cap probe launches across all models (sliding 60s window; omit/0 = unlimited)
   sample_window: 300          # seconds to keep probe/metrics samples for scoring (default: 300 = 5 min)
   config_poll_interval: 2     # seconds between config.yaml change checks (set 0 to disable hot-reload)
 ```
 
+`ConfigValidator` rejects out-of-range values for `retries.max_attempts`, `retries.backoff_base`, `performance.probe_interval`, `performance.probe_max_per_minute`, `performance.sample_window`, `limits.max_request_body`, and `timeouts.{open,read,write}` at boot/reload, so a fat-fingered config can't silently DoS the proxy.
+
 ### Authentication (optional)
 
-Require an auth token on incoming requests:
+Require an auth token on incoming `/v1/*` requests:
 
 ```yaml
 auth:
-  token: "your-secret-token"   # Clients must send Authorization: Bearer <token>
+  token: "your-secret-token"           # Clients must send Authorization: Bearer <token>
+  metrics_token: "scrape-only-token"   # Optional separate token gating only /metrics
 ```
+
+`/health` is always public so load balancers can probe it. `/metrics` is public by default; set `auth.metrics_token` to require a separate bearer token for Prometheus scraping. Token comparison is constant-time.
 
 ## Environment Variables
 
@@ -231,6 +241,8 @@ auth:
 | `PUMA_MIN_THREADS` | `1` | Puma thread pool minimum |
 | `PUMA_MAX_THREADS` | `16` | Puma thread pool maximum |
 | `RACK_ENV` | `production` | Rack environment |
+| `CONFIG_FILE` | `config/config.yaml` | Absolute path to the config file |
+| `STATE_DIR` | `data/` | Directory for persisted provider state |
 
 For high-concurrency I/O-bound workloads, raise `PUMA_MAX_THREADS` to `16–32` since most time is waiting on upstream providers.
 
@@ -265,14 +277,15 @@ The proxy passes `Authorization`, `OpenAI-Organization`, and `OpenAI-Beta` heade
 Every streaming request logs token statistics:
 
 ```
-[glm-5/wafer] Success | content=187 thinking=42 ttft=0.342s content_tps=54.3 thinking_tps=18.7
+[glm-5/wafer] Success | content=187 thinking=42 ttft=0.342s content_tps=54.3 thinking_tps=18.7 total_tps=48.9
 ```
 
 - **content** — output tokens (`delta.content` / `delta.text`)
 - **thinking** — reasoning tokens (`delta.reasoning_content` / `delta.thinking` / `delta.reasoning`)
 - **ttft** — time to first token
-- **content_tps** — content tokens per second (measured from first content token)
-- **thinking_tps** — thinking tokens per second (measured from first token of any kind)
+- **content_tps** — content tokens per second (measured from first content token to last content token)
+- **thinking_tps** — thinking tokens per second (measured from first thinking token to last thinking token)
+- **total_tps** — completion tokens per second over the full streaming window (first token to last of any kind); matches what providers report
 
 ## Docker Compose Reference
 
@@ -283,16 +296,24 @@ services:
     ports:
       - "9234:4567"
     volumes:
-      - ./config/:/app/config/
+      # Mount as directory, not single file — avoids inode breakage on atomic writes
+      - ./config:/app/config
+      # Persist provider state across container restarts
+      - ./data:/app/data
     restart: unless-stopped
     environment:
-      - RUBY_ENV=production
+      - RACK_ENV=production
+      - CONFIG_FILE=/app/config/config.yaml
 ```
 
 Editable fields:
 - `ports` — change left side to remap host port.
-- `volumes` — mount your `config/` directory from host.
+- `volumes` — mount your `config/` and `data/` directories from host. The `data/` mount preserves provider scoring state (TTFT/TPS samples, active-provider selection) across container restarts.
 - `environment` — add any env vars from the table above (e.g. `PUMA_MAX_THREADS=32`).
+
+The image runs as a non-root user (UID 1000). Bind-mounted host directories must be writable by UID 1000, or set `user: "${UID}:${GID}"` in a `docker-compose.override.yml` to match the host UID.
+
+A `HEALTHCHECK` is built into the image that polls `/health` every 30 seconds (`docker compose ps` will show `(healthy)` when ready).
 
 ---
 
