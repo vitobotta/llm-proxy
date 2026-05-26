@@ -85,4 +85,17 @@ class TestRequestHandler < Minitest::Test
     result = h.build_failure_summary(attempts, false)
     assert_equal 502, result[:status]
   end
+
+  # Regression guard: the Sinatra not_found block must be scoped to
+  # Sinatra::NotFound (no route matches), not to `not_found do` which is
+  # sugar for `error 404` and would override every halted 404 with a
+  # generic message. Confirmed by reading proxy.rb directly because the
+  # Sinatra dispatch path is awkward to mount inside a unit test.
+  def test_proxy_uses_error_sinatra_notfound_not_generic_not_found
+    src = File.read(File.expand_path("../proxy.rb", __dir__))
+    refute_match(/^\s*not_found do/, src,
+      "proxy.rb must NOT use `not_found do` — it overrides halt-based 404 messages (e.g. 'Model X not found')")
+    assert_match(/error Sinatra::NotFound do/, src,
+      "proxy.rb must use `error Sinatra::NotFound do` to only catch genuine no-route cases")
+  end
 end

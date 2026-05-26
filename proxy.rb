@@ -173,7 +173,10 @@ class LLMProxy < Sinatra::Base
   register Routes::Completions
   register Routes::Admin
 
-  not_found do
+  # Scope to Sinatra::NotFound (raised when no route matches) so that
+  # route-level `halt json_error(status: 404, ...)` keeps its specific
+  # message instead of being overridden by this generic handler.
+  error Sinatra::NotFound do
     json_error(status: 404, message: "Not Found", detail: request.path, type: "not_found")
   end
 
