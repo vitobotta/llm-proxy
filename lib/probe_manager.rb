@@ -44,12 +44,20 @@ module ProbeManager
     probe_id = SecureRandom.uuid[0..7]
 
     Thread.new do
-      named_threads = selector.other_providers.map do |provider_config|
+      named_threads = selector.other_providers.filter_map do |provider_config|
         p_name = provider_config["provider"]
+        if selector.quota_paused?(p_name)
+          logger.debug("[probe:#{probe_id}] Skipping quota-paused provider #{p_name}")
+          next
+        end
+        if selector.circuit_open?(p_name)
+          logger.debug("[probe:#{probe_id}] Skipping circuit-broken provider #{p_name}")
+          next
+        end
         thread = Thread.new do
           Thread.current.report_on_exception = false
           begin
-            metrics = probe_provider(provider_config, path, PROBE_BODY, provider_config["model"], headers, timeouts: timeouts, logger: logger)
+            metrics = probe_provider(provider_config, path, PROBE_BODY, provider_config["model"], headers, timeouts: timeouts, logger: logger, selector: selector)
             [p_name, metrics]
           rescue => e
             logger.error("[probe:#{probe_id}] #{p_name} thread error: #{e.class}: #{e.message}")
@@ -83,7 +91,7 @@ module ProbeManager
     end
   end
 
-  def self.probe_provider(provider_config, path, body, body_model, incoming_headers, timeouts:, logger:)
+  def self.probe_provider(provider_config, path, body, body_model, incoming_headers, timeouts:, logger:, selector: nil)
     pname = provider_config["provider"]
     uri, request = HTTPSupport.build_upstream_request(provider_config, path, body, body_model, incoming_headers, stream: true)
 
@@ -97,7 +105,23 @@ module ProbeManager
       stream_end = Process.clock_gettime(Process::CLOCK_MONOTONIC)
 
       if result[:error]
-        logger.warn("[probe] #{pname}: #{result[:error]}")
+        error_str = result[:error]
+        status_match = /\AHTTP (\d{3})/.match(error_str)
+        status_code = status_match ? status_match[1].to_i : nil
+        error_body = error_str.sub(/\AHTTP \d{3}:\s*/, "")
+
+        if status_code && HTTPSupport.quota_exhausted?(status_code, error_body)
+          reason = status_code == 402 ? "payment_required" : (status_code == 429 ? "rate_limited" : "quota_exhausted")
+          reset_time = HTTPSupport.extract_reset_time_from_error(error_str, status_code,
+            default_seconds: (defined?(ConfigStore) ? ConfigStore.quota_pause_default_seconds : HTTPSupport::DEFAULT_QUOTA_PAUSE_SECONDS))
+          logger.warn("[probe] #{pname}: Quota exhausted (#{reason}), pausing until #{Time.at(reset_time).utc.iso8601}")
+          if selector
+            selector.quota_pause!(pname, reset_time, reason: reason)
+            Metrics.increment(:provider_quota_paused, labels: {provider: pname, model: provider_config["model"], reason: reason})
+          end
+        end
+
+        logger.warn("[probe] #{pname}: #{error_str}")
         return {ttft: Float::INFINITY, tps: nil}
       end
 

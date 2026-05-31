@@ -12,6 +12,7 @@ class TestProbeManager < Minitest::Test
       @metrics_calls = []
       @evaluate_calls = 0
       @probe_finished_called = false
+      @paused = {}
       @mutex = Mutex.new
     end
 
@@ -29,6 +30,14 @@ class TestProbeManager < Minitest::Test
 
     def probe_finished
       @probe_finished_called = true
+    end
+
+    def quota_paused?(provider_name)
+      @paused.key?(provider_name)
+    end
+
+    def circuit_open?(_provider_name)
+      false
     end
   end
 

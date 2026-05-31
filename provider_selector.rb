@@ -14,6 +14,7 @@ class ProviderSelector
   CIRCUIT_COOLDOWN = 60
 
   CircuitState = Struct.new(:failures, :opened_at, keyword_init: true)
+  QuotaPause = Struct.new(:paused_until, :reason, keyword_init: true)
 
   attr_reader :providers
 
@@ -56,6 +57,7 @@ class ProviderSelector
     @circuit_failure_threshold = circuit_failure_threshold
     @circuit_cooldown = circuit_cooldown
     @circuits = providers.each_with_object({}) { |p, h| h[p["provider"]] = CircuitState.new(failures: 0, opened_at: nil) }
+    @quota_pauses = providers.each_with_object({}) { |p, h| h[p["provider"]] = QuotaPause.new(paused_until: nil, reason: nil) }
     @error_counts = providers.each_with_object({}) { |p, h| h[p["provider"]] = 0 }
     @total_requests = providers.each_with_object({}) { |p, h| h[p["provider"]] = 0 }
     @last_success_at = providers.each_with_object({}) { |p, h| h[p["provider"]] = nil }
@@ -66,14 +68,21 @@ class ProviderSelector
     @lock.synchronize { @providers[@active_index]["provider"] }
   end
 
-  def ordered_providers
+  def ordered_providers(auto_switch: true)
     @lock.synchronize do
       @cached_ordered ||= begin
         active = @providers[@active_index]
-        others = @providers.reject.with_index { |_, i| i == @active_index }
-          .reject { |p| circuit_open?(p["provider"]) }
-          .sort_by { |p| -score_provider(p["provider"]) }
-        [active, *others]
+        if check_circuit_open(active["provider"]) || check_quota_paused(active["provider"])
+          available = @providers.reject { |p| check_circuit_open(p["provider"]) || check_quota_paused(p["provider"]) }
+          available = available.sort_by { |p| -score_provider(p["provider"]) } if auto_switch && available.length > 1
+          available
+        else
+          others = @providers.reject.with_index { |_, i| i == @active_index }
+            .reject { |p| check_circuit_open(p["provider"]) }
+            .reject { |p| check_quota_paused(p["provider"]) }
+          others = others.sort_by { |p| -score_provider(p["provider"]) } if auto_switch && others.length > 1
+          [active, *others]
+        end
       end
     end
   end
@@ -115,6 +124,7 @@ class ProviderSelector
   def evaluate_and_select(logger, auto_switch: true)
     scored = @lock.synchronize do
       @providers.each_with_index.map do |p, i|
+        next nil if check_quota_paused(p["provider"])
         avg = average_metrics(p["provider"])
         next nil unless avg && avg[:sample_count] >= MIN_SAMPLES
         [i, avg]
@@ -172,6 +182,30 @@ class ProviderSelector
     end
   end
 
+  def quota_pause!(provider_name, paused_until, reason: nil)
+    @lock.synchronize do
+      qp = @quota_pauses[provider_name]
+      return unless qp
+      qp.paused_until = [qp.paused_until || 0, paused_until].max
+      qp.reason = reason if reason
+      @cached_ordered = nil
+    end
+  end
+
+  def quota_paused?(provider_name)
+    @lock.synchronize { check_quota_paused(provider_name) }
+  end
+
+  def clear_quota_pause(provider_name)
+    @lock.synchronize do
+      qp = @quota_pauses[provider_name]
+      return unless qp
+      qp.paused_until = nil
+      qp.reason = nil
+      @cached_ordered = nil
+    end
+  end
+
   def record_success(provider_name)
     @lock.synchronize do
       @total_requests[provider_name] = (@total_requests[provider_name] || 0) + 1
@@ -219,12 +253,16 @@ class ProviderSelector
       @providers.each_with_object({}) do |p, h|
         name = p["provider"]
         last = @last_success_at[name]
+        qp = @quota_pauses[name]
         h[name] = {
           errors: @error_counts[name] || 0,
           successes: @total_requests[name] || 0,
           circuit_open: !@circuits[name]&.opened_at.nil?,
           last_success_at: last ? Time.at(last).iso8601 : nil,
-          last_success_age_seconds: last ? (now - last).round(1) : nil
+          last_success_age_seconds: last ? (now - last).round(1) : nil,
+          quota_paused: qp&.paused_until && now < qp.paused_until ? true : false,
+          quota_pause_until: qp&.paused_until ? Time.at(qp.paused_until).iso8601 : nil,
+          quota_pause_reason: qp&.reason
         }
       end
     end
@@ -239,7 +277,10 @@ class ProviderSelector
           arr.map { |s| sample_to_hash(s) }
         end,
         circuits: @circuits.transform_values do |c|
-          {failures: c.failures, opened_at: c.opened_at}
+          {"failures" => c.failures, "opened_at" => c.opened_at}
+        end,
+        quota_pauses: @quota_pauses.transform_values do |qp|
+          {"paused_until" => qp.paused_until, "reason" => qp.reason}
         end,
         request_count: @request_count
       }
@@ -294,6 +335,16 @@ class ProviderSelector
         end
       end
 
+      if (qp_data = state["quota_pauses"] || state[:quota_pauses]).is_a?(Hash)
+        qp_data.each do |p_name, qp|
+          next unless qp.is_a?(Hash) && @quota_pauses.key?(p_name)
+          paused_until = (qp["paused_until"] || qp[:paused_until])&.to_f
+          reason = qp["reason"] || qp[:reason]
+          next unless paused_until && paused_until > now
+          @quota_pauses[p_name] = QuotaPause.new(paused_until: paused_until, reason: reason)
+        end
+      end
+
       @cached_ordered = nil
     end
   end
@@ -319,12 +370,31 @@ class ProviderSelector
   # auto-close after cooldown, so unsynchronized reads can race with
   # concurrent record_failure / record_success calls.
   def circuit_open?(provider_name)
+    @lock.synchronize { check_circuit_open(provider_name) }
+  end
+
+  # CALLER MUST HOLD @lock. Auto-expires circuits past cooldown.
+  def check_circuit_open(provider_name)
     circuit = @circuits[provider_name]
     return false unless circuit&.opened_at
     now = Time.now.to_f
     if now - circuit.opened_at > @circuit_cooldown
       circuit.opened_at = nil
       circuit.failures = 0
+      false
+    else
+      true
+    end
+  end
+
+  # CALLER MUST HOLD @lock. Auto-expires past pauses.
+  def check_quota_paused(provider_name)
+    qp = @quota_pauses[provider_name]
+    return false unless qp&.paused_until
+    now = Time.now.to_f
+    if now >= qp.paused_until
+      qp.paused_until = nil
+      qp.reason = nil
       false
     else
       true

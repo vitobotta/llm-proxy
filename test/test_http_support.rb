@@ -12,12 +12,15 @@ class TestHTTPSupport < Minitest::Test
     assert HTTPSupport::ClientDisconnected < StandardError
   end
 
-  def test_retryable_codes_include_429_5xx
-    assert_includes HTTPSupport::RETRYABLE_CODES, 429
+  def test_retryable_codes_include_5xx
     assert_includes HTTPSupport::RETRYABLE_CODES, 500
     assert_includes HTTPSupport::RETRYABLE_CODES, 502
     assert_includes HTTPSupport::RETRYABLE_CODES, 503
     assert_includes HTTPSupport::RETRYABLE_CODES, 504
+  end
+
+  def test_retryable_codes_exclude_429
+    refute_includes HTTPSupport::RETRYABLE_CODES, 429, "429 is now handled via QuotaExhaustedError, not retryable"
   end
 
   def test_retryable_codes_exclude_4xx_client_errors

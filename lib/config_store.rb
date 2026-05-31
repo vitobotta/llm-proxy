@@ -99,6 +99,7 @@ module ConfigStore
   def self.sample_window = @data[:sample_window]
   def self.max_attempts = @data[:max_attempts]
   def self.backoff_base = @data[:backoff_base]
+  def self.quota_pause_default_seconds = @data[:quota_pause_default_seconds]
 
   def self.model(name) = @data[:models][name]
   def self.selector(name) = @data[:selectors][name]
@@ -162,7 +163,8 @@ module ConfigStore
       probe_max_per_minute: raw.dig("performance", "probe_max_per_minute"),
       sample_window: sample_window,
       max_attempts: raw.dig("retries", "max_attempts") || 3,
-      backoff_base: raw.dig("retries", "backoff_base") || 2
+      backoff_base: raw.dig("retries", "backoff_base") || 2,
+      quota_pause_default_seconds: raw.dig("performance", "quota_pause_default_seconds") || 60
     }
   end
 

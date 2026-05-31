@@ -10,7 +10,8 @@ module Metrics
   COUNTER_HELP = {
     requests_total: "Total HTTP requests received",
     provider_success: "Successful upstream responses by provider/model",
-    provider_failure: "Failed upstream attempts by provider/model"
+    provider_failure: "Failed upstream attempts by provider/model",
+    provider_quota_paused: "Times a provider was quota-paused by provider/model/reason"
   }.freeze
 
   HISTOGRAM_HELP = {

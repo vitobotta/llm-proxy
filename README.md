@@ -17,11 +17,11 @@ LLM Proxy automates this. You list multiple providers for each model, and the pr
 Every incoming request follows this path:
 
 1. **Route** — the proxy matches the requested model name to your config
-2. **Select** — `ProviderSelector` picks the best provider: the active primary, or the highest-scoring alternative if the primary's circuit breaker is open
+2. **Select** — `ProviderSelector` picks the best provider: the active primary, or the highest-scoring alternative if the primary's circuit breaker is open or quota-paused
 3. **Stream** — the request is forwarded to the chosen provider; the response streams back to the client in real time (SSE)
 4. **Measure** — TTFT, token counts, and tokens-per-second are recorded per-request
 5. **Auto-switch** — a background probe periodically compares providers on real TTFT/TPS data; if a non-primary provider consistently outperforms the active one, the proxy switches and persists the change to your config
-6. **Fallback** — if the chosen provider fails, the proxy tries the next-best provider in score order, with retry and backoff
+6. **Fallback** — if the chosen provider fails, the proxy tries the next provider (in config order when auto_switch is off, or by score when on), with retry and backoff
 
 ```
 ┌──────────────┐
@@ -49,12 +49,13 @@ Every incoming request follows this path:
 - Scores providers by real **TTFT** (time to first token) and **TPS** (tokens per second) — not guesswork
 - **Auto-switches** to the fastest provider after background probes compare performance
 - **Circuit breaker** opens after 3 consecutive failures on a provider (60s cooldown), so bad providers are skipped until they recover
+- **Quota pause** — 429, 402, and 403 (with quota body patterns) responses pause the provider until the reset time given by `Retry-After`, `x-ratelimit-reset-*` headers, or the body. While paused, the provider is skipped and requests fall through to the next provider
 
 ### Resilience
 
 - **Exponential backoff** retry — configurable max attempts with `2^n` second delays
 - **Stale-connection recovery** — `EOFError` from idle connections gets 2 free retries that don't count against your attempt limit
-- **429 Retry-After** — rate-limited responses trigger a non-blocking retry after the provider's specified delay (capped at 60s)
+- **Quota-aware fallback** — 429/402/403 quota responses immediately fall through to the next provider instead of retrying the same one; the paused provider is skipped until its reset time expires
 - **Request deadline** — 600s overall limit across all provider fallback attempts, so a cascade of slow providers can't hang your request forever
 
 ### Performance
@@ -69,7 +70,7 @@ Every incoming request follows this path:
 - **Per-request streaming stats** — TTFT, content/thinking token counts, and tokens-per-second logged for every streaming response
 - **Prometheus `/metrics`** — request counts/durations, per-provider success/failure counters with a `reason` label, and a per-provider `upstream_ttft_seconds` histogram
 - **Structured JSON logs** — set `logging.format: json` to emit one JSON record per log line with `request_id` threaded through helper calls
-- **Per-provider freshness in `/health`** — `last_success_at` and `last_success_age_seconds` reveal stale "active" providers at a glance
+- **Per-provider freshness in `/health`** — `last_success_at`, `last_success_age_seconds`, `quota_paused`, `quota_pause_until`, and `quota_pause_reason` reveal stale or paused providers at a glance
 
 ### Operations
 
@@ -183,10 +184,10 @@ retries:
 
 Retry behaviour:
 1. Attempt primary provider up to `max_attempts` with backoff.
-2. On exhaustion, fall through to next provider (ordered by score) and retry there.
+2. On exhaustion, fall through to next provider (ordered by config when auto_switch is off, or by score when on) and retry there.
 3. EOF on stale connection gets 2 fast retries that do **not** count against attempts; then counts as a normal failure.
 4. Timeouts count as failures and trigger retry/backoff.
-5. `Retry-After` on a 429 response is honored in both delta-seconds and HTTP-date formats (capped at 60s).
+5. 429, 402, and 403 (with quota body patterns) immediately pause the provider and fall through to the next one — no retry on the same provider. The provider is skipped until its stated reset time expires.
 
 ### Logging
 

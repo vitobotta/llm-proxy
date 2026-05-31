@@ -9,7 +9,7 @@ module RequestHandler
     auto_switch = model_entry&.dig("auto_switch") == true
     probe_interval = model_entry&.dig("probe_interval") || ConfigStore.probe_interval
 
-    providers = selector.ordered_providers
+    providers = selector.ordered_providers(auto_switch: auto_switch)
 
     deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + REQUEST_DEADLINE
 
@@ -48,6 +48,10 @@ module RequestHandler
         attempts << {provider: p_name, status: result.is_a?(Hash) ? result[:status] : nil, error: result.is_a?(Hash) ? result[:error] : nil, reason: reason}
         selector.record_failure(p_name)
         Metrics.increment(:provider_failure, labels: {provider: p_name, model: model_name, reason: reason})
+        if result.is_a?(Hash) && result[:quota_pause_until]
+          selector.quota_pause!(p_name, result[:quota_pause_until], reason: result[:quota_pause_reason])
+          Metrics.increment(:provider_quota_paused, labels: {provider: p_name, model: model_name, reason: result[:quota_pause_reason] || "unknown"})
+        end
       end
     end
 
@@ -95,6 +99,7 @@ module RequestHandler
     return "unknown" unless result.is_a?(Hash)
     status = result[:status]
     err = result[:error].to_s
+    return "quota_exhausted" if result[:quota_pause_until]
     if status
       return "rate_limited" if status == 429
       return "client_error" if status >= 400 && status < 500

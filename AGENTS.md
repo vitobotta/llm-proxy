@@ -43,9 +43,9 @@ curl -s http://localhost:9234/v1/models | python3 -m json.tool
 | File | Role |
 |---|---|
 | `proxy.rb` | Sinatra app: routes, config loading, before/after hooks, auth |
-| `provider_selector.rb` | Per-model provider scorer with TTFT/TPS ranking, hysteresis, circuit breaker |
+| `provider_selector.rb` | Per-model provider scorer with TTFT/TPS ranking, hysteresis, circuit breaker, quota pause |
 | `lib/streaming.rb` | SSE chunk parser, `TimerTracker` class, token counting, TPS computation |
-| `lib/http_support.rb` | HTTP connection pooling (`PoolEntry` with age/idle tracking), retry logic, graceful shutdown |
+| `lib/http_support.rb` | HTTP connection pooling (`PoolEntry` with age/idle tracking), retry logic, quota detection, graceful shutdown |
 | `lib/request_handler.rb` | Sinatra helper: `with_auto_select`, `try_stream`, `try_single_request`, deadline enforcement |
 | `lib/config_validator.rb` | Config validation (errors abort on boot, return errors on reload) |
 | `lib/config_store.rb` | Thread-safe mutable config store — replaces frozen constants, supports hot-reload |
@@ -59,14 +59,15 @@ curl -s http://localhost:9234/v1/models | python3 -m json.tool
 ## Architecture notes
 
 - **Streaming is the default** — `stream: false` must be explicit in the request body. The `stream_requested` var is `true` unless body has `"stream": false`.
-- **Provider auto-selection** happens per-request via `ProviderSelector#ordered_providers`. Active provider is first; others sorted by score. Circuit-broken providers are skipped.
+- **Provider auto-selection** happens per-request via `ProviderSelector#ordered_providers`. Active provider is first; others follow config order (when `auto_switch: false`) or are sorted by score (when `auto_switch: true`). Circuit-broken and quota-paused providers are skipped.
 - **Circuit breaker** — 3 consecutive failures opens a provider's circuit for 60s. Success resets it.
+- **Quota pause** — 429, 402, and 403 (with quota body patterns like `insufficient_quota`, `billing limit`, `credit`, etc.) responses immediately pause the provider and fall through to the next one. The pause duration is extracted from `Retry-After`, `x-ratelimit-reset-requests/tokens` headers, or the response body. If none are available, `quota_pause_default_seconds` (default 60s) is used. Paused providers are skipped by requests and probes until the pause expires. `QuotaExhaustedError` is raised in `handle_upstream_error` and caught in `try_with_retries` which returns immediately (no retry on same provider). `with_auto_select` registers the pause via `selector.quota_pause!`. `quota_pause!` takes the `max` of the current and new `paused_until` so repeated requests can't extend a pause beyond the server-stated reset time.
 - **`ProviderSelector` mutates `config/config.yaml`** — when auto-switch fires, it writes `primary: true` back to the file. This is by design, not a side effect to "fix".
 - **Pre-warm** runs at boot: `HTTPSupport.prewarm_connections!` opens and keeps HTTP connections alive.
 - **Graceful shutdown** registered via `HTTPSupport.setup_graceful_shutdown!` — cleans connection pools on SIGINT/SIGTERM.
 - **No JSON parse for chunk tracking** — `Streaming.parse_chunk` uses fast string matching (`include?`) on SSE data lines to detect thinking/content/usage. Only the `usage` block gets `JSON.parse`. When `tracking.enabled: false`, all chunk parsing is skipped entirely.
 - **EOF recovery** — two no-harm retries on `EOFError` (stale connection) that don't count against `max_attempts`.
-- **429 Retry-After** — non-blocking: `RateLimitedError` carries the delay, retry loop sleeps with cap at 60s.
+- **429/402/403 quota responses** — no longer retry on the same provider. `QuotaExhaustedError` is raised immediately and the request falls through to the next provider. The provider is quota-paused until its stated reset time. `RateLimitedError` and its sleep-and-retry logic have been removed.
 - **Request deadline** — 600s overall limit across all provider fallback attempts.
 - **Connection lifecycle** — `PoolEntry` tracks creation time and last-used time. Connections evicted after 300s age or 60s idle.
 - **Prometheus metrics** at `/metrics` — request counts/durations, per-provider success/failure counters.
@@ -85,9 +86,11 @@ curl -s http://localhost:9234/v1/models | python3 -m json.tool
 - **`PROTECTED_HEADERS`** (host, authorization, x-api-key, api-key) are stripped from incoming requests before forwarding upstream.
 - **Docker binds port 9234**, not 4567.
 - **`context_length` is optional** per model — only validated if present (must be positive integer).
-- **Background probing** uses a fixed `PROBE_BODY` ("Write a brief paragraph about the weather", max_tokens: 100) and skips providers already being probed.
+- **Background probing** uses a fixed `PROBE_BODY` ("Write a brief paragraph about the weather", max_tokens: 100) and skips providers already being probed or that are quota-paused or circuit-broken.
 - **Incoming auth** optional via `auth.token` in config — clients must send `Authorization: Bearer <token>`.
 - **`accumulated` string** is nil'd after usage data found OR after exceeding 512KB — always nil-check before use.
+- **`quota_pause_default_seconds`** (default 60s) — used when a quota error doesn't include a `Retry-After`, `x-ratelimit-reset-*`, or body reset time. Configurable via `quota_pause_default_seconds` in the top-level config.
+- **Probe quota detection** — `probe_provider` parses error strings from `Streaming.stream_response` and registers quota pauses via `HTTPSupport.quota_exhausted?` and `HTTPSupport.extract_reset_time_from_error`. These are string-based alternatives to the response-object methods used in the main request path.
 - **`probing_enabled: false` disables auto_switch** — per-model `auto_switch` is forced false when `probing_enabled` is false, matching the global behaviour.
 - **Puma's `WRITE_TIMEOUT` is monkey-patched to 300s** — Puma's default 10s write timeout (`Puma::Const::WRITE_TIMEOUT`) kills long-lived streaming connections with "Socket timeout writing data". Overridden in `puma.rb` + `persistent_timeout 300`.
 

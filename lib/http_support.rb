@@ -10,16 +10,32 @@ module HTTPSupport
   class RetryableError < StandardError; end
   class ClientDisconnected < StandardError; end
 
-  class RateLimitedError < RetryableError
-    attr_reader :retry_after
+  class QuotaExhaustedError < StandardError
+    attr_reader :reset_time, :status, :reason
 
-    def initialize(retry_after)
-      @retry_after = retry_after
-      super("Rate limited, Retry-After: #{retry_after}s")
+    def initialize(reset_time:, status:, reason: "quota_exhausted")
+      @reset_time = reset_time
+      @status = status
+      @reason = reason
+      super("Quota exhausted (#{reason}), resume at #{Time.at(reset_time).utc.iso8601}")
     end
   end
 
-  RETRYABLE_CODES = [429, 500, 502, 503, 504].freeze
+  RETRYABLE_CODES = [500, 502, 503, 504].freeze
+
+  QUOTA_BODY_PATTERNS = [
+    /insufficient_quota/i,
+    /billing\s*(limit|exceeded|issue)/i,
+    /credit/i,
+    /payment/i,
+    /plan\s*(limit|exceeded)/i,
+    /usage\s*limit/i,
+    /quota\s*(exceeded|reached|limit)/i
+  ].freeze
+
+  QUOTA_STATUS_CODES = [402].freeze
+
+  DEFAULT_QUOTA_PAUSE_SECONDS = 60
 
   TIMEOUT_EXCEPTIONS = [Net::OpenTimeout, Net::ReadTimeout, Net::WriteTimeout].freeze
 
@@ -81,6 +97,126 @@ module HTTPSupport
         0.0
       end
     end
+  end
+
+  def self.quota_exhausted?(status, body)
+    return true if QUOTA_STATUS_CODES.include?(status)
+    return true if status == 429
+    return false unless status == 403
+    body ||= ""
+    QUOTA_BODY_PATTERNS.any? { |pat| pat.match?(body) }
+  end
+
+  def self.extract_reset_time(response, body, status, default_seconds:)
+    ra = parse_retry_after(response["Retry-After"])
+    if ra > 0
+      delay = [ra, MAX_RETRY_AFTER].min
+      return Time.now.to_f + delay
+    end
+
+    %w[x-ratelimit-reset-requests x-ratelimit-reset-tokens].each do |hdr|
+      val = response[hdr]
+      next unless val
+      begin
+        t = Float(val)
+        return t if t > Time.now.to_f
+      rescue
+        nil
+      end
+    end
+
+    parsed = nil
+    begin
+      parsed = JSON.parse(body.to_s)
+    rescue JSON::ParserError
+      nil
+    end
+
+    if parsed.is_a?(Hash)
+      reset_fields = %w[reset reset_time reset_at]
+      ms_fields = %w[retry_after_ms]
+
+      reset_fields.each do |key|
+        if parsed.key?(key)
+          v = parsed[key]
+          return v.to_f if v.respond_to?(:to_f) && v.to_f > Time.now.to_f
+        end
+      end
+
+      ms_fields.each do |key|
+        if parsed.key?(key)
+          v = parsed[key]
+          return Time.now.to_f + v.to_f / 1000.0 if v.respond_to?(:to_f)
+        end
+      end
+
+      err = parsed["error"]
+      if err.is_a?(Hash)
+        reset_fields.each do |key|
+          if err.key?(key)
+            v = err[key]
+            return v.to_f if v.respond_to?(:to_f) && v.to_f > Time.now.to_f
+          end
+        end
+
+        ms_fields.each do |key|
+          if err.key?(key)
+            v = err[key]
+            return Time.now.to_f + v.to_f / 1000.0 if v.respond_to?(:to_f)
+          end
+        end
+      end
+    end
+
+    Time.now.to_f + default_seconds
+  end
+
+  def self.extract_reset_time_from_error(error_str, status, default_seconds:)
+    body = error_str.sub(/\AHTTP \d{3}:\s*/, "")
+    parsed = nil
+    begin
+      parsed = JSON.parse(body.to_s)
+    rescue JSON::ParserError
+      nil
+    end
+
+    if parsed.is_a?(Hash)
+      reset_fields = %w[reset reset_time reset_at]
+      ms_fields = %w[retry_after_ms]
+
+      reset_fields.each do |key|
+        if parsed.key?(key)
+          v = parsed[key]
+          return v.to_f if v.respond_to?(:to_f) && v.to_f > Time.now.to_f
+        end
+      end
+
+      ms_fields.each do |key|
+        if parsed.key?(key)
+          v = parsed[key]
+          return Time.now.to_f + v.to_f / 1000.0 if v.respond_to?(:to_f)
+        end
+      end
+
+      err = parsed["error"]
+      if err.is_a?(Hash)
+        reset_fields.each do |key|
+          if err.key?(key)
+            v = err[key]
+            return v.to_f if v.respond_to?(:to_f) && v.to_f > Time.now.to_f
+          end
+        end
+
+        ms_fields.each do |key|
+          if err.key?(key)
+            v = err[key]
+            return Time.now.to_f + v.to_f / 1000.0 if v.respond_to?(:to_f)
+          end
+        end
+      end
+    end
+
+    Time.now.to_f + default_seconds
   end
 
   def self.cached_uri(base, path)
@@ -199,11 +335,10 @@ module HTTPSupport
 
       begin
         return block.call
+      rescue QuotaExhaustedError => e
+        settings.logger.warn("#{log_prefix} Quota exhausted (#{e.reason}), pausing provider until #{Time.at(e.reset_time).utc.iso8601}")
+        return {success: false, error: e.message, status: e.status, quota_pause_until: e.reset_time, quota_pause_reason: e.reason}
       rescue RetryableError => e
-        if e.is_a?(RateLimitedError)
-          settings.logger.info("#{log_prefix} Waiting #{e.retry_after}s before retry...")
-          sleep(e.retry_after)
-        end
         return retry_or_fail(log_prefix, error_label: "Failed", detail: e.message) unless maybe_retry(attempts)
       rescue ClientDisconnected
         settings.logger.info("#{log_prefix} Client disconnected")
@@ -234,14 +369,21 @@ module HTTPSupport
     error_msg = "HTTP #{code}: #{error_body}"
     settings.logger.warn("#{log_prefix} Failed: #{error_msg}")
 
+    if code == 429 || HTTPSupport.quota_exhausted?(code, error_body)
+      reason = if code == 402
+                 "payment_required"
+               elsif code == 429
+                 "rate_limited"
+               else
+                 "quota_exhausted"
+               end
+      reset_time = HTTPSupport.extract_reset_time(response, error_body, code,
+        default_seconds: (defined?(ConfigStore) ? ConfigStore.quota_pause_default_seconds : HTTPSupport::DEFAULT_QUOTA_PAUSE_SECONDS))
+      settings.logger.warn("#{log_prefix} Quota paused (#{reason}), resume at #{Time.at(reset_time).utc.iso8601}")
+      raise QuotaExhaustedError.new(reset_time: reset_time, status: code, reason: reason)
+    end
+
     if RETRYABLE_CODES.include?(code)
-      if code == 429 && response["Retry-After"]
-        delay = HTTPSupport.parse_retry_after(response["Retry-After"])
-        delay = [delay, MAX_RETRY_AFTER].min
-        delay = 0 if delay.negative?
-        settings.logger.warn("#{log_prefix} Rate limited, Retry-After: #{delay}s")
-        raise RateLimitedError.new(delay)
-      end
       raise RetryableError, error_msg
     end
 
