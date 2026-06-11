@@ -217,6 +217,8 @@ module RequestHandler
     return if result[:success]
     out << streaming_error(result[:error], detail: result[:detail])
     out << "data: [DONE]\n\n"
+  rescue Errno::EPIPE, IOError, Puma::ConnectionError
+    raise HTTPSupport::ClientDisconnected
   end
 
   def forward_chunk_to_client(out, chunk)

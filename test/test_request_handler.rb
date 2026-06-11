@@ -2,6 +2,9 @@
 
 require_relative "test_helper"
 require_relative "../lib/request_handler"
+require "puma/const"
+require "puma/null_io"
+require "puma/client"
 
 class TestRequestHandler < Minitest::Test
   def test_failure_reason_rate_limited_from_status
@@ -97,5 +100,47 @@ class TestRequestHandler < Minitest::Test
       "proxy.rb must NOT use `not_found do` — it overrides halt-based 404 messages (e.g. 'Model X not found')")
     assert_match(/error Sinatra::NotFound do/, src,
       "proxy.rb must use `error Sinatra::NotFound do` to only catch genuine no-route cases")
+  end
+
+  class MockStreamApp
+    include RequestHandler
+    include Streaming
+  end
+
+  class BrokenStream
+    def initialize(error_class)
+      @error_class = error_class
+    end
+
+    def <<(_data)
+      raise @error_class, "broken pipe"
+    end
+  end
+
+  def test_handle_streaming_error_does_nothing_on_success
+    out = []
+    MockStreamApp.new.handle_streaming_error({success: true}, out)
+    assert_empty out
+  end
+
+  def test_handle_streaming_error_raises_client_disconnected_on_epipe
+    out = BrokenStream.new(Errno::EPIPE)
+    assert_raises(HTTPSupport::ClientDisconnected) do
+      MockStreamApp.new.handle_streaming_error({success: false, error: "fail"}, out)
+    end
+  end
+
+  def test_handle_streaming_error_raises_client_disconnected_on_io_error
+    out = BrokenStream.new(IOError)
+    assert_raises(HTTPSupport::ClientDisconnected) do
+      MockStreamApp.new.handle_streaming_error({success: false, error: "fail"}, out)
+    end
+  end
+
+  def test_handle_streaming_error_raises_client_disconnected_on_puma_connection_error
+    out = BrokenStream.new(Puma::ConnectionError)
+    assert_raises(HTTPSupport::ClientDisconnected) do
+      MockStreamApp.new.handle_streaming_error({success: false, error: "fail"}, out)
+    end
   end
 end
