@@ -1,5 +1,17 @@
 # frozen_string_literal: true
 
+begin
+  require "simplecov"
+  SimpleCov.start do
+    add_filter "/test/"
+    track_files "lib/**/*.rb"
+    track_files "provider_selector.rb"
+    enable_coverage :branch
+  end
+rescue LoadError
+  # simplecov not available
+end
+
 require "minitest/autorun"
 require "json"
 require "yaml"

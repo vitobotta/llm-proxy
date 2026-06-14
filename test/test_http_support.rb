@@ -323,4 +323,321 @@ class TestHTTPSupport < Minitest::Test
     assert_equal 0.0, HTTPSupport.parse_retry_after(nil)
     assert_equal 0.0, HTTPSupport.parse_retry_after("")
   end
+
+  # -- Mock helpers for pool and handle_upstream_error tests --
+
+  class MockHttp
+    attr_accessor :started
+    alias_method :started?, :started
+
+    def finish
+      @started = false
+    end
+  end
+
+  class MockErrorResponse
+    def initialize(code:, body:, headers: {})
+      @code = code.to_s
+      @body = body
+      @headers = headers
+    end
+
+    attr_reader :code, :body
+
+    def [](k)
+      @headers[k]
+    end
+  end
+
+  class MockApp
+    include HTTPSupport
+
+    MockSettings = Struct.new(:logger)
+
+    def settings
+      MockSettings.new(NullLogger.new)
+    end
+  end
+
+  def setup
+    HTTPSupport::POOL_LOCK.synchronize { HTTPSupport::CONNECTION_POOL.clear }
+    @mock_app = MockApp.new
+  end
+
+  # -- Connection pool: checkout --
+
+  def test_checkout_http_returns_nil_when_pool_empty
+    uri = URI.parse("https://example.com")
+    assert_nil HTTPSupport.checkout_http(uri)
+  end
+
+  def test_checkout_http_returns_started_entry
+    uri = URI.parse("https://example.com")
+    mock = MockHttp.new
+    mock.started = true
+    HTTPSupport.checkin_http(uri, mock)
+    result = HTTPSupport.checkout_http(uri)
+    assert_same mock, result
+  end
+
+  def test_checkout_http_skips_unstarted_entry
+    uri = URI.parse("https://example.com")
+    mock = MockHttp.new
+    mock.started = false
+    HTTPSupport.checkin_http(uri, mock)
+    assert_nil HTTPSupport.checkout_http(uri)
+  end
+
+  def test_checkout_http_evicts_stale_created_entry
+    uri = URI.parse("https://example.com")
+    mock = MockHttp.new
+    mock.started = true
+    key = "#{uri.host}:#{uri.port}"
+    old_time = Time.now.to_f - HTTPSupport::POOL_MAX_AGE - 10
+    HTTPSupport::POOL_LOCK.synchronize do
+      HTTPSupport::CONNECTION_POOL[key] = [
+        {http: mock, created: old_time, last_used: Time.now.to_f}
+      ]
+    end
+    assert_nil HTTPSupport.checkout_http(uri)
+  end
+
+  def test_checkout_http_evicts_stale_idle_entry
+    uri = URI.parse("https://example.com")
+    mock = MockHttp.new
+    mock.started = true
+    key = "#{uri.host}:#{uri.port}"
+    old_idle = Time.now.to_f - HTTPSupport::POOL_MAX_IDLE - 10
+    HTTPSupport::POOL_LOCK.synchronize do
+      HTTPSupport::CONNECTION_POOL[key] = [
+        {http: mock, created: Time.now.to_f, last_used: old_idle}
+      ]
+    end
+    assert_nil HTTPSupport.checkout_http(uri)
+  end
+
+  # -- Connection pool: checkin --
+
+  def test_checkin_http_stores_entry
+    uri = URI.parse("https://example.com")
+    mock = MockHttp.new
+    mock.started = true
+    HTTPSupport.checkin_http(uri, mock)
+    key = "#{uri.host}:#{uri.port}"
+    entries = HTTPSupport::POOL_LOCK.synchronize { HTTPSupport::CONNECTION_POOL[key] }
+    assert_equal 1, entries.size
+    assert_same mock, entries.first[:http]
+  end
+
+  def test_checkin_http_ignores_nil
+    uri = URI.parse("https://example.com")
+    HTTPSupport.checkin_http(uri, nil)
+    key = "#{uri.host}:#{uri.port}"
+    entries = HTTPSupport::POOL_LOCK.synchronize { HTTPSupport::CONNECTION_POOL[key] }
+    assert_nil entries
+  end
+
+  def test_checkin_http_evicts_stale_before_adding
+    uri = URI.parse("https://example.com")
+    key = "#{uri.host}:#{uri.port}"
+    stale = MockHttp.new
+    stale.started = true
+    old_time = Time.now.to_f - HTTPSupport::POOL_MAX_AGE - 10
+    HTTPSupport::POOL_LOCK.synchronize do
+      HTTPSupport::CONNECTION_POOL[key] = [
+        {http: stale, created: old_time, last_used: old_time}
+      ]
+    end
+    fresh = MockHttp.new
+    fresh.started = true
+    HTTPSupport.checkin_http(uri, fresh)
+    entries = HTTPSupport::POOL_LOCK.synchronize { HTTPSupport::CONNECTION_POOL[key] }
+    assert_equal 1, entries.size
+    assert_same fresh, entries.first[:http]
+  end
+
+  # -- Connection pool: discard --
+
+  def test_discard_http_finishes_started_connection
+    mock = MockHttp.new
+    mock.started = true
+    HTTPSupport.discard_http(mock)
+    refute mock.started?, "discard should finish a started connection"
+  end
+
+  def test_discard_http_handles_nil
+    # Should not raise
+    HTTPSupport.discard_http(nil)
+  end
+
+  def test_discard_http_handles_already_finished
+    mock = MockHttp.new
+    mock.started = false
+    # Should not raise
+    HTTPSupport.discard_http(mock)
+  end
+
+  # -- Connection pool: flush_pool! --
+
+  def test_flush_pool_clears_all_entries
+    uri_a = URI.parse("https://a.example.com")
+    uri_b = URI.parse("https://b.example.com")
+    mock_a = MockHttp.new; mock_a.started = true
+    mock_b = MockHttp.new; mock_b.started = true
+    HTTPSupport.checkin_http(uri_a, mock_a)
+    HTTPSupport.checkin_http(uri_b, mock_b)
+    HTTPSupport.flush_pool!
+    assert_empty HTTPSupport::CONNECTION_POOL
+    refute mock_a.started?, "flush should finish started connections"
+    refute mock_b.started?, "flush should finish started connections"
+  end
+
+  def test_flush_pool_handles_empty_pool
+    HTTPSupport.flush_pool!
+    assert_empty HTTPSupport::CONNECTION_POOL
+  end
+
+  # -- fresh_http --
+
+  def test_fresh_http_returns_net_http_with_correct_settings
+    uri = URI.parse("https://api.example.com/v1")
+    timeouts = {open: 5, read: 10, write: 8}
+    http = HTTPSupport.fresh_http(uri, timeouts: timeouts)
+    assert_kind_of Net::HTTP, http
+    assert_equal "api.example.com", http.address
+    assert_equal 443, http.port
+    assert http.use_ssl?
+    assert_equal 5, http.open_timeout
+    assert_equal 10, http.read_timeout
+    assert_equal 8, http.write_timeout
+    assert_equal HTTPSupport::KEEP_ALIVE_TIMEOUT, http.keep_alive_timeout
+  end
+
+  def test_fresh_http_disables_ssl_for_http_uri
+    uri = URI.parse("http://api.example.com/v1")
+    timeouts = {open: 5, read: 10, write: 8}
+    http = HTTPSupport.fresh_http(uri, timeouts: timeouts)
+    refute http.use_ssl?
+  end
+
+  def test_fresh_http_uses_custom_port
+    uri = URI.parse("http://localhost:8080/v1")
+    timeouts = {open: 1, read: 2, write: 3}
+    http = HTTPSupport.fresh_http(uri, timeouts: timeouts)
+    assert_equal "localhost", http.address
+    assert_equal 8080, http.port
+  end
+
+  # -- extract_reset_time_from_body --
+
+  def test_extract_reset_time_from_body_with_reset_field
+    future = (Time.now.to_f + 120).round(3)
+    body = JSON.generate({"reset" => future})
+    result = HTTPSupport.extract_reset_time_from_body(body, default_seconds: 60)
+    assert_equal future.to_f, result
+  end
+
+  def test_extract_reset_time_from_body_with_error_reset
+    future = (Time.now.to_f + 90).round(3)
+    body = JSON.generate({"error" => {"reset" => future}})
+    result = HTTPSupport.extract_reset_time_from_body(body, default_seconds: 60)
+    assert_equal future.to_f, result
+  end
+
+  def test_extract_reset_time_from_body_with_retry_after_ms
+    body = JSON.generate({"retry_after_ms" => 5000})
+    result = HTTPSupport.extract_reset_time_from_body(body, default_seconds: 60)
+    assert_in_delta Time.now.to_f + 5.0, result, 1.0
+  end
+
+  def test_extract_reset_time_from_body_with_error_retry_after_ms
+    body = JSON.generate({"error" => {"retry_after_ms" => 3000}})
+    result = HTTPSupport.extract_reset_time_from_body(body, default_seconds: 60)
+    assert_in_delta Time.now.to_f + 3.0, result, 1.0
+  end
+
+  def test_extract_reset_time_from_body_with_bad_json
+    result = HTTPSupport.extract_reset_time_from_body("not json at all", default_seconds: 60)
+    assert_in_delta Time.now.to_f + 60, result, 1.0
+  end
+
+  def test_extract_reset_time_from_body_with_missing_fields
+    body = JSON.generate({"something" => "else", "count" => 42})
+    result = HTTPSupport.extract_reset_time_from_body(body, default_seconds: 30)
+    assert_in_delta Time.now.to_f + 30, result, 1.0
+  end
+
+  def test_extract_reset_time_from_body_with_nil_body
+    result = HTTPSupport.extract_reset_time_from_body(nil, default_seconds: 45)
+    assert_in_delta Time.now.to_f + 45, result, 1.0
+  end
+
+  def test_extract_reset_time_from_body_ignores_past_reset
+    past = (Time.now.to_f - 100).round(3)
+    body = JSON.generate({"reset" => past})
+    result = HTTPSupport.extract_reset_time_from_body(body, default_seconds: 60)
+    # Past reset should be ignored, falls through to default
+    assert_in_delta Time.now.to_f + 60, result, 1.0
+  end
+
+  # -- handle_upstream_error --
+
+  def test_handle_upstream_error_429_raises_quota_exhausted
+    response = MockErrorResponse.new(code: 429, body: "rate limited")
+    err = assert_raises(HTTPSupport::QuotaExhaustedError) do
+      @mock_app.handle_upstream_error(response, "[test]")
+    end
+    assert_equal 429, err.status
+    assert_equal "rate_limited", err.reason
+  end
+
+  def test_handle_upstream_error_402_raises_quota_exhausted
+    response = MockErrorResponse.new(code: 402, body: '{"error":{"message":"insufficient_quota"}}')
+    err = assert_raises(HTTPSupport::QuotaExhaustedError) do
+      @mock_app.handle_upstream_error(response, "[test]")
+    end
+    assert_equal 402, err.status
+    assert_equal "payment_required", err.reason
+  end
+
+  def test_handle_upstream_error_500_raises_retryable
+    response = MockErrorResponse.new(code: 500, body: "internal server error")
+    err = assert_raises(HTTPSupport::RetryableError) do
+      @mock_app.handle_upstream_error(response, "[test]")
+    end
+    assert_includes err.message, "500"
+  end
+
+  def test_handle_upstream_error_400_returns_failure_hash
+    response = MockErrorResponse.new(code: 400, body: "bad request")
+    result = @mock_app.handle_upstream_error(response, "[test]")
+    assert_equal false, result[:success]
+    assert_includes result[:error], "400"
+    assert_equal 400, result[:status]
+  end
+
+  def test_handle_upstream_error_502_raises_retryable
+    response = MockErrorResponse.new(code: 502, body: "bad gateway")
+    assert_raises(HTTPSupport::RetryableError) do
+      @mock_app.handle_upstream_error(response, "[test]")
+    end
+  end
+
+  def test_handle_upstream_error_403_with_quota_body_raises_quota_exhausted
+    response = MockErrorResponse.new(code: 403, body: '{"error":{"message":"quota exceeded"}}')
+    err = assert_raises(HTTPSupport::QuotaExhaustedError) do
+      @mock_app.handle_upstream_error(response, "[test]")
+    end
+    assert_equal 403, err.status
+  end
+
+  def test_handle_upstream_error_sets_reset_time
+    future = (Time.now.to_f + 120).round(3)
+    body = JSON.generate({"reset" => future})
+    response = MockErrorResponse.new(code: 429, body: body)
+    err = assert_raises(HTTPSupport::QuotaExhaustedError) do
+      @mock_app.handle_upstream_error(response, "[test]")
+    end
+    assert_equal future.to_f, err.reset_time
+  end
 end

@@ -33,6 +33,8 @@ class TestConfigWatcher < Minitest::Test
   end
 
   def teardown
+    ConfigWatcher.stop! rescue nil
+    sleep 0.05
     ConfigStore.singleton_class.class_eval do
       if method_defined?(:__orig_reload) || private_method_defined?(:__orig_reload)
         alias_method :reload!, :__orig_reload
@@ -95,5 +97,68 @@ class TestConfigWatcher < Minitest::Test
     File.write(@config_path, YAML.dump(MOCK_CONFIG.merge("retries" => {"max_attempts" => 6, "backoff_base" => 1})))
     ConfigWatcher.send(:check_and_reload)
     assert_equal after_first + 1, ConfigStore.__reload_counter.size
+  end
+
+  # --- start! / stop! tests ---
+
+  def test_start_creates_polling_thread
+    ConfigWatcher.start!(logger: @logger, poll_interval: 0.1)
+
+    assert_equal true, ConfigWatcher.instance_variable_get(:@running)
+
+    sleep 0.25
+    ConfigWatcher.stop!
+    sleep 0.15
+
+    assert_equal false, ConfigWatcher.instance_variable_get(:@running)
+  end
+
+  def test_stop_sets_running_false
+    ConfigWatcher.start!(logger: @logger, poll_interval: 0.1)
+    assert_equal true, ConfigWatcher.instance_variable_get(:@running)
+
+    ConfigWatcher.stop!
+    assert_equal false, ConfigWatcher.instance_variable_get(:@running)
+  end
+
+  def test_start_sets_last_hash
+    ConfigWatcher.instance_variable_set(:@last_hash, nil)
+    ConfigWatcher.start!(logger: @logger, poll_interval: 0.1)
+
+    refute_nil ConfigWatcher.instance_variable_get(:@last_hash)
+    ConfigWatcher.stop!
+  end
+
+  def test_polling_thread_calls_check_and_reload
+    new_cfg = MOCK_CONFIG.merge("retries" => {"max_attempts" => 7, "backoff_base" => 1})
+    File.write(@config_path, YAML.dump(new_cfg))
+
+    before_count = ConfigStore.__reload_counter.size
+    ConfigWatcher.start!(logger: @logger, poll_interval: 0.1)
+    # After start! sets @last_hash to current file hash, override so next poll sees a hash change
+    ConfigWatcher.instance_variable_set(:@last_hash, "old_hash_value")
+    ConfigWatcher.instance_variable_set(:@last_mtime, Time.at(0))
+
+    sleep 0.35
+    ConfigWatcher.stop!
+    sleep 0.15
+
+    assert_operator ConfigStore.__reload_counter.size, :>, before_count
+  end
+
+  def test_expect_write_suppresses_poll_reload
+    ConfigWatcher.expecting_write!
+    new_cfg = MOCK_CONFIG.merge("retries" => {"max_attempts" => 8, "backoff_base" => 1})
+    File.write(@config_path, YAML.dump(new_cfg))
+
+    before_count = ConfigStore.__reload_counter.size
+    ConfigWatcher.start!(logger: @logger, poll_interval: 0.1)
+    ConfigWatcher.instance_variable_set(:@last_mtime, Time.at(0))
+
+    sleep 0.35
+    ConfigWatcher.stop!
+    sleep 0.15
+
+    assert_equal before_count, ConfigStore.__reload_counter.size
   end
 end

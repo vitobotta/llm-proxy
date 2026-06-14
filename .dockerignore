@@ -1,0 +1,9 @@
+.git
+config/config.yaml
+data/
+tmp/
+test/
+*.md
+.opencode
+.vscode
+.idea

@@ -195,4 +195,279 @@ class TestStreaming < Minitest::Test
     assert cr.has_thinking, "should detect thinking"
     refute cr.has_content, "reasoning_content should not trigger content detection"
   end
+
+  # --- consume_stream ---
+
+  def test_consume_stream_extracts_usage_from_final_chunk
+    usage_chunk = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\n"
+    done_chunk = "data: [DONE]\n\n"
+    response = MockResponse.new([usage_chunk, done_chunk])
+    tracker = Streaming::TimerTracker.new
+
+    usage = Streaming.consume_stream(response, tracker: tracker)
+    assert_equal({"prompt_tokens" => 10, "completion_tokens" => 5, "total_tokens" => 15}, usage)
+  end
+
+  def test_consume_stream_returns_nil_when_no_usage
+    content_chunk = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"
+    done_chunk = "data: [DONE]\n\n"
+    response = MockResponse.new([content_chunk, done_chunk])
+    tracker = Streaming::TimerTracker.new
+
+    usage = Streaming.consume_stream(response, tracker: tracker)
+    assert_nil usage
+  end
+
+  def test_consume_stream_tracks_thinking_timestamps
+    think_chunk = "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"hmm\"}}]}\n\n"
+    done_chunk = "data: [DONE]\n\n"
+    response = MockResponse.new([think_chunk, done_chunk])
+    tracker = Streaming::TimerTracker.new
+
+    Streaming.consume_stream(response, tracker: tracker)
+    assert tracker.thinking_detected
+    assert tracker.first_thinking
+    assert tracker.last_thinking
+  end
+
+  def test_consume_stream_tracks_content_timestamps
+    content_chunk = "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n"
+    done_chunk = "data: [DONE]\n\n"
+    response = MockResponse.new([content_chunk, done_chunk])
+    tracker = Streaming::TimerTracker.new
+
+    Streaming.consume_stream(response, tracker: tracker)
+    assert tracker.content_detected
+    assert tracker.first_content
+    assert tracker.last_content
+  end
+
+  def test_consume_stream_yields_chunk_cr_and_now_to_block
+    content_chunk = "data: {\"choices\":[{\"delta\":{\"content\":\"yo\"}}]}\n\n"
+    response = MockResponse.new([content_chunk])
+    tracker = Streaming::TimerTracker.new
+    yielded = []
+
+    Streaming.consume_stream(response, tracker: tracker) do |chunk, cr, now|
+      yielded << {chunk: chunk, cr: cr, now: now}
+    end
+
+    assert_equal 1, yielded.length
+    assert_equal content_chunk, yielded[0][:chunk]
+    assert yielded[0][:cr].is_a?(Streaming::ChunkResult)
+    assert yielded[0][:now].is_a?(Numeric)
+  end
+
+  def test_consume_stream_calls_block_for_every_chunk
+    chunks = [
+      "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"a\"}}]}\n\n",
+      "data: {\"choices\":[{\"delta\":{\"content\":\"b\"}}]}\n\n",
+      "data: [DONE]\n\n"
+    ]
+    response = MockResponse.new(chunks)
+    tracker = Streaming::TimerTracker.new
+    call_count = 0
+
+    Streaming.consume_stream(response, tracker: tracker) { |_c, _cr, _n| call_count += 1 }
+    assert_equal 3, call_count
+  end
+
+  def test_consume_stream_last_usage_wins
+    usage1 = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2}}\n\n"
+    usage2 = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\n"
+    response = MockResponse.new([usage1, usage2])
+    tracker = Streaming::TimerTracker.new
+
+    usage = Streaming.consume_stream(response, tracker: tracker)
+    assert_equal({"prompt_tokens" => 10, "completion_tokens" => 5}, usage)
+  end
+
+  # --- stream_response ---
+
+  def test_stream_response_success_with_usage
+    usage_json = {choices: [], usage: {prompt_tokens: 10, completion_tokens: 5}}.to_json
+    content_json = {choices: [{delta: {content: "hi"}}]}.to_json
+    chunks = "data: #{content_json}\n\ndata: #{usage_json}\n\ndata: [DONE]\n\n"
+    response = MockHTTPResponse.new("200", chunks)
+    http = MockHTTP.new(response)
+    request = Object.new
+
+    result = Streaming.stream_response(http, request, 1000.0)
+
+    assert_nil result[:error]
+    assert_equal 1000.0, result[:request_start]
+    assert result[:usage_data].is_a?(Hash)
+    assert_equal 10, result[:usage_data]["prompt_tokens"]
+    assert result[:first_token_time], "first_token_time should be set after content chunk"
+    assert result[:first_content_time], "first_content_time should be set"
+  end
+
+  def test_stream_response_error_returns_error_hash
+    response = MockHTTPResponse.new("500", "Internal Server Error")
+    http = MockHTTP.new(response)
+    request = Object.new
+
+    result = Streaming.stream_response(http, request, 1000.0)
+
+    assert result[:error], "should return error for non-200"
+    assert_includes result[:error], "500"
+    assert_includes result[:error], "Internal Server Error"
+  end
+
+  def test_stream_response_success_without_usage
+    content_json = {choices: [{delta: {content: "hello"}}]}.to_json
+    chunks = "data: #{content_json}\n\ndata: [DONE]\n\n"
+    response = MockHTTPResponse.new("200", chunks)
+    http = MockHTTP.new(response)
+    request = Object.new
+
+    result = Streaming.stream_response(http, request, 1000.0)
+
+    assert_nil result[:error]
+    assert_nil result[:usage_data]
+    assert result[:first_token_time]
+    assert result[:first_content_time]
+  end
+
+  def test_stream_response_calls_on_chunk_callback
+    content_json = {choices: [{delta: {content: "x"}}]}.to_json
+    chunks = "data: #{content_json}\n\ndata: [DONE]\n\n"
+    response = MockHTTPResponse.new("200", chunks)
+    http = MockHTTP.new(response)
+    request = Object.new
+    received = []
+
+    Streaming.stream_response(http, request, 1000.0, on_chunk: ->(chunk, cr, now) {
+      received << {chunk: chunk, has_content: cr.has_content, now: now}
+    })
+
+    assert received.length >= 1, "on_chunk should have been called"
+    assert received.any? { |r| r[:has_content] }, "at least one chunk should have content"
+  end
+
+  def test_stream_response_thinking_tracks_thinking_timers
+    think_json = {choices: [{delta: {reasoning_content: "thinking..."}}]}.to_json
+    content_json = {choices: [{delta: {content: "answer"}}]}.to_json
+    chunks = "data: #{think_json}\n\ndata: #{content_json}\n\ndata: [DONE]\n\n"
+    response = MockHTTPResponse.new("200", chunks)
+    http = MockHTTP.new(response)
+    request = Object.new
+
+    result = Streaming.stream_response(http, request, 1000.0)
+
+    assert_nil result[:error]
+    assert result[:first_thinking_time], "first_thinking_time should be set"
+    assert result[:last_thinking_time], "last_thinking_time should be set"
+    assert result[:first_content_time], "first_content_time should be set after content chunk"
+  end
+
+  # --- build_stream_result ---
+
+  def test_build_stream_result_with_usage_data
+    handler = BuildStreamResultHarness.new(1000.0)
+    tracker = Streaming::TimerTracker.new
+    tracker.record_thinking(1000.1)
+    tracker.record_content(1000.2)
+    tracker.record_content(1000.5)
+
+    usage = {"completion_tokens" => 100, "completion_tokens_details" => {"reasoning_tokens" => 30}}
+    result = handler.build_stream_result("[test]", tracker, usage)
+
+    assert_equal true, result[:success]
+    assert_equal 70, result[:content_tokens]
+    assert_equal 30, result[:thinking_tokens]
+    assert_in_delta(0.1, result[:ttft], 0.01)
+    assert result[:content_tps], "content_tps should be computed"
+    assert result[:total_tps], "total_tps should be computed"
+  end
+
+  def test_build_stream_result_without_usage_data
+    handler = BuildStreamResultHarness.new(1000.0)
+    tracker = Streaming::TimerTracker.new
+    tracker.record_content(1000.3)
+
+    result = handler.build_stream_result("[test]", tracker, nil)
+
+    assert_equal true, result[:success]
+    assert_nil result[:content_tokens]
+    assert_nil result[:thinking_tokens]
+    assert_nil result[:content_tps]
+    assert_nil result[:thinking_tps]
+    assert_in_delta(0.3, result[:ttft], 0.01)
+  end
+
+  def test_build_stream_result_no_tokens_received
+    handler = BuildStreamResultHarness.new(1000.0)
+    tracker = Streaming::TimerTracker.new
+
+    result = handler.build_stream_result("[test]", tracker, nil)
+
+    assert_equal true, result[:success]
+    assert_nil result[:ttft], "ttft should be nil when no tokens received"
+  end
+
+  def test_build_stream_result_negative_content_clamped
+    Streaming.reset_negative_token_warnings!
+    handler = BuildStreamResultHarness.new(1000.0)
+    tracker = Streaming::TimerTracker.new
+    tracker.record_content(1000.1)
+    tracker.record_content(1000.2)
+
+    usage = {"completion_tokens" => 10, "completion_tokens_details" => {"reasoning_tokens" => 30}}
+    result = handler.build_stream_result("[test-negative]", tracker, usage)
+
+    assert_equal 0, result[:content_tokens]
+    assert_equal 30, result[:thinking_tokens]
+  end
+end
+
+# --- Mock helpers ---
+
+class MockResponse
+  def initialize(chunks)
+    @chunks = chunks
+  end
+
+  def read_body
+    @chunks.each { |c| yield c }
+  end
+end
+
+class MockHTTPResponse
+  attr_reader :code, :body
+
+  def initialize(code, body)
+    @code = code
+    @body = body
+  end
+
+  def read_body
+    yield @body
+  end
+
+  def is_a?(klass)
+    klass.name == "Net::HTTPSuccess" && @code == "200"
+  end
+end
+
+class MockHTTP
+  def initialize(response)
+    @response = response
+  end
+
+  def request(_req)
+    yield @response
+  end
+end
+
+class BuildStreamResultHarness
+  include Streaming
+
+  attr_reader :settings
+
+  def initialize(request_start)
+    @request_start = request_start
+    logger = NullLogger.new
+    @settings = Struct.new(:logger).new(logger)
+  end
 end

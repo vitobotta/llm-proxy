@@ -46,12 +46,13 @@ module RequestHandler
       else
         reason = RequestHandler.failure_reason(result)
         attempts << {provider: p_name, status: result.is_a?(Hash) ? result[:status] : nil, error: result.is_a?(Hash) ? result[:error] : nil, reason: reason}
-        selector.record_failure(p_name)
-        Metrics.increment(:provider_failure, labels: {provider: p_name, model: model_name, reason: reason})
         if result.is_a?(Hash) && result[:quota_pause_until]
           selector.quota_pause!(p_name, result[:quota_pause_until], reason: result[:quota_pause_reason])
           Metrics.increment(:provider_quota_paused, labels: {provider: p_name, model: model_name, reason: result[:quota_pause_reason] || "unknown"})
+        else
+          selector.record_failure(p_name)
         end
+        Metrics.increment(:provider_failure, labels: {provider: p_name, model: model_name, reason: reason})
       end
     end
 
@@ -114,13 +115,13 @@ module RequestHandler
 
   MAX_ACCUMULATED_SIZE = 512 * 1024
   REQUEST_DEADLINE = 600
-
   def try_stream(provider_config, path, body, body_model, incoming_headers, out:, log_prefix:)
     uri, request = HTTPSupport.build_upstream_request(provider_config, path, body, body_model, incoming_headers, stream: true)
 
     try_with_retries(log_prefix: log_prefix, body_model: body_model) do
       http = HTTPSupport.create_http(uri, timeouts: ConfigStore.timeouts)
       http.start unless http.started?
+      pooled = true
 
       timers = Streaming::TimerTracker.new
       usage_data = nil
@@ -173,8 +174,15 @@ module RequestHandler
             stream_result = handle_upstream_error(response, log_prefix)
           end
         end
+      rescue Net::OpenTimeout, Net::ReadTimeout, Net::WriteTimeout, IOError, EOFError, Errno::ECONNRESET, Errno::ECONNREFUSED, SocketError
+        pooled = false
+        raise
       ensure
-        http.finish if http&.started?
+        if pooled
+          HTTPSupport.checkin_http(uri, http)
+        else
+          HTTPSupport.discard_http(http)
+        end
       end
       stream_result
     end
@@ -186,6 +194,7 @@ module RequestHandler
     try_with_retries(log_prefix: log_prefix, body_model: body_model) do
       http = HTTPSupport.create_http(uri, timeouts: ConfigStore.timeouts)
       http.start unless http.started?
+      pooled = true
       begin
         response = http.request(request)
 
@@ -195,8 +204,15 @@ module RequestHandler
         else
           handle_upstream_error(response, log_prefix)
         end
+      rescue Net::OpenTimeout, Net::ReadTimeout, Net::WriteTimeout, IOError, EOFError, Errno::ECONNRESET, Errno::ECONNREFUSED, SocketError
+        pooled = false
+        raise
       ensure
-        http.finish if http&.started?
+        if pooled
+          HTTPSupport.checkin_http(uri, http)
+        else
+          HTTPSupport.discard_http(http)
+        end
       end
     end
   end

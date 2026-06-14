@@ -8,12 +8,15 @@ module ConfigWatcher
   @lock = Mutex.new
   @last_hash = nil
   @expected_hash = nil
+  @last_mtime = nil
   @running = false
+  @reloading = false
   @logger = nil
 
   def self.start!(logger:, poll_interval: DEFAULT_POLL_INTERVAL)
     @logger = logger
     @last_hash = file_hash
+    @last_mtime = begin; File.mtime(ConfigStore.config_path); rescue Errno::ENOENT; nil; end
     @running = true
 
     Thread.new do
@@ -25,10 +28,15 @@ module ConfigWatcher
         @logger&.error("ConfigWatcher error: #{e.message}")
       end
     end
-
     begin
       Signal.trap("USR1") do
-        Thread.new { trigger_reload("SIGUSR1") }
+        next if @reloading
+        @reloading = true
+        Thread.new do
+          trigger_reload("SIGUSR1")
+        ensure
+          @reloading = false
+        end
       end
     rescue ArgumentError
       @logger.debug("SIGUSR1 not available on this platform")
@@ -56,6 +64,15 @@ module ConfigWatcher
   end
 
   def self.check_and_reload
+    path = ConfigStore.config_path
+    begin
+      current_mtime = File.mtime(path)
+    rescue Errno::ENOENT
+      return
+    end
+    return if @last_mtime && current_mtime == @last_mtime
+    @last_mtime = current_mtime
+
     current_hash = file_hash
     return if current_hash == @last_hash
 

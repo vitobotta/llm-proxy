@@ -1,9 +1,6 @@
 # LLM Proxy Configuration Example
 # Copy this file to config.yaml and add your API keys
 
-server:
-  bind: "0.0.0.0"
-
 # Retry settings
 retries:
   max_attempts: 2

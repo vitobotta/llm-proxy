@@ -2,17 +2,19 @@
 
 require_relative "test_helper"
 require_relative "../lib/probe_manager"
+require_relative "../lib/config_store"
+require_relative "../lib/metrics"
 
 class TestProbeManager < Minitest::Test
   class FakeSelector
-    attr_reader :metrics_calls, :evaluate_calls, :probe_finished_called
+    attr_reader :metrics_calls, :evaluate_calls, :probe_finished_called, :pauses
 
     def initialize(others)
       @others = others
       @metrics_calls = []
       @evaluate_calls = 0
-      @probe_finished_called = false
       @paused = {}
+      @pauses = []
       @mutex = Mutex.new
     end
 
@@ -38,6 +40,11 @@ class TestProbeManager < Minitest::Test
 
     def circuit_open?(_provider_name)
       false
+    end
+
+    def quota_pause!(name, time, reason: nil)
+      @pauses << {name: name, time: time, reason: reason}
+      @paused[name] = true
     end
   end
 
@@ -221,6 +228,118 @@ class TestProbeManager < Minitest::Test
         alias_method :probe_provider, :__orig_probe_provider2
         remove_method :__orig_probe_provider2
       end
+    end
+  end
+end
+
+class ProbeProviderTest < Minitest::Test
+  def setup
+    @captured_logs = []
+    @logger = Class.new(NullLogger) do
+      attr_reader :messages
+      def initialize(messages)
+        super()
+        @messages = messages
+      end
+      def info(m); @messages << [:info, m]; end
+      def error(m); @messages << [:error, m]; end
+      def warn(m); @messages << [:warn, m]; end
+      def debug(m); @messages << [:debug, m]; end
+    end.new(@captured_logs)
+    @provider_config = {"provider" => "test_prov", "model" => "m", "base_url" => "https://example.invalid/v1", "api_key" => "k"}
+    @selector = TestProbeManager::FakeSelector.new([@provider_config])
+    ConfigStore.instance_variable_set(:@data, {quota_pause_default_seconds: 60})
+  end
+
+  def test_probe_provider_success_with_usage_data
+    now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    stub_streaming(first_token_time: now + 0.1, first_content_time: now + 0.1, last_content_time: now + 0.5, last_any_token_time: now + 0.5, usage_data: {"completion_tokens" => 50, "prompt_tokens" => 10}) do
+      result = ProbeManager.probe_provider(@provider_config, "/chat/completions", {}, "m", {}, timeouts: {open: 1, read: 1, write: 1}, logger: @logger, selector: @selector)
+      assert result[:tps] && result[:tps] > 0, "tps should be positive, got #{result[:tps]}"
+      assert result[:ttft] < Float::INFINITY, "ttft should be finite"
+    end
+  end
+
+  def test_probe_provider_no_usage_data_returns_nil_tps
+    now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    stub_streaming(first_token_time: now + 0.1, usage_data: nil) do
+      result = ProbeManager.probe_provider(@provider_config, "/chat/completions", {}, "m", {}, timeouts: {open: 1, read: 1, write: 1}, logger: @logger, selector: @selector)
+      assert_nil result[:tps]
+      assert result[:ttft] < Float::INFINITY
+    end
+  end
+
+  def test_probe_provider_error_returns_infinite_ttft
+    stub_streaming(error: "HTTP 500: internal server error") do
+      result = ProbeManager.probe_provider(@provider_config, "/chat/completions", {}, "m", {}, timeouts: {open: 1, read: 1, write: 1}, logger: @logger, selector: @selector)
+      assert_equal Float::INFINITY, result[:ttft]
+      assert_nil result[:tps]
+    end
+  end
+
+  def test_probe_provider_quota_error_pauses_provider
+    stub_streaming(error: "HTTP 429: insufficient_quota") do
+      result = ProbeManager.probe_provider(@provider_config, "/chat/completions", {}, "m", {}, timeouts: {open: 1, read: 1, write: 1}, logger: @logger, selector: @selector)
+      assert_equal Float::INFINITY, result[:ttft]
+      assert_equal 1, @selector.pauses.size
+      assert_equal "rate_limited", @selector.pauses.first[:reason]
+    end
+  end
+
+  def test_probe_provider_402_payment_required
+    stub_streaming(error: "HTTP 402: payment required") do
+      result = ProbeManager.probe_provider(@provider_config, "/chat/completions", {}, "m", {}, timeouts: {open: 1, read: 1, write: 1}, logger: @logger, selector: @selector)
+      assert_equal Float::INFINITY, result[:ttft]
+      assert_equal 1, @selector.pauses.size
+      assert_equal "payment_required", @selector.pauses.first[:reason]
+    end
+  end
+
+  def test_probe_provider_connection_error_returns_infinite_ttft
+    http_mock = Object.new
+    http_mock.define_singleton_method(:started?) { false }
+    http_mock.define_singleton_method(:start) { raise Errno::ECONNREFUSED, "Connection refused" }
+
+    HTTPSupport.singleton_class.class_eval do
+      alias_method :__orig_create_http, :create_http
+      define_method(:create_http) { |*_a, **_k| http_mock }
+    end
+
+    result = ProbeManager.probe_provider(@provider_config, "/chat/completions", {}, "m", {}, timeouts: {open: 1, read: 1, write: 1}, logger: @logger, selector: @selector)
+    assert_equal Float::INFINITY, result[:ttft]
+    assert_nil result[:tps]
+  ensure
+    HTTPSupport.singleton_class.class_eval do
+      alias_method :create_http, :__orig_create_http
+      remove_method :__orig_create_http
+    end
+  end
+
+  private
+
+  def stub_streaming(stream_result, &block)
+    http_mock = Object.new
+    http_mock.define_singleton_method(:started?) { true }
+    http_mock.define_singleton_method(:start) {}
+
+    HTTPSupport.singleton_class.class_eval do
+      alias_method :__orig_create_http_probe, :create_http
+      define_method(:create_http) { |*_a, **_k| http_mock }
+    end
+    Streaming.singleton_class.class_eval do
+      alias_method :__orig_stream_response_probe, :stream_response
+      define_method(:stream_response) { |*_a, **_k| stream_result }
+    end
+
+    block.call
+  ensure
+    HTTPSupport.singleton_class.class_eval do
+      alias_method :create_http, :__orig_create_http_probe
+      remove_method :__orig_create_http_probe
+    end
+    Streaming.singleton_class.class_eval do
+      alias_method :stream_response, :__orig_stream_response_probe
+      remove_method :__orig_stream_response_probe
     end
   end
 end

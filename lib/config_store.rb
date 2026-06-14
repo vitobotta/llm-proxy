@@ -68,6 +68,7 @@ module ConfigStore
     warnings.each { |w| logger.warn("Config warning: #{w}") }
 
     load!(raw, logger: logger)
+    HTTPSupport.clear_uri_cache! if defined?(HTTPSupport)
     new_provider_keys = last_added_provider_keys
     unless new_provider_keys.empty?
       HTTPSupport.prewarm_connections!(raw, providers, logger, timeouts: timeouts)

@@ -1,7 +1,5 @@
-# frozen_string_literal: true
-
 require "securerandom"
-
+require "timeout"
 module ProbeManager
   PROBE_BODY = {
     "messages" => [{"role" => "user", "content" => "Write a brief paragraph about the weather"}],
@@ -57,8 +55,13 @@ module ProbeManager
         thread = Thread.new do
           Thread.current.report_on_exception = false
           begin
-            metrics = probe_provider(provider_config, path, PROBE_BODY, provider_config["model"], headers, timeouts: timeouts, logger: logger, selector: selector)
-            [p_name, metrics]
+            Timeout.timeout(deadline_seconds) do
+              metrics = probe_provider(provider_config, path, PROBE_BODY, provider_config["model"], headers, timeouts: timeouts, logger: logger, selector: selector)
+              [p_name, metrics]
+            end
+          rescue Timeout::Error
+            logger.warn("[probe:#{probe_id}] #{p_name} exceeded #{deadline_seconds}s deadline")
+            [p_name, {ttft: Float::INFINITY, tps: nil}]
           rescue => e
             logger.error("[probe:#{probe_id}] #{p_name} thread error: #{e.class}: #{e.message}")
             [p_name, {ttft: Float::INFINITY, tps: nil}]
@@ -67,15 +70,7 @@ module ProbeManager
         [p_name, thread]
       end
 
-      results = named_threads.map do |p_name, t|
-        if t.join(deadline_seconds).nil?
-          logger.warn("[probe:#{probe_id}] #{p_name} exceeded #{deadline_seconds}s deadline, killing thread")
-          t.kill
-          [p_name, {ttft: Float::INFINITY, tps: nil}]
-        else
-          t.value
-        end
-      end
+      results = named_threads.map { |p_name, t| t.value }
 
       results.each do |p_name, m|
         selector.update_metrics(p_name, m[:ttft], m[:tps])
@@ -96,9 +91,11 @@ module ProbeManager
     uri, request = HTTPSupport.build_upstream_request(provider_config, path, body, body_model, incoming_headers, stream: true)
 
     http = nil
+    pooled = false
     begin
       http = HTTPSupport.create_http(uri, timeouts: timeouts)
       http.start unless http.started?
+      pooled = true
 
       request_start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
       result = Streaming.stream_response(http, request, request_start)
@@ -160,13 +157,16 @@ module ProbeManager
 
       {ttft: ttft, tps: tps}
     rescue => e
+      pooled = false
       logger.debug("[probe] #{pname}: #{e.message}")
       {ttft: Float::INFINITY, tps: nil}
     ensure
-      begin
-        http.finish if http&.started?
-      rescue
-        nil
+      if http
+        if pooled
+          HTTPSupport.checkin_http(uri, http)
+        else
+          HTTPSupport.discard_http(http)
+        end
       end
     end
   end

@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require_relative "test_helper"
+require_relative "../lib/config_store"
 require_relative "../lib/state_persistence"
 require "tmpdir"
 require "json"
@@ -274,6 +275,282 @@ class TestStatePersistence < Minitest::Test
           alias_method :build_state, :__orig_build_state
           remove_method :__orig_build_state
         end
+      end
+    end
+  end
+
+  # --- restore! tests ---
+
+  def test_restore_calls_restore_state_on_matching_selectors
+    old_env = ENV["STATE_DIR"]
+    ENV["STATE_DIR"] = @tmpdir
+    begin
+      sel = selector
+      sel.update_metrics("prov_a", 1.5, 80.0)
+      sel.update_metrics("prov_a", 2.0, 90.0)
+      write_state_file({"test-model" => sel})
+
+      fresh = ProviderSelector.new("test-model", @providers, model_config: @model_config)
+      selectors_map = {"test-model" => fresh}
+      models_map = {"test-model" => @model_config}
+
+      ConfigStore.singleton_class.class_eval do
+        alias_method :__orig_sp_sel, :selectors rescue nil
+        alias_method :__orig_sp_mod, :models rescue nil
+        define_method(:selectors) { selectors_map }
+        define_method(:models) { models_map }
+      end
+
+      StatePersistence.restore!(logger: NullLogger.new)
+
+      assert_equal "prov_a", fresh.active_provider_name
+    ensure
+      ConfigStore.singleton_class.class_eval do
+        if method_defined?(:__orig_sp_sel) || private_method_defined?(:__orig_sp_sel)
+          alias_method :selectors, :__orig_sp_sel
+          remove_method :__orig_sp_sel
+        end
+        if method_defined?(:__orig_sp_mod) || private_method_defined?(:__orig_sp_mod)
+          alias_method :models, :__orig_sp_mod
+          remove_method :__orig_sp_mod
+        end
+      end
+      ENV["STATE_DIR"] = old_env
+    end
+  end
+
+  def test_restore_skips_unknown_models
+    old_env = ENV["STATE_DIR"]
+    ENV["STATE_DIR"] = @tmpdir
+    begin
+      sel = selector
+      write_state_file({"test-model" => sel, "unknown-model" => sel})
+
+      selectors_map = {"test-model" => sel}
+      models_map = {"test-model" => @model_config}
+
+      captured = []
+      dbg_logger = Class.new do
+        define_method(:info) { |_m| }
+        define_method(:warn) { |_m| }
+        define_method(:error) { |_m| }
+        define_method(:debug) { |m| captured << m }
+      end.new
+
+      ConfigStore.singleton_class.class_eval do
+        alias_method :__orig_sp_sel, :selectors rescue nil
+        alias_method :__orig_sp_mod, :models rescue nil
+        define_method(:selectors) { selectors_map }
+        define_method(:models) { models_map }
+      end
+
+      StatePersistence.restore!(logger: dbg_logger)
+
+      assert(captured.any? { |m| m.include?("unknown-model") }, "should log skip for unknown model")
+    ensure
+      ConfigStore.singleton_class.class_eval do
+        if method_defined?(:__orig_sp_sel) || private_method_defined?(:__orig_sp_sel)
+          alias_method :selectors, :__orig_sp_sel
+          remove_method :__orig_sp_sel
+        end
+        if method_defined?(:__orig_sp_mod) || private_method_defined?(:__orig_sp_mod)
+          alias_method :models, :__orig_sp_mod
+          remove_method :__orig_sp_mod
+        end
+      end
+      ENV["STATE_DIR"] = old_env
+    end
+  end
+
+  def test_restore_returns_early_when_no_state
+    old_env = ENV["STATE_DIR"]
+    ENV["STATE_DIR"] = @tmpdir
+    begin
+      ConfigStore.singleton_class.class_eval do
+        alias_method :__orig_sp_sel, :selectors rescue nil
+        alias_method :__orig_sp_mod, :models rescue nil
+        define_method(:selectors) { {} }
+        define_method(:models) { {} }
+      end
+
+      result = StatePersistence.restore!
+      assert_nil result
+    ensure
+      ConfigStore.singleton_class.class_eval do
+        if method_defined?(:__orig_sp_sel) || private_method_defined?(:__orig_sp_sel)
+          alias_method :selectors, :__orig_sp_sel
+          remove_method :__orig_sp_sel
+        end
+        if method_defined?(:__orig_sp_mod) || private_method_defined?(:__orig_sp_mod)
+          alias_method :models, :__orig_sp_mod
+          remove_method :__orig_sp_mod
+        end
+      end
+      ENV["STATE_DIR"] = old_env
+    end
+  end
+
+  def test_restore_calls_realign_active_index
+    old_env = ENV["STATE_DIR"]
+    ENV["STATE_DIR"] = @tmpdir
+    begin
+      sel = selector
+      write_state_file({"test-model" => sel})
+
+      realign_called = []
+      original_realign = sel.method(:realign_active_index!)
+      sel.define_singleton_method(:realign_active_index!) do |mc|
+        realign_called << mc
+        original_realign.call(mc)
+      end
+
+      selectors_map = {"test-model" => sel}
+      models_map = {"test-model" => @model_config}
+
+      ConfigStore.singleton_class.class_eval do
+        alias_method :__orig_sp_sel, :selectors rescue nil
+        alias_method :__orig_sp_mod, :models rescue nil
+        define_method(:selectors) { selectors_map }
+        define_method(:models) { models_map }
+      end
+
+      StatePersistence.restore!(logger: NullLogger.new)
+
+      assert_equal 1, realign_called.length
+      assert_equal @model_config, realign_called.first
+    ensure
+      ConfigStore.singleton_class.class_eval do
+        if method_defined?(:__orig_sp_sel) || private_method_defined?(:__orig_sp_sel)
+          alias_method :selectors, :__orig_sp_sel
+          remove_method :__orig_sp_sel
+        end
+        if method_defined?(:__orig_sp_mod) || private_method_defined?(:__orig_sp_mod)
+          alias_method :models, :__orig_sp_mod
+          remove_method :__orig_sp_mod
+        end
+      end
+      ENV["STATE_DIR"] = old_env
+    end
+  end
+
+  def test_restore_logs_warning_on_restore_failure
+    old_env = ENV["STATE_DIR"]
+    ENV["STATE_DIR"] = @tmpdir
+    begin
+      sel = selector
+      write_state_file({"test-model" => sel})
+
+      sel.define_singleton_method(:restore_state!) { |_state| raise RuntimeError, "boom" }
+
+      captured = []
+      warn_logger = Class.new do
+        define_method(:info) { |_m| }
+        define_method(:warn) { |m| captured << m }
+        define_method(:error) { |_m| }
+        define_method(:debug) { |_m| }
+      end.new
+
+      selectors_map = {"test-model" => sel}
+      models_map = {"test-model" => @model_config}
+
+      ConfigStore.singleton_class.class_eval do
+        alias_method :__orig_sp_sel, :selectors rescue nil
+        alias_method :__orig_sp_mod, :models rescue nil
+        define_method(:selectors) { selectors_map }
+        define_method(:models) { models_map }
+      end
+
+      StatePersistence.restore!(logger: warn_logger)
+
+      assert(captured.any? { |m| m.include?("boom") }, "should log restore failure")
+    ensure
+      ConfigStore.singleton_class.class_eval do
+        if method_defined?(:__orig_sp_sel) || private_method_defined?(:__orig_sp_sel)
+          alias_method :selectors, :__orig_sp_sel
+          remove_method :__orig_sp_sel
+        end
+        if method_defined?(:__orig_sp_mod) || private_method_defined?(:__orig_sp_mod)
+          alias_method :models, :__orig_sp_mod
+          remove_method :__orig_sp_mod
+        end
+      end
+      ENV["STATE_DIR"] = old_env
+    end
+  end
+
+  # --- build_state tests ---
+
+  def test_build_state_returns_version_and_models
+    sel = selector
+    selectors_map = {"test-model" => sel}
+
+    ConfigStore.singleton_class.class_eval do
+      alias_method :__orig_sp_sel, :selectors rescue nil
+      define_method(:selectors) { selectors_map }
+    end
+
+    state = StatePersistence.build_state
+
+    assert_equal StatePersistence::STATE_VERSION, state[:version]
+    assert_kind_of Float, state[:saved_at]
+    assert_equal({"test-model" => sel.to_state}, state[:models])
+  ensure
+    ConfigStore.singleton_class.class_eval do
+      if method_defined?(:__orig_sp_sel) || private_method_defined?(:__orig_sp_sel)
+        alias_method :selectors, :__orig_sp_sel
+        remove_method :__orig_sp_sel
+      end
+    end
+  end
+
+  def test_build_state_aggregates_multiple_selectors
+    sel_a = selector
+    providers_b = [
+      {"provider" => "prov_x", "model" => "m-x", "base_url" => "https://x.example.com/v1", "api_key" => "kx"}.freeze,
+      {"provider" => "prov_y", "model" => "m-y", "base_url" => "https://y.example.com/v1", "api_key" => "ky"}.freeze
+    ].freeze
+    model_config_b = {"name" => "model-b", "providers" => [
+      {"provider" => "prov_x", "model" => "m-x", "primary" => true},
+      {"provider" => "prov_y", "model" => "m-y"}
+    ]}
+    sel_b = ProviderSelector.new("model-b", providers_b, model_config: model_config_b)
+
+    selectors_map = {"test-model" => sel_a, "model-b" => sel_b}
+
+    ConfigStore.singleton_class.class_eval do
+      alias_method :__orig_sp_sel, :selectors rescue nil
+      define_method(:selectors) { selectors_map }
+    end
+
+    state = StatePersistence.build_state
+
+    assert_equal 2, state[:models].size
+    assert_equal sel_a.to_state, state[:models]["test-model"]
+    assert_equal sel_b.to_state, state[:models]["model-b"]
+  ensure
+    ConfigStore.singleton_class.class_eval do
+      if method_defined?(:__orig_sp_sel) || private_method_defined?(:__orig_sp_sel)
+        alias_method :selectors, :__orig_sp_sel
+        remove_method :__orig_sp_sel
+      end
+    end
+  end
+
+  def test_build_state_with_empty_selectors
+    ConfigStore.singleton_class.class_eval do
+      alias_method :__orig_sp_sel, :selectors rescue nil
+      define_method(:selectors) { {} }
+    end
+
+    state = StatePersistence.build_state
+
+    assert_equal({}, state[:models])
+    assert_equal StatePersistence::STATE_VERSION, state[:version]
+  ensure
+    ConfigStore.singleton_class.class_eval do
+      if method_defined?(:__orig_sp_sel) || private_method_defined?(:__orig_sp_sel)
+        alias_method :selectors, :__orig_sp_sel
+        remove_method :__orig_sp_sel
       end
     end
   end

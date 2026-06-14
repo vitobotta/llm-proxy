@@ -10,5 +10,5 @@ services:
       - ./data:/app/data
     restart: unless-stopped
     environment:
-      - RUBY_ENV=production
+      - RACK_ENV=production
       - CONFIG_FILE=/app/config/config.yaml

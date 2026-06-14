@@ -24,17 +24,18 @@ module StatePersistence
     tmp = nil
     WRITE_LOCK.synchronize do
       state = build_state
-      tmp = "#{state_file}.tmp.#{Process.pid}"
-      File.write(tmp, JSON.generate(state))
+      tmp = state_file + ".tmp.#{Process.pid}"
+      File.open(tmp, File::WRONLY | File::CREAT | File::TRUNC) do |f|
+        f.write(JSON.pretty_generate(state))
+        f.fsync
+      end
       File.rename(tmp, state_file)
-      tmp = nil
-      logger&.debug("[StatePersistence] Saved state to #{state_file}")
     end
   rescue => e
     logger&.error("[StatePersistence] Failed to save state: #{e.class}: #{e.message}")
     begin
       File.delete(tmp) if tmp && File.exist?(tmp)
-    rescue
+    rescue Errno::ENOENT
       nil
     end
   end

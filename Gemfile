@@ -6,6 +6,7 @@ gem "rackup", "~> 2.0"
 
 group :test do
   gem "minitest", "~> 6.0"
+  gem "simplecov", "~> 0.22"
 end
 
 group :development, :test do

@@ -7,6 +7,11 @@ module Routes
     def self.registered(app)
       app.get "/health" do
         content_type :json
+        {status: "ok"}.to_json
+      end
+
+      app.get "/v1/health/detail" do
+        content_type :json
         provider_status = {}
         ConfigStore.selectors.each do |name, selector|
           metrics = selector.active_metrics

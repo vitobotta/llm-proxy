@@ -34,7 +34,12 @@ class ProviderSelector
       model_entry["providers"][provider_index]["primary"] = true
 
       ConfigWatcher.expecting_write! if defined?(ConfigWatcher)
-      File.write(config_path, YAML.dump(raw))
+      tmp = "#{config_path}.tmp.#{Process.pid}"
+      File.open(tmp, File::WRONLY | File::CREAT | File::TRUNC) do |f|
+        f.write(YAML.dump(raw))
+        f.fsync
+      end
+      File.rename(tmp, config_path)
     end
   rescue => e
     msg = "[#{model_name}] Failed to persist active provider: #{e.class}: #{e.message}"
@@ -122,40 +127,42 @@ class ProviderSelector
   end
 
   def evaluate_and_select(logger, auto_switch: true)
-    scored = @lock.synchronize do
-      @providers.each_with_index.map do |p, i|
+    best_index = nil
+    best_avg = nil
+    active_avg = nil
+    old_name = nil
+
+    @lock.synchronize do
+      scored = @providers.each_with_index.map do |p, i|
         next nil if check_quota_paused(p["provider"])
         avg = average_metrics(p["provider"])
         next nil unless avg && avg[:sample_count] >= MIN_SAMPLES
         [i, avg]
       end.compact
-    end
 
-    return if scored.empty?
+      return if scored.empty?
 
-    best_index, best_avg = scored.max_by { |_, avg| score_from_avg(avg) }
+      best_index, best_avg = scored.max_by { |_, avg| score_from_avg(avg) }
+      active_avg = average_metrics(@providers[@active_index]["provider"])
 
-    active_avg = @lock.synchronize { average_metrics(@providers[@active_index]["provider"]) }
+      if best_index != @active_index
+        if active_avg && active_avg[:sample_count] >= MIN_SAMPLES
+          active_score = score_from_avg(active_avg)
+          best_score = score_from_avg(best_avg)
+          return unless best_score > active_score * (1.0 + HYSTERESIS)
+        end
 
-    if best_index != @active_index
-      if active_avg && active_avg[:sample_count] >= MIN_SAMPLES
-        active_score = score_from_avg(active_avg)
-        best_score = score_from_avg(best_avg)
-        return unless best_score > active_score * (1.0 + HYSTERESIS)
-      end
+        old_name = @providers[@active_index]["provider"]
+        new_name = @providers[best_index]["provider"]
 
-      old_name = @lock.synchronize { @providers[@active_index]["provider"] }
-      new_name = @providers[best_index]["provider"]
-
-      if auto_switch
-        @lock.synchronize do
+        if auto_switch
           @active_index = best_index
           @cached_ordered = nil
           logger.info("[#{@model_name}] Switched to #{new_name} (avg_ttft=#{best_avg[:avg_ttft].round(3)}s, avg_tps=#{best_avg[:avg_tps].round(1)}, n=#{best_avg[:sample_count]}) from #{old_name} (avg_ttft=#{active_avg&.dig(:avg_ttft)&.round(3)}s, avg_tps=#{active_avg&.dig(:avg_tps)&.round(1)}, n=#{active_avg&.dig(:sample_count)})")
+          StatePersistence.save(logger: logger) if defined?(StatePersistence)
+        else
+          logger.info("[#{@model_name}] Suggest switch to #{new_name} (avg_ttft=#{best_avg[:avg_ttft].round(3)}s, avg_tps=#{best_avg[:avg_tps].round(1)}, n=#{best_avg[:sample_count]}) from #{old_name} (avg_ttft=#{active_avg&.dig(:avg_ttft)&.round(3)}s, avg_tps=#{active_avg&.dig(:avg_tps)&.round(1)}, n=#{active_avg&.dig(:sample_count)})")
         end
-        StatePersistence.save(logger: logger) if defined?(StatePersistence)
-      else
-        logger.info("[#{@model_name}] Suggest switch to #{new_name} (avg_ttft=#{best_avg[:avg_ttft].round(3)}s, avg_tps=#{best_avg[:avg_tps].round(1)}, n=#{best_avg[:sample_count]}) from #{old_name} (avg_ttft=#{active_avg&.dig(:avg_ttft)&.round(3)}s, avg_tps=#{active_avg&.dig(:avg_tps)&.round(1)}, n=#{active_avg&.dig(:sample_count)})")
       end
     end
   end
@@ -314,7 +321,7 @@ class ProviderSelector
           circuit = @circuits[p_name]
           circuit.failures = begin
             Integer(c["failures"])
-          rescue
+          rescue ArgumentError, TypeError
             0
           end
           opened_at = c["opened_at"]
@@ -330,7 +337,7 @@ class ProviderSelector
       if state["request_count"]
         @request_count = begin
           Integer(state["request_count"])
-        rescue
+        rescue ArgumentError, TypeError
           0
         end
       end

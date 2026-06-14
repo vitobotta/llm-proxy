@@ -234,4 +234,153 @@ class TestProviderSelector < Minitest::Test
     samples = selector.instance_variable_get(:@samples)["prov_a"]
     assert_equal 100, samples.length
   end
+
+  # --- circuit breaker cooldown tests ---
+
+  def test_circuit_auto_closes_after_cooldown
+    s = ProviderSelector.new("test-model", @providers, model_config: @model_config,
+      circuit_failure_threshold: 2, circuit_cooldown: 0.2)
+
+    # Record failures to open circuit
+    s.record_failure("prov_a")
+    s.record_failure("prov_a")
+
+    circuits = s.instance_variable_get(:@circuits)
+    refute_nil circuits["prov_a"].opened_at, "circuit should be open after threshold failures"
+
+    # Before cooldown expires, circuit_open? should return true
+    assert s.send(:circuit_open?, "prov_a"), "circuit should be open before cooldown"
+
+    # Wait for cooldown
+    sleep 0.3
+
+    # After cooldown, circuit should auto-close
+    refute s.send(:circuit_open?, "prov_a"), "circuit should auto-close after cooldown"
+    assert_equal 0, circuits["prov_a"].failures, "failures should reset after cooldown"
+    assert_nil circuits["prov_a"].opened_at, "opened_at should be nil after cooldown"
+  end
+
+  def test_circuit_stays_open_before_cooldown
+    s = ProviderSelector.new("test-model", @providers, model_config: @model_config,
+      circuit_failure_threshold: 2, circuit_cooldown: 60)
+
+    s.record_failure("prov_a")
+    s.record_failure("prov_a")
+
+    assert s.send(:circuit_open?, "prov_a"), "circuit should be open"
+    circuits = s.instance_variable_get(:@circuits)
+    refute_nil circuits["prov_a"].opened_at
+  end
+
+  def test_circuit_open_returns_false_when_not_opened
+    refute selector.send(:circuit_open?, "prov_a"), "circuit should not be open initially"
+  end
+
+  def test_record_failure_opens_circuit_at_threshold
+    s = ProviderSelector.new("test-model", @providers, model_config: @model_config,
+      circuit_failure_threshold: 3, circuit_cooldown: 60)
+
+    s.record_failure("prov_a")
+    s.record_failure("prov_a")
+    refute s.send(:circuit_open?, "prov_a"), "should not be open below threshold"
+
+    s.record_failure("prov_a")
+    assert s.send(:circuit_open?, "prov_a"), "should open at threshold"
+  end
+
+  def test_circuit_cooldown_resets_opened_at_to_nil
+    s = ProviderSelector.new("test-model", @providers, model_config: @model_config,
+      circuit_failure_threshold: 1, circuit_cooldown: 0.1)
+
+    s.record_failure("prov_a")
+    assert s.send(:circuit_open?, "prov_a")
+
+    sleep 0.2
+
+    # check_circuit_open should reset the state
+    result = s.send(:check_circuit_open, "prov_a")
+    refute result
+    circuits = s.instance_variable_get(:@circuits)
+    assert_nil circuits["prov_a"].opened_at
+    assert_equal 0, circuits["prov_a"].failures
+  end
+
+  # --- quota pause expiry tests ---
+
+  def test_quota_pause_expires_after_duration
+    s = ProviderSelector.new("test-model", @providers, model_config: @model_config)
+    now = Time.now.to_f
+
+    # Set a quota pause that expires soon
+    s.quota_pause!("prov_a", now + 0.2, reason: "rate limited")
+
+    assert s.quota_paused?("prov_a"), "should be paused initially"
+
+    sleep 0.3
+
+    refute s.quota_paused?("prov_a"), "should not be paused after expiry"
+  end
+
+  def test_quota_pause_still_active_before_expiry
+    s = ProviderSelector.new("test-model", @providers, model_config: @model_config)
+    now = Time.now.to_f
+
+    s.quota_pause!("prov_a", now + 60, reason: "quota exceeded")
+
+    assert s.quota_paused?("prov_a"), "should be paused before expiry"
+    pauses = s.instance_variable_get(:@quota_pauses)
+    refute_nil pauses["prov_a"].paused_until
+    assert_equal "quota exceeded", pauses["prov_a"].reason
+  end
+
+  def test_check_quota_paused_returns_false_when_not_paused
+    refute selector.send(:check_quota_paused, "prov_a"), "should not be paused initially"
+  end
+
+  def test_check_quota_paused_clears_expired_pause
+    s = ProviderSelector.new("test-model", @providers, model_config: @model_config)
+    now = Time.now.to_f
+    s.quota_pause!("prov_a", now + 0.1, reason: "test")
+
+    sleep 0.2
+
+    result = s.send(:check_quota_paused, "prov_a")
+    refute result, "should return false after expiry"
+    pauses = s.instance_variable_get(:@quota_pauses)
+    assert_nil pauses["prov_a"].paused_until, "paused_until should be cleared"
+    assert_nil pauses["prov_a"].reason, "reason should be cleared"
+  end
+
+  def test_quota_pause_does_not_expire_when_future
+    s = ProviderSelector.new("test-model", @providers, model_config: @model_config)
+    now = Time.now.to_f
+    s.quota_pause!("prov_b", now + 3600, reason: "long pause")
+
+    result = s.send(:check_quota_paused, "prov_b")
+    assert result, "should still be paused"
+  end
+
+  def test_ordered_providers_excludes_circuit_open
+    s = ProviderSelector.new("test-model", @providers, model_config: @model_config,
+      circuit_failure_threshold: 1, circuit_cooldown: 60)
+
+    # Open circuit for active provider (prov_a)
+    s.record_failure("prov_a")
+
+    ordered = s.ordered_providers
+    refute ordered.any? { |p| p["provider"] == "prov_a" }, "circuit-open provider should be excluded"
+    assert_equal "prov_b", ordered.first["provider"]
+  end
+
+  def test_ordered_providers_excludes_quota_paused
+    s = ProviderSelector.new("test-model", @providers, model_config: @model_config)
+    now = Time.now.to_f
+
+    # Pause the active provider
+    s.quota_pause!("prov_a", now + 60, reason: "exhausted")
+
+    ordered = s.ordered_providers
+    refute ordered.any? { |p| p["provider"] == "prov_a" }, "quota-paused provider should be excluded"
+    assert_equal "prov_b", ordered.first["provider"]
+  end
 end

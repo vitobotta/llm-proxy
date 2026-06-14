@@ -26,7 +26,7 @@ module HTTPSupport
   QUOTA_BODY_PATTERNS = [
     /insufficient_quota/i,
     /billing\s*(limit|exceeded|issue)/i,
-    /credit/i,
+    /credit\s*(balance|limit|exhausted|insufficient)/i,
     /payment/i,
     /plan\s*(limit|exceeded)/i,
     /usage\s*limit/i,
@@ -57,6 +57,11 @@ module HTTPSupport
   URI_CACHE = {}
   URI_CACHE_LOCK = Mutex.new
   MAX_URI_CACHE_SIZE = 1024
+
+  POOL_MAX_AGE = 300
+  POOL_MAX_IDLE = 60
+  CONNECTION_POOL = {}
+  POOL_LOCK = Mutex.new
 
   AUTH_STRATEGIES = {
     "anthropic" => ->(req, key) { req["x-api-key"] = key }
@@ -120,59 +125,20 @@ module HTTPSupport
       begin
         t = Float(val)
         return t if t > Time.now.to_f
-      rescue
+      rescue ArgumentError
         nil
-      end
+    end
     end
 
-    parsed = nil
-    begin
-      parsed = JSON.parse(body.to_s)
-    rescue JSON::ParserError
-      nil
-    end
-
-    if parsed.is_a?(Hash)
-      reset_fields = %w[reset reset_time reset_at]
-      ms_fields = %w[retry_after_ms]
-
-      reset_fields.each do |key|
-        if parsed.key?(key)
-          v = parsed[key]
-          return v.to_f if v.respond_to?(:to_f) && v.to_f > Time.now.to_f
-        end
-      end
-
-      ms_fields.each do |key|
-        if parsed.key?(key)
-          v = parsed[key]
-          return Time.now.to_f + v.to_f / 1000.0 if v.respond_to?(:to_f)
-        end
-      end
-
-      err = parsed["error"]
-      if err.is_a?(Hash)
-        reset_fields.each do |key|
-          if err.key?(key)
-            v = err[key]
-            return v.to_f if v.respond_to?(:to_f) && v.to_f > Time.now.to_f
-          end
-        end
-
-        ms_fields.each do |key|
-          if err.key?(key)
-            v = err[key]
-            return Time.now.to_f + v.to_f / 1000.0 if v.respond_to?(:to_f)
-          end
-        end
-      end
-    end
-
-    Time.now.to_f + default_seconds
+    extract_reset_time_from_body(body, default_seconds: default_seconds)
   end
 
   def self.extract_reset_time_from_error(error_str, status, default_seconds:)
     body = error_str.sub(/\AHTTP \d{3}:\s*/, "")
+    extract_reset_time_from_body(body, default_seconds: default_seconds)
+  end
+
+  def self.extract_reset_time_from_body(body, default_seconds:)
     parsed = nil
     begin
       parsed = JSON.parse(body.to_s)
@@ -218,7 +184,6 @@ module HTTPSupport
 
     Time.now.to_f + default_seconds
   end
-
   def self.cached_uri(base, path)
     key = "#{base}/#{path}"
     URI_CACHE_LOCK.synchronize do
@@ -228,6 +193,10 @@ module HTTPSupport
       b = base.end_with?("/") ? base : base + "/"
       URI_CACHE[key] = URI.join(b, path)
     end
+  end
+
+  def self.clear_uri_cache!
+    URI_CACHE_LOCK.synchronize { URI_CACHE.clear }
   end
 
   def self.build_upstream_request(provider_config, path, body, body_model, incoming_headers, stream: true)
@@ -260,6 +229,12 @@ module HTTPSupport
   end
 
   def self.create_http(uri, timeouts:)
+    http = checkout_http(uri)
+    return http if http
+    fresh_http(uri, timeouts: timeouts)
+  end
+
+  def self.fresh_http(uri, timeouts:)
     http = Net::HTTP.new(uri.host, uri.port)
     http.use_ssl = uri.scheme == "https"
     http.open_timeout = timeouts[:open]
@@ -269,9 +244,62 @@ module HTTPSupport
     http
   end
 
-  # (cleanup_thread_connections! removed with connection pool)
-  # (cleanup_all_connections! removed with connection pool)
-  # (flush_stale_connections removed with connection pool)
+  def self.checkout_http(uri)
+    key = "#{uri.host}:#{uri.port}"
+    POOL_LOCK.synchronize do
+      entries = CONNECTION_POOL[key]
+      return nil unless entries
+      now = Time.now.to_f
+      while (entry = entries.pop)
+        next if now - entry[:created] > POOL_MAX_AGE
+        next if now - entry[:last_used] > POOL_MAX_IDLE
+        if entry[:http].started?
+          entry[:http].instance_variable_set(:@last_used_at, now)
+          return entry[:http]
+        end
+      end
+      nil
+    end
+  end
+
+  def self.checkin_http(uri, http)
+    return unless http
+    key = "#{uri.host}:#{uri.port}"
+    now = Time.now.to_f
+    POOL_LOCK.synchronize do
+      entries = (CONNECTION_POOL[key] ||= [])
+      # Evict stale entries
+      entries.reject! { |e| now - e[:created] > POOL_MAX_AGE || now - e[:last_used] > POOL_MAX_IDLE }
+      entries << {http: http, created: now, last_used: now}
+    end
+  rescue
+    # If checkin fails, just let http get GC'd
+    nil
+  end
+
+  def self.discard_http(http)
+    return unless http
+    begin
+      http.finish if http.started?
+    rescue
+      nil
+    end
+  end
+
+  def self.flush_pool!
+    POOL_LOCK.synchronize do
+      CONNECTION_POOL.each do |_, entries|
+        entries.each do |entry|
+          begin
+            entry[:http].finish if entry[:http].started?
+          rescue
+            nil
+          end
+        end
+      end
+      CONNECTION_POOL.clear
+    end
+  end
 
   def self.prewarm_connections!(config, providers, logger, timeouts:)
     return unless config.dig("performance", "prewarm_connections") != false
@@ -280,9 +308,9 @@ module HTTPSupport
       logger.info("Pre-warming HTTP connections to providers...")
       providers.values.map { |p| p["base_url"] }.uniq.each do |base_url|
         uri = URI.parse(base_url)
-        http = create_http(uri, timeouts: timeouts)
-        http.start unless http.started?
-        http.finish
+        http = fresh_http(uri, timeouts: timeouts)
+        http.start
+        checkin_http(uri, http)
         logger.info("  \u2713 #{base_url}")
       rescue => e
         logger.warn("  \u2717 #{base_url} (#{e.class}: #{e.message})")
@@ -291,19 +319,33 @@ module HTTPSupport
   end
 
   def self.setup_graceful_shutdown!(logger, selectors)
+    @shutting_down = false
+
     %w[INT TERM].each do |sig|
       Signal.trap(sig) do
+        next if @shutting_down
+        @shutting_down = true
         logger.info("\nShutting down gracefully...")
         Thread.new do
-          selectors.each { |_, s| s.persist_active_index(logger: logger) }
-          StatePersistence.save(logger: logger) if defined?(StatePersistence)
+          begin
+            flush_pool!
+            selectors.each { |_, s| s.persist_active_index(logger: logger) }
+            StatePersistence.save(logger: logger) if defined?(StatePersistence)
+          rescue => e
+            logger.error("Shutdown error: #{e.class}: #{e.message}")
+          end
           exit(0)
         end
       end
     end
 
     at_exit do
-      StatePersistence.save(logger: logger) if defined?(StatePersistence) && !$ERROR_INFO.is_a?(SystemExit)
+      begin
+        flush_pool!
+        StatePersistence.save(logger: logger) if defined?(StatePersistence) && !$ERROR_INFO.is_a?(SystemExit)
+      rescue => e
+        logger&.error("at_exit save error: #{e.class}: #{e.message}")
+      end
     end
   end
 
@@ -361,7 +403,6 @@ module HTTPSupport
     end
   end
 
-  # (flush_stale_connections removed with connection pool)
 
   def handle_upstream_error(response, log_prefix)
     code = response.code.to_i
