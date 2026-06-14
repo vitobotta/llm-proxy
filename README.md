@@ -60,7 +60,8 @@ Every incoming request follows this path:
 
 ### Performance
 
-- **Boot-time pre-warm** — background connections opened to all providers at startup, so the first real request skips the TCP/TLS handshake
+- **HTTP connection pool** — connections are pooled per (host, port) with 300s max-age and 60s max-idle eviction, eliminating TLS handshake overhead on subsequent requests
+- **Boot-time pre-warm** — background connections opened to all providers at startup and added to the pool, so the first real request skips the TCP/TLS handshake
 - **Lock-free config reads** — config snapshot is swapped atomically; request-path accessors take no mutex
 - **Zero-overhead passthrough** — set `tracking.enabled: false` to skip all chunk parsing; raw bytes pass straight through with negligible CPU cost
 - **Bounded probe cost** — `performance.probe_max_per_minute` caps probe launches across all models with a sliding 60-second window
@@ -70,13 +71,13 @@ Every incoming request follows this path:
 - **Per-request streaming stats** — TTFT, content/thinking token counts, and tokens-per-second logged for every streaming response
 - **Prometheus `/metrics`** — request counts/durations, per-provider success/failure counters with a `reason` label, and a per-provider `upstream_ttft_seconds` histogram
 - **Structured JSON logs** — set `logging.format: json` to emit one JSON record per log line with `request_id` threaded through helper calls
-- **Per-provider freshness in `/health`** — `last_success_at`, `last_success_age_seconds`, `quota_paused`, `quota_pause_until`, and `quota_pause_reason` reveal stale or paused providers at a glance
+- **Per-provider detail endpoint** — `GET /v1/health/detail` returns per-model provider stats including active provider, TTFT/TPS metrics, quota pause state, and circuit breaker status
 
 ### Operations
 
 - **Config hot-reload** — edit `config.yaml` and the proxy picks up changes within seconds (polls every 2s); or send `kill -USR1 <pid>` for an instant reload
 - **Docker with live config** — mount `config/` from the host; edits apply without rebuild or restart
-- **Health check** — `GET /health` returns model list and timestamp for load balancers and monitors
+- **Health check** — `GET /health` returns `{\"status\": \"ok\"}` for load balancers and monitors; `GET /v1/health/detail` returns full provider stats
 - **Optional incoming auth** — set `auth.token` in config to require `Authorization: Bearer <token>` on all requests
 
 ## Use Cases
@@ -231,7 +232,7 @@ auth:
   metrics_token: "scrape-only-token"   # Optional separate token gating only /metrics
 ```
 
-`/health` is always public so load balancers can probe it. `/metrics` is public by default; set `auth.metrics_token` to require a separate bearer token for Prometheus scraping. Token comparison is constant-time.
+`/health` is always public so load balancers can probe it. `/v1/health/detail` requires authentication and returns detailed per-provider stats. `/metrics` is public by default; set `auth.metrics_token` to require a separate bearer token for Prometheus scraping. Token comparison is constant-time.
 
 ## Environment Variables
 
@@ -256,7 +257,8 @@ For high-concurrency I/O-bound workloads, raise `PUMA_MAX_THREADS` to `16–32` 
 | `/v1/embeddings` | POST | Embeddings (non-streaming) |
 | `/v1/models` | GET | List configured models |
 | `/v1/models/:name` | GET | Model details with provider routing |
-| `/health` | GET | Health check with models list and timestamp |
+| `/health` | GET | Health check — returns `{\"status\":\"ok\"}` |
+| `/v1/health/detail` | GET | Detailed provider stats (requires auth) |
 | `/metrics` | GET | Prometheus-compatible metrics |
 
 ## Usage
