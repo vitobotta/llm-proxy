@@ -31,3 +31,4 @@ data/provider_state.json
 # OS
 .DS_Store
 .opencode
+.lcm
