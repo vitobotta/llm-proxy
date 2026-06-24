@@ -50,8 +50,8 @@ class TestStatePersistence < Minitest::Test
     state = selector.to_state
     circuit = state[:circuits]["prov_b"]
     refute_nil circuit
-    assert_equal 3, circuit[:failures]
-    refute_nil circuit[:opened_at]
+    assert_equal 3, circuit["failures"]
+    refute_nil circuit["opened_at"]
   end
 
   def test_restore_state_restores_active_provider

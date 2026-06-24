@@ -109,8 +109,9 @@ module ProbeManager
 
         if status_code && HTTPSupport.quota_exhausted?(status_code, error_body)
           reason = status_code == 402 ? "payment_required" : (status_code == 429 ? "rate_limited" : "quota_exhausted")
+          default_secs = (defined?(ConfigStore) ? ConfigStore.quota_pause_default_seconds : nil) || HTTPSupport::DEFAULT_QUOTA_PAUSE_SECONDS
           reset_time = HTTPSupport.extract_reset_time_from_error(error_str, status_code,
-            default_seconds: (defined?(ConfigStore) ? ConfigStore.quota_pause_default_seconds : HTTPSupport::DEFAULT_QUOTA_PAUSE_SECONDS))
+            default_seconds: default_secs)
           logger.warn("[probe] #{pname}: Quota exhausted (#{reason}), pausing until #{Time.at(reset_time).utc.iso8601}")
           if selector
             selector.quota_pause!(pname, reset_time, reason: reason)

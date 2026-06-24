@@ -418,8 +418,9 @@ module HTTPSupport
                else
                  "quota_exhausted"
                end
+      default_secs = (defined?(ConfigStore) ? ConfigStore.quota_pause_default_seconds : nil) || HTTPSupport::DEFAULT_QUOTA_PAUSE_SECONDS
       reset_time = HTTPSupport.extract_reset_time(response, error_body, code,
-        default_seconds: (defined?(ConfigStore) ? ConfigStore.quota_pause_default_seconds : HTTPSupport::DEFAULT_QUOTA_PAUSE_SECONDS))
+        default_seconds: default_secs)
       settings.logger.warn("#{log_prefix} Quota paused (#{reason}), resume at #{Time.at(reset_time).utc.iso8601}")
       raise QuotaExhaustedError.new(reset_time: reset_time, status: code, reason: reason)
     end
