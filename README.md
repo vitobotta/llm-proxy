@@ -21,7 +21,7 @@ Every incoming request follows this path:
 3. **Stream** — the request is forwarded to the chosen provider; the response streams back to the client in real time (SSE)
 4. **Measure** — TTFT, token counts, and tokens-per-second are recorded per-request
 5. **Auto-switch** — a background probe periodically compares providers on real TTFT/TPS data; if a non-primary provider consistently outperforms the active one, the proxy switches and persists the change to your config
-6. **Fallback** — if the chosen provider fails, the proxy tries the next provider (in config order when auto_switch is off, or by score when on), with retry and backoff
+6. **Fallback** — if the chosen provider fails, the proxy retries it up to `max_attempts` times, then falls through to the next provider. After all providers in a round fail, the proxy starts a new round (up to `max_rounds`) with a backoff delay between rounds, re-walking the provider list. Circuit-broken and quota-paused providers are excluded from subsequent rounds.
 
 ```
 ┌──────────────┐
@@ -53,10 +53,10 @@ Every incoming request follows this path:
 
 ### Resilience
 
-- **Exponential backoff** retry — configurable max attempts with `2^n` second delays
+- **Exponential backoff** retry — configurable max attempts with `2^n` second delays, plus circular fallback rounds (`max_rounds`) that re-walk the provider list with inter-round backoff until success or circuit breakers open
 - **Stale-connection recovery** — `EOFError` from idle connections gets 2 free retries that don't count against your attempt limit
 - **Quota-aware fallback** — 429/402/403 quota responses immediately fall through to the next provider instead of retrying the same one; the paused provider is skipped until its reset time expires
-- **Request deadline** — 600s overall limit across all provider fallback attempts, so a cascade of slow providers can't hang your request forever
+- **Request deadline** — 600s overall limit across all fallback rounds, so a cascade of slow providers can't hang your request forever
 
 ### Performance
 
@@ -179,16 +179,21 @@ timeouts:
 
 ```yaml
 retries:
-  max_attempts: 3
-  backoff_base: 2      # seconds (2, 4, 8, ...)
+  max_attempts: 3        # retries on the same provider before falling through (per round)
+  max_rounds: 3         # circular fallback rounds: A→B→A→B until success or circuits open
+  backoff_base: 2       # seconds (2, 4, 8, ... — used for both per-attempt and inter-round backoff)
 ```
 
 Retry behaviour:
-1. Attempt primary provider up to `max_attempts` with backoff.
-2. On exhaustion, fall through to next provider (ordered by config when auto_switch is off, or by score when on) and retry there.
-3. EOF on stale connection gets 2 fast retries that do **not** count against attempts; then counts as a normal failure.
-4. Timeouts count as failures and trigger retry/backoff.
-5. 429, 402, and 403 (with quota body patterns) immediately pause the provider and fall through to the next one — no retry on the same provider. The provider is skipped until its stated reset time expires.
+1. Within each round, attempt each provider up to `max_attempts` with exponential backoff.
+2. Fall through to the next provider (config order when auto_switch is off, by score when on) and retry there.
+3. After every provider in a round fails, start the next round — re-walking the provider list — with an inter-round backoff delay. This gives transient outages time to recover: `A×3 → B×3` ⟶ delay ⟶ `A×3 → B×3` ⟶ delay ⟶ `A×3 → B×3`.
+4. Repeat up to `max_rounds` times. With a single provider, this becomes repeated retry groups with a delay between them.
+5. The circuit breaker (3 consecutive failures, 60s cooldown) and quota pauses are re-evaluated each round. A provider that opens its circuit or hits quota is excluded from subsequent rounds, so the loop naturally narrows to providers that are still healthy.
+6. EOF on stale connection gets 2 fast retries that do **not** count against attempts; then counts as a normal failure.
+7. Timeouts count as failures and trigger retry/backoff.
+8. 429, 402, and 403 (with quota body patterns) immediately pause the provider and fall through to the next one — no retry on the same provider. The provider is skipped until its stated reset time expires.
+9. 600s overall request deadline across all rounds.
 
 ### Logging
 

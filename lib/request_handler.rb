@@ -9,51 +9,82 @@ module RequestHandler
     auto_switch = model_entry&.dig("auto_switch") == true
     probe_interval = model_entry&.dig("probe_interval") || ConfigStore.probe_interval
 
-    providers = selector.ordered_providers(auto_switch: auto_switch)
-
     deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + REQUEST_DEADLINE
+    max_rounds = settings.max_rounds || 3
 
     result = nil
     attempts = []
     deadline_hit = false
 
-    providers.each_with_index do |provider_config, i|
+    max_rounds.times do |round|
+      # Re-evaluate the provider list each round. record_failure and
+      # quota_pause! invalidate @cached_ordered, so providers that opened
+      # their circuit or hit quota in a prior round are excluded here.
+      providers = selector.ordered_providers(auto_switch: auto_switch)
+
+      if providers.empty?
+        settings.logger.info("[#{@request_id}/#{model_name}] No providers available for round #{round + 1}/#{max_rounds}, stopping")
+        break
+      end
+
       if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
         deadline_hit = true
         settings.logger.warn("[#{@request_id}/#{model_name}] Request deadline exceeded after trying #{attempts.size} provider(s), aborting")
         break
       end
-      p_name = provider_config["provider"]
-      p_model = provider_config["model"]
-      if i == 0
-        settings.logger.info("[#{@request_id}/#{model_name}] Using #{p_name} (#{p_model})")
+
+      # Exponential backoff between rounds (delay between groups of retries).
+      # Round 0 starts immediately; subsequent rounds sleep backoff_base * 2^(round-1)
+      # with the same jitter factor used by per-attempt backoff.
+      if round > 0
+        delay_base = settings.backoff_base * (2 ** (round - 1))
+        sleep(delay_base * (0.5 + rand * 0.5))
+        settings.logger.info("[#{@request_id}/#{model_name}] Round #{round + 1}/#{max_rounds} after backoff")
       else
-        prev = attempts.last
-        prev_reason = prev ? "#{prev[:provider]} #{prev[:reason]}#{" (status=#{prev[:status]})" if prev[:status]}" : "previous failure"
-        settings.logger.info("[#{@request_id}/#{model_name}] Fallback to #{p_name} (#{p_model}) because #{prev_reason}")
+        settings.logger.info("[#{@request_id}/#{model_name}] Round 1/#{max_rounds}")
       end
 
-      log_prefix = "[#{@request_id}/#{model_name}/#{p_name}]"
-      result = yield(provider_config, path, body, p_model, headers, log_prefix)
-      if result&.dig(:success)
-        record_metrics(selector, p_name, result) if probing
-        selector.record_success(p_name)
-        Metrics.increment(:provider_success, labels: {provider: p_name, model: model_name})
-        if result[:ttft]
-          Metrics.observe(:upstream_ttft_seconds, result[:ttft], labels: {provider: p_name, model: model_name})
+      providers.each_with_index do |provider_config, i|
+        if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+          deadline_hit = true
+          settings.logger.warn("[#{@request_id}/#{model_name}] Request deadline exceeded after trying #{attempts.size} provider(s), aborting")
+          break
         end
-        break
-      else
-        reason = RequestHandler.failure_reason(result)
-        attempts << {provider: p_name, status: result.is_a?(Hash) ? result[:status] : nil, error: result.is_a?(Hash) ? result[:error] : nil, reason: reason}
-        if result.is_a?(Hash) && result[:quota_pause_until]
-          selector.quota_pause!(p_name, result[:quota_pause_until], reason: result[:quota_pause_reason])
-          Metrics.increment(:provider_quota_paused, labels: {provider: p_name, model: model_name, reason: result[:quota_pause_reason] || "unknown"})
+        p_name = provider_config["provider"]
+        p_model = provider_config["model"]
+        if round == 0 && i == 0
+          settings.logger.info("[#{@request_id}/#{model_name}] Using #{p_name} (#{p_model})")
         else
-          selector.record_failure(p_name)
+          prev = attempts.last
+          prev_reason = prev ? "#{prev[:provider]} #{prev[:reason]}#{" (status=#{prev[:status]})" if prev[:status]}" : "previous failure"
+          settings.logger.info("[#{@request_id}/#{model_name}] Fallback to #{p_name} (#{p_model}) because #{prev_reason}")
         end
-        Metrics.increment(:provider_failure, labels: {provider: p_name, model: model_name, reason: reason})
+
+        log_prefix = "[#{@request_id}/#{model_name}/#{p_name}]"
+        result = yield(provider_config, path, body, p_model, headers, log_prefix)
+        if result&.dig(:success)
+          record_metrics(selector, p_name, result) if probing
+          selector.record_success(p_name)
+          Metrics.increment(:provider_success, labels: {provider: p_name, model: model_name})
+          if result[:ttft]
+            Metrics.observe(:upstream_ttft_seconds, result[:ttft], labels: {provider: p_name, model: model_name})
+          end
+          break
+        else
+          reason = RequestHandler.failure_reason(result)
+          attempts << {provider: p_name, status: result.is_a?(Hash) ? result[:status] : nil, error: result.is_a?(Hash) ? result[:error] : nil, reason: reason}
+          if result.is_a?(Hash) && result[:quota_pause_until]
+            selector.quota_pause!(p_name, result[:quota_pause_until], reason: result[:quota_pause_reason])
+            Metrics.increment(:provider_quota_paused, labels: {provider: p_name, model: model_name, reason: result[:quota_pause_reason] || "unknown"})
+          else
+            selector.record_failure(p_name)
+          end
+          Metrics.increment(:provider_failure, labels: {provider: p_name, model: model_name, reason: reason})
+        end
       end
+
+      break if result&.dig(:success)
+      break if deadline_hit
     end
 
     if probing && selector.record_and_maybe_probe(probe_interval)

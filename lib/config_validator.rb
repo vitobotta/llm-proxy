@@ -2,6 +2,7 @@
 
 module ConfigValidator
   MAX_MAX_ATTEMPTS = 10
+  MAX_MAX_ROUNDS = 10
   MAX_PROBE_INTERVAL = 100_000
   MAX_SAMPLE_WINDOW = 86_400      # 1 day
   MAX_BACKOFF_BASE = 60
@@ -101,6 +102,16 @@ module ConfigValidator
     if (n = config.dig("retries", "backoff_base"))
       if !n.is_a?(Numeric) || n <= 0 || n > MAX_BACKOFF_BASE
         errors << "retries.backoff_base must be between 0 and #{MAX_BACKOFF_BASE} seconds (got #{n.inspect})"
+      end
+    end
+
+    if (n = config.dig("retries", "max_rounds"))
+      if !n.is_a?(Integer) || n < 1
+        errors << "retries.max_rounds must be a positive integer (got #{n.inspect})"
+      elsif n > MAX_MAX_ROUNDS
+        errors << "retries.max_rounds is #{n}, refusing (>#{MAX_MAX_ROUNDS}). Reduce to keep request latency bounded."
+      elsif n > 5
+        warnings << "max_rounds > 5 may cause long retry loops"
       end
     end
 

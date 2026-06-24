@@ -93,6 +93,36 @@ class TestConfigValidator < Minitest::Test
     assert(errors.any? { |e| e.include?("backoff_base") }, errors.inspect)
   end
 
+  def test_rejects_zero_max_rounds
+    cfg = base.merge("retries" => {"max_rounds" => 0})
+    errors, _ = validate(cfg)
+    assert(errors.any? { |e| e.include?("max_rounds") }, errors.inspect)
+  end
+
+  def test_rejects_negative_max_rounds
+    cfg = base.merge("retries" => {"max_rounds" => -1})
+    errors, _ = validate(cfg)
+    assert(errors.any? { |e| e.include?("max_rounds") }, errors.inspect)
+  end
+
+  def test_rejects_excessive_max_rounds
+    cfg = base.merge("retries" => {"max_rounds" => 1_000_000})
+    errors, _ = validate(cfg)
+    assert(errors.any? { |e| e.include?("max_rounds") }, errors.inspect)
+  end
+
+  def test_accepts_valid_max_rounds
+    cfg = base.merge("retries" => {"max_rounds" => 5})
+    errors, _ = validate(cfg)
+    assert_empty errors, errors.inspect
+  end
+
+  def test_warns_on_high_max_rounds
+    cfg = base.merge("retries" => {"max_rounds" => 7})
+    _, warnings = validate(cfg)
+    assert(warnings.any? { |w| w.include?("max_rounds") }, warnings.inspect)
+  end
+
   def test_rejects_excessive_max_request_body
     cfg = base.merge("limits" => {"max_request_body" => 10 * 1024 * 1024 * 1024})
     errors, _ = validate(cfg)

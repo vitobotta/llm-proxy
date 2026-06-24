@@ -177,14 +177,14 @@ class HandlerTestApp
     logger.define_singleton_method(:warn) { |m| logs_ref << [:warn, m] }
     logger.define_singleton_method(:error) { |m| logs_ref << [:error, m] }
     logger.define_singleton_method(:debug) { |m| logs_ref << [:debug, m] }
-    Struct.new(:logger, :max_attempts, :backoff_base).new(logger, 2, 0)
+    Struct.new(:logger, :max_attempts, :backoff_base, :max_rounds).new(logger, 2, 0, 3)
   end
 
   def sleep(_); end
 end
 
 class FakeSelector
-  attr_reader :successes, :failures, :pauses, :metrics_updates
+  attr_reader :successes, :failures, :pauses, :metrics_updates, :paused_names
   attr_accessor :_providers
 
   def initialize
@@ -193,10 +193,11 @@ class FakeSelector
     @pauses = []
     @metrics_updates = []
     @_providers = []
+    @paused_names = []
   end
 
   def ordered_providers(auto_switch: false)
-    @_providers
+    @_providers.reject { |p| @paused_names.include?(p["provider"]) }
   end
 
   def record_success(name)
@@ -209,6 +210,7 @@ class FakeSelector
 
   def quota_pause!(name, time, reason: nil)
     @pauses << {name: name, time: time, reason: reason}
+    @paused_names << name unless @paused_names.include?(name)
   end
 
   def update_metrics(name, ttft, tps)
@@ -324,6 +326,168 @@ class WithAutoSelectTest < Minitest::Test
 
     refute result[:success]
     assert_equal 503, result[:status]
+  end
+end
+
+# --- Circular fallback round-loop tests ---
+
+class RoundLoopTest < Minitest::Test
+  def setup
+    @app = HandlerTestApp.new
+    @selector = FakeSelector.new
+    @model_entry = {"name" => "test-model", "probing_enabled" => false, "auto_switch" => false}
+    ConfigStore.instance_variable_set(:@data, {
+      selectors: {"test-model" => @selector},
+      models: {"test-model" => @model_entry},
+      probe_interval: 60,
+      probe_max_per_minute: 2,
+      timeouts: {open: 1, read: 1, write: 1},
+      tracking_enabled: true,
+      quota_pause_default_seconds: 60
+    })
+  end
+
+  def make_provider(name, model = name)
+    {"provider" => name, "model" => model, "base_url" => "https://#{name}.example.com/v1", "api_key" => "k"}
+  end
+
+  # Two-provider circular retry succeeds on round 2.
+  # Round 1: A fails, B fails. Round 2: A succeeds.
+  def test_circular_retry_succeeds_on_round_2
+    @selector._providers = [make_provider("a"), make_provider("b")]
+    call_count = 0
+    result = @app.with_auto_select(model: @model_entry, model_name: "test-model", path: "/chat/completions", body: {}, headers: {}) do
+      call_count += 1
+      # Round 1: calls 1 (a) and 2 (b) fail. Round 2: call 3 (a) succeeds.
+      {success: call_count >= 3}
+    end
+
+    assert result[:success], "should succeed on round 2"
+    assert_equal 3, call_count, "should have made 3 attempts (2 fails + 1 success)"
+    assert_equal ["a"], @selector.successes
+    assert_equal ["a", "b"], @selector.failures
+  end
+
+  # Single provider: retries across rounds until success.
+  def test_single_provider_retries_across_rounds
+    @selector._providers = [make_provider("solo")]
+    call_count = 0
+    result = @app.with_auto_select(model: @model_entry, model_name: "test-model", path: "/chat/completions", body: {}, headers: {}) do
+      call_count += 1
+      # Fails rounds 1 and 2 (calls 1, 2), succeeds on round 3 (call 3).
+      {success: call_count >= 3}
+    end
+
+    assert result[:success], "single provider should retry across rounds"
+    assert_equal 3, call_count
+    assert_equal ["solo", "solo"], @selector.failures
+    assert_equal ["solo"], @selector.successes
+  end
+
+  # max_rounds exhausted with all failures returns failure summary.
+  def test_max_rounds_exhausted_returns_failure
+    @selector._providers = [make_provider("a"), make_provider("b")]
+    call_count = 0
+    result = @app.with_auto_select(model: @model_entry, model_name: "test-model", path: "/chat/completions", body: {}, headers: {}) do
+      call_count += 1
+      {success: false, status: 500, error: "persistent failure"}
+    end
+
+    refute result[:success]
+    # max_rounds=3, 2 providers each round = 6 calls
+    assert_equal 6, call_count, "should exhaust all rounds"
+    assert_includes result[:error], "a"
+    assert_includes result[:error], "b"
+  end
+
+  # A provider that fails every round opens its circuit (3 failures = threshold).
+  # After 3 rounds, provider "a" has 3 failures → circuit opens.
+  def test_circuit_opens_after_3_rounds
+    @selector._providers = [make_provider("a"), make_provider("b")]
+    call_count = 0
+    @app.with_auto_select(model: @model_entry, model_name: "test-model", path: "/chat/completions", body: {}, headers: {}) do
+      call_count += 1
+      {success: false, status: 500, error: "down"}
+    end
+
+    # "a" fails in rounds 1, 2, 3 → 3 record_failure calls → circuit threshold met.
+    assert_equal 3, @selector.failures.count("a"), "provider a should have 3 failures (circuit threshold)"
+    assert_equal 3, @selector.failures.count("b")
+  end
+
+  # Quota-paused provider is excluded from subsequent rounds.
+  def test_quota_paused_provider_excluded_from_next_round
+    @selector._providers = [make_provider("a"), make_provider("b")]
+    call_count = 0
+    result = @app.with_auto_select(model: @model_entry, model_name: "test-model", path: "/chat/completions", body: {}, headers: {}) do
+      call_count += 1
+      if call_count == 1
+        # Provider a hits quota on first call of round 1
+        {success: false, status: 429, error: "rate limited", quota_pause_until: Time.now.to_f + 600, quota_pause_reason: "rate_limited"}
+      elsif call_count == 2
+        # Provider b fails round 1
+        {success: false, status: 500, error: "down"}
+      else
+        # Round 2: only b should be tried (a is quota-paused) → succeeds
+        {success: true}
+      end
+    end
+
+    assert result[:success], "should succeed on round 2 with only b"
+    assert_equal 3, call_count
+    assert_equal 1, @selector.pauses.size
+    assert_equal "a", @selector.pauses.first[:name]
+    # b should have 1 failure (round 1) then 1 success (round 2)
+    assert_equal ["b"], @selector.failures
+    assert_equal ["b"], @selector.successes
+  end
+
+  # Round delay (backoff) is applied between rounds.
+  def test_round_delay_between_rounds
+    @selector._providers = [make_provider("a")]
+    sleep_calls = []
+    @app.define_singleton_method(:sleep) { |d| sleep_calls << d }
+    call_count = 0
+    @app.with_auto_select(model: @model_entry, model_name: "test-model", path: "/chat/completions", body: {}, headers: {}) do
+      call_count += 1
+      {success: false, status: 500, error: "down"}
+    end
+
+    # 3 rounds with 1 provider = 3 calls, 2 inter-round sleeps (between rounds 1→2 and 2→3)
+    assert_equal 3, call_count
+    assert_equal 2, sleep_calls.size, "should sleep between rounds 1→2 and 2→3"
+    # Round 2 delay: backoff_base(0) * 2^0 = 0, so sleep is 0 (jittered 0..0)
+    # Round 3 delay: backoff_base(0) * 2^1 = 0, so sleep is 0
+    # With backoff_base=0 all delays are 0; just assert sleeps happened.
+    sleep_calls.each { |d| assert d >= 0 }
+  end
+
+  # No inter-round sleep before round 1.
+  def test_no_sleep_before_first_round
+    @selector._providers = [make_provider("a")]
+    sleep_calls = []
+    @app.define_singleton_method(:sleep) { |d| sleep_calls << d }
+    call_count = 0
+    @app.with_auto_select(model: @model_entry, model_name: "test-model", path: "/chat/completions", body: {}, headers: {}) do
+      call_count += 1
+      {success: true} # succeeds immediately on round 1
+    end
+
+    assert_equal 1, call_count
+    assert_empty sleep_calls, "no inter-round sleep before round 1"
+  end
+
+  # Success on first round does not trigger further rounds.
+  def test_success_on_first_round_stops_loop
+    @selector._providers = [make_provider("a"), make_provider("b")]
+    call_count = 0
+    result = @app.with_auto_select(model: @model_entry, model_name: "test-model", path: "/chat/completions", body: {}, headers: {}) do
+      call_count += 1
+      {success: true}
+    end
+
+    assert result[:success]
+    assert_equal 1, call_count, "should stop after first success"
   end
 end
 

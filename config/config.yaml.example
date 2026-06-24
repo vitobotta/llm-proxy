@@ -3,7 +3,8 @@
 
 # Retry settings
 retries:
-  max_attempts: 2
+  max_attempts: 2        # retries on the same provider before falling through (per round)
+  max_rounds: 3          # circular fallback rounds: A→B→A→B until success or circuits open
   backoff_base: 1
 
 # Timeout settings (seconds)

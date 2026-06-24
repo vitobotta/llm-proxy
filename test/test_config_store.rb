@@ -44,14 +44,14 @@ class TestConfigStore < Minitest::Test
     ConfigStore.register_app!(app)
     assert_equal 2, app.settings_hash[:max_attempts]
     assert_equal 1, app.settings_hash[:backoff_base]
+    assert_equal 3, app.settings_hash[:max_rounds]
   end
 
   def test_reload_re_propagates_settings_to_registered_app
     app = FakeApp.new
     ConfigStore.register_app!(app)
     assert_equal 2, app.settings_hash[:max_attempts]
-
-    new_cfg = MOCK_CONFIG.merge("retries" => {"max_attempts" => 7, "backoff_base" => 3})
+    new_cfg = MOCK_CONFIG.merge("retries" => {"max_attempts" => 7, "backoff_base" => 3, "max_rounds" => 5})
     write_config(new_cfg)
 
     # Stub prewarm_connections! to avoid spawning a thread that hits real URLs
@@ -77,6 +77,7 @@ class TestConfigStore < Minitest::Test
     assert ok, "reload! should succeed (errors: #{err_logger.errors.inspect})"
     assert_equal 7, app.settings_hash[:max_attempts]
     assert_equal 3, app.settings_hash[:backoff_base]
+    assert_equal 5, app.settings_hash[:max_rounds]
   ensure
     HTTPSupport.singleton_class.class_eval do
       if method_defined?(:__orig_prewarm) || private_method_defined?(:__orig_prewarm)
@@ -188,6 +189,30 @@ class TestConfigStore < Minitest::Test
       if method_defined?(:__orig_prewarm2) || private_method_defined?(:__orig_prewarm2)
         alias_method :prewarm_connections!, :__orig_prewarm2
         remove_method :__orig_prewarm2
+      end
+    end
+  end
+
+  def test_max_rounds_defaults_to_3_when_omitted
+    # MOCK_CONFIG has no max_rounds key → should default to 3
+    assert_equal 3, ConfigStore.max_rounds
+  end
+
+  def test_max_rounds_loaded_from_config
+    new_cfg = MOCK_CONFIG.merge("retries" => MOCK_CONFIG["retries"].merge("max_rounds" => 7))
+    write_config(new_cfg)
+    HTTPSupport.singleton_class.class_eval do
+      alias_method :__orig_prewarm_mr, :prewarm_connections!
+      define_method(:prewarm_connections!) { |*_args, **_kw| nil }
+    end
+
+    assert ConfigStore.reload!(logger: NullLogger.new)
+    assert_equal 7, ConfigStore.max_rounds
+  ensure
+    HTTPSupport.singleton_class.class_eval do
+      if method_defined?(:__orig_prewarm_mr) || private_method_defined?(:__orig_prewarm_mr)
+        alias_method :prewarm_connections!, :__orig_prewarm_mr
+        remove_method :__orig_prewarm_mr
       end
     end
   end

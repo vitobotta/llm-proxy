@@ -100,15 +100,16 @@ module ConfigStore
   def self.sample_window = @data[:sample_window]
   def self.max_attempts = @data[:max_attempts]
   def self.backoff_base = @data[:backoff_base]
+  def self.max_rounds = @data[:max_rounds]
   def self.quota_pause_default_seconds = @data[:quota_pause_default_seconds]
 
   def self.model(name) = @data[:models][name]
   def self.selector(name) = @data[:selectors][name]
-
   def self.update_settings!(app)
     snapshot = @data
     app.set :max_attempts, snapshot[:max_attempts]
     app.set :backoff_base, snapshot[:backoff_base]
+    app.set :max_rounds, snapshot[:max_rounds]
   end
 
   # `private` is a no-op on `def self.foo` definitions in modules; use
@@ -165,7 +166,7 @@ module ConfigStore
       sample_window: sample_window,
       max_attempts: raw.dig("retries", "max_attempts") || 3,
       backoff_base: raw.dig("retries", "backoff_base") || 2,
-      quota_pause_default_seconds: raw.dig("performance", "quota_pause_default_seconds") || 60
+      max_rounds: raw.dig("retries", "max_rounds") || 3,
     }
   end
 
