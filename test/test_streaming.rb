@@ -197,7 +197,7 @@ class TestStreaming < Minitest::Test
     response = MockResponse.new([usage_chunk, done_chunk])
     tracker = Streaming::TimerTracker.new
 
-    usage, _perf_metrics = Streaming.consume_stream(response, tracker: tracker)
+    usage, _perf_metrics, _server_duration = Streaming.consume_stream(response, tracker: tracker)
     assert_equal({"prompt_tokens" => 10, "completion_tokens" => 5, "total_tokens" => 15}, usage)
   end
 
@@ -207,7 +207,7 @@ class TestStreaming < Minitest::Test
     response = MockResponse.new([content_chunk, done_chunk])
     tracker = Streaming::TimerTracker.new
 
-    usage, _perf_metrics = Streaming.consume_stream(response, tracker: tracker)
+    usage, _perf_metrics, _server_duration = Streaming.consume_stream(response, tracker: tracker)
     assert_nil usage
   end
 
@@ -271,7 +271,7 @@ class TestStreaming < Minitest::Test
     response = MockResponse.new([usage1, usage2])
     tracker = Streaming::TimerTracker.new
 
-    usage, _perf_metrics = Streaming.consume_stream(response, tracker: tracker)
+    usage, _perf_metrics, _server_duration = Streaming.consume_stream(response, tracker: tracker)
     assert_equal({"prompt_tokens" => 10, "completion_tokens" => 5}, usage)
   end
 
@@ -487,9 +487,37 @@ class TestStreaming < Minitest::Test
     response = MockResponse.new([perf_chunk, done_chunk])
     tracker = Streaming::TimerTracker.new
 
-    _usage, perf_metrics = Streaming.consume_stream(response, tracker: tracker)
+    _usage, perf_metrics, _server_duration = Streaming.consume_stream(response, tracker: tracker)
     assert perf_metrics
     assert_equal 1.5, perf_metrics["generation-duration"]
+  end
+
+  def test_parse_chunk_extracts_server_duration_from_energy_comment
+    chunk = ": energy {\"energy_joules\": 8.41, \"duration_seconds\": 2.292, \"carbon_g_co2eq\": 0.0001}\n\n"
+    cr = Streaming.parse_chunk(chunk)
+    assert_equal 2.292, cr.server_duration
+  end
+
+  def test_extract_token_counts_tokens_per_second
+    usage = {"completion_tokens" => 100, "tokens_per_second" => 51.36}
+    result = Streaming.extract_token_counts(usage)
+    assert_equal 51.4, result[:server_tps], "server_tps should use tokens_per_second from usage"
+  end
+
+  def test_extract_token_counts_server_duration_fallback
+    usage = {"completion_tokens" => 100}
+    result = Streaming.extract_token_counts(usage, server_duration: 2.5)
+    assert_equal 40.0, result[:server_tps], "server_tps should fall back to completion/server_duration"
+  end
+
+  def test_consume_stream_extracts_server_duration
+    usage_chunk = "data: {\"choices\":[],\"usage\":{\"completion_tokens\":50}}\n\n"
+    energy_chunk = ": energy {\"duration_seconds\": 1.5}\n\n"
+    response = MockResponse.new([usage_chunk, energy_chunk])
+    tracker = Streaming::TimerTracker.new
+
+    _usage, _perf_metrics, server_duration = Streaming.consume_stream(response, tracker: tracker)
+    assert_equal 1.5, server_duration
   end
 end
 

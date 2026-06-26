@@ -278,6 +278,15 @@ class ProbeProviderTest < Minitest::Test
     end
   end
 
+  def test_probe_provider_server_duration_fallback
+    now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    stub_streaming(first_token_time: now + 0.1, first_content_time: now + 0.1, last_content_time: now + 1.0, last_any_token_time: now + 1.0, usage_data: {"completion_tokens" => 100, "prompt_tokens" => 10}, server_duration: 2.0) do
+      result = ProbeManager.probe_provider(@provider_config, "/chat/completions", {}, "m", {}, timeouts: {open: 1, read: 1, write: 1}, logger: @logger, selector: @selector)
+      assert result[:tps] && result[:tps] > 0, "tps should use server_duration fallback"
+      assert_equal 50.0, result[:tps], "100 tokens / 2.0s = 50.0 TPS"
+    end
+  end
+
   def test_probe_provider_server_ttft_preferred
     now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
     stub_streaming(first_token_time: now + 0.5, usage_data: {"completion_tokens" => 50, "completion_time" => 0.5}, perf_metrics: {"server-time-to-first-token" => 0.3}) do

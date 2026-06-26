@@ -30,7 +30,7 @@ module Streaming
   TOOL_CALL_PATTERN = /[^a-zA-Z_]"tool_calls"\s*:\s*\[/
   USAGE_STRING = '"usage"'
 
-  ChunkResult = Struct.new(:usage, :has_thinking, :has_content, :has_tool_call, :perf_metrics)
+  ChunkResult = Struct.new(:usage, :has_thinking, :has_content, :has_tool_call, :perf_metrics, :server_duration)
 
   class TimerTracker
     attr_reader :first_token, :first_thinking, :last_thinking,
@@ -70,9 +70,28 @@ module Streaming
   end
 
   PERF_METRICS_STRING = '"perf_metrics"'
+  ENERGY_COMMENT_PREFIX = ": energy"
 
   def self.parse_chunk(chunk)
-    result = ChunkResult.new(nil, false, false, false, nil)
+    result = ChunkResult.new(nil, false, false, false, nil, nil)
+
+    # vLLM energy comment line: ": energy {"duration_seconds": 1.234, ...}"
+    # This is an SSE comment line (not a data: line) that contains the
+    # server-side total request duration. Used as a fallback for server_tps
+    # when the provider doesn't report tokens_per_second.
+    if chunk.include?(ENERGY_COMMENT_PREFIX)
+      chunk.split("\n").each do |line|
+        next unless line.start_with?(ENERGY_COMMENT_PREFIX)
+        json_part = line.sub(/\A#{Regexp.escape(ENERGY_COMMENT_PREFIX)}\s*/, "").strip
+        begin
+          energy = JSON.parse(json_part)
+          duration = energy["duration_seconds"]
+          result.server_duration = duration if duration.is_a?(Numeric) && duration > 0
+        rescue JSON::ParserError
+          next
+        end
+      end
+    end
 
     if chunk.include?(USAGE_STRING) || chunk.include?(PERF_METRICS_STRING)
       chunk.scan(/^data:\s*(.+)$/).each do |raw|
@@ -106,7 +125,7 @@ module Streaming
   end
 
 
-  def self.extract_token_counts(usage_data, perf_metrics: nil)
+  def self.extract_token_counts(usage_data, perf_metrics: nil, server_duration: nil)
     completion = usage_data.dig("completion_tokens") || usage_data.dig("output_tokens")
     thinking = usage_data.dig("completion_tokens_details", "reasoning_tokens") ||
       usage_data.dig("output_tokens_details", "reasoning_tokens") ||
@@ -133,6 +152,16 @@ module Streaming
       server_ttft = (groq_prompt_time + groq_queue_time).round(3)
     end
 
+    # Generic: usage["tokens_per_second"] — decode-only rate reported by
+    # DeepSeek, Kimi (Moonshot), and other vLLM-based/OpenAI-compatible providers.
+    # This is the closest to what provider dashboards display.
+    if server_tps.nil?
+      tps_field = usage_data["tokens_per_second"]
+      if tps_field.is_a?(Numeric) && tps_field > 0
+        server_tps = tps_field.round(1)
+      end
+    end
+
     # Fireworks: perf_metrics["generation-duration"] + server-time-to-first-token.
     if perf_metrics && server_tps.nil?
       gen_dur = perf_metrics["generation-duration"]
@@ -146,6 +175,14 @@ module Streaming
       server_ttft = fw_ttft.to_f.round(3) if fw_ttft.is_a?(Numeric) && fw_ttft > 0
     end
 
+    # vLLM energy comment: server_duration is the total request time
+    # (prefill + decode). Dividing completion_tokens by it gives a
+    # total-time TPS — lower than decode-only but far more accurate than
+    # the arrival-window estimate for short generations.
+    if server_tps.nil? && server_duration && completion && completion > 0
+      server_tps = (completion / server_duration).round(1)
+    end
+
     {completion: completion, thinking: thinking, content: content, content_clamped: clamped,
      server_tps: server_tps, server_ttft: server_ttft}
   end
@@ -157,30 +194,33 @@ module Streaming
   end
 
   # Walks response.read_body, parsing each chunk and updating `tracker`
-  # with thinking/content timestamps. Captures cr.usage and cr.perf_metrics
-  # as they appear (last-seen-wins). The caller-supplied block receives
-  # (chunk, cr, now) per chunk and may write the chunk to a client,
-  # accumulate it, or do nothing.
-  # Returns [usage, perf_metrics] — either may be nil.
+  # with thinking/content timestamps. Captures cr.usage, cr.perf_metrics, and
+  # cr.server_duration as they appear (last-seen-wins). The caller-supplied
+  # block receives (chunk, cr, now) per chunk and may write the chunk to a
+  # client, accumulate it, or do nothing.
+  # Returns [usage, perf_metrics, server_duration] — any may be nil.
   def self.consume_stream(response, tracker:)
     usage = nil
     perf_metrics = nil
+    server_duration = nil
     response.read_body do |chunk|
       now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
       cr = parse_chunk(chunk)
       usage = cr.usage if cr.usage
       perf_metrics = cr.perf_metrics if cr.perf_metrics
+      server_duration = cr.server_duration if cr.server_duration
       tracker.record_thinking(now) if cr.has_thinking
       tracker.record_content(now) if cr.has_content
       yield(chunk, cr, now) if block_given?
     end
-    [usage, perf_metrics]
+    [usage, perf_metrics, server_duration]
   end
 
   def self.stream_response(http, request, request_start, on_chunk: nil)
     timers = TimerTracker.new
     usage_data = nil
     perf_metrics = nil
+    server_duration = nil
     error = nil
 
     http.request(request) do |response|
@@ -189,7 +229,7 @@ module Streaming
         next
       end
 
-      usage_data, perf_metrics = consume_stream(response, tracker: timers) do |chunk, cr, now|
+      usage_data, perf_metrics, server_duration = consume_stream(response, tracker: timers) do |chunk, cr, now|
         on_chunk&.call(chunk, cr, now)
       end
     end
@@ -206,6 +246,7 @@ module Streaming
         last_any_token_time: timers.last_any_token,
         usage_data: usage_data,
         perf_metrics: perf_metrics,
+        server_duration: server_duration,
         request_start: request_start
       }
     end
@@ -216,11 +257,11 @@ module Streaming
     tracker.record_content(now) if chunk_result.has_content
   end
 
-  def build_stream_result(log_prefix, tracker, usage_data, perf_metrics: nil)
+  def build_stream_result(log_prefix, tracker, usage_data, perf_metrics: nil, server_duration: nil)
     ttft = tracker.first_token ? (tracker.first_token - @request_start).round(3) : nil
 
     if usage_data
-      tokens = Streaming.extract_token_counts(usage_data, perf_metrics: perf_metrics)
+      tokens = Streaming.extract_token_counts(usage_data, perf_metrics: perf_metrics, server_duration: server_duration)
       if tokens[:content_clamped] && Streaming.note_negative_content_once(log_prefix)
         settings.logger.warn("#{log_prefix} provider reported reasoning_tokens (#{tokens[:thinking]}) > completion_tokens (#{tokens[:completion]}); clamping content to 0. This indicates a bug at the provider — please verify their usage accounting.")
       end

@@ -131,7 +131,7 @@ module ProbeManager
         return {ttft: ttft, tps: nil}
       end
 
-      tokens = Streaming.extract_token_counts(result[:usage_data], perf_metrics: result[:perf_metrics])
+      tokens = Streaming.extract_token_counts(result[:usage_data], perf_metrics: result[:perf_metrics], server_duration: result[:server_duration])
       completion_tokens = tokens[:completion] || 0
 
       # Override arrival TTFT with server-side timing when the provider reports it.
