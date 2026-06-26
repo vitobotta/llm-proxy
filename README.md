@@ -293,7 +293,7 @@ Every streaming request logs token statistics:
 - **ttft** — time to first token
 - **content_tps** — content tokens per second (measured from first content token to last content token)
 - **thinking_tps** — thinking tokens per second (measured from first thinking token to last thinking token)
-- **total_tps** — completion tokens per second over the full streaming window (first token to last of any kind); matches what providers report
+- **total_tps** — completion tokens per second. Uses server-side timing when reported by the provider (in priority order: `usage.tokens_per_second`, Groq's `usage.completion_time`, Fireworks' `perf_metrics.generation-duration`, or the vLLM `: energy` comment's `duration_seconds`); falls back to the arrival-window estimate (first token to last of any kind) when no server timing is available
 
 ## Docker Compose Reference
 
