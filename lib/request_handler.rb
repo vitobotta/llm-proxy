@@ -156,6 +156,7 @@ module RequestHandler
 
       timers = Streaming::TimerTracker.new
       usage_data = nil
+      perf_metrics = nil
       stream_result = nil
       tracking = ConfigStore.tracking_enabled
       accumulated = tracking ? +"" : nil
@@ -164,7 +165,7 @@ module RequestHandler
         http.request(request) do |response|
           if response.is_a?(Net::HTTPSuccess)
             if tracking
-              usage_data = Streaming.consume_stream(response, tracker: timers) do |chunk, cr, _now|
+              usage_data, perf_metrics = Streaming.consume_stream(response, tracker: timers) do |chunk, cr, _now|
                 forward_chunk_to_client(out, chunk)
                 if accumulated
                   accumulated << chunk
@@ -182,22 +183,10 @@ module RequestHandler
               unless usage_data
                 fallback = Streaming.parse_chunk(accumulated.to_s) if accumulated
                 usage_data = fallback.usage if fallback&.usage
+                perf_metrics = fallback.perf_metrics if fallback&.perf_metrics
               end
 
-              unless usage_data
-                if accumulated
-                  counts = Streaming.extract_sse_content(accumulated.to_s)
-                  total = counts[:content_len] + counts[:thinking_len]
-                  if total > 0
-                    usage_data = {
-                      "completion_tokens" => total,
-                      "completion_tokens_details" => {"reasoning_tokens" => counts[:thinking_len]}
-                    }
-                  end
-                end
-              end
-
-              stream_result = build_stream_result(log_prefix, timers, usage_data)
+              stream_result = build_stream_result(log_prefix, timers, usage_data, perf_metrics: perf_metrics)
             else
               stream_result = {success: true}
             end

@@ -176,13 +176,6 @@ class TestStreaming < Minitest::Test
     assert_equal 200.0, timers.last_content
   end
 
-  def test_extract_sse_content
-    accumulated = "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\ndata: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking\"}}]}\n\n"
-    result = Streaming.extract_sse_content(accumulated)
-    assert_equal 5, result[:content_len]
-    assert_equal 8, result[:thinking_len]
-  end
-
   def test_parse_chunk_ignores_empty_content_in_role_delta
     chunk = 'data: {"choices":[{"delta":{"role":"assistant","content":""}}]}' + "\n\n"
     cr = Streaming.parse_chunk(chunk)
@@ -204,7 +197,7 @@ class TestStreaming < Minitest::Test
     response = MockResponse.new([usage_chunk, done_chunk])
     tracker = Streaming::TimerTracker.new
 
-    usage = Streaming.consume_stream(response, tracker: tracker)
+    usage, _perf_metrics = Streaming.consume_stream(response, tracker: tracker)
     assert_equal({"prompt_tokens" => 10, "completion_tokens" => 5, "total_tokens" => 15}, usage)
   end
 
@@ -214,7 +207,7 @@ class TestStreaming < Minitest::Test
     response = MockResponse.new([content_chunk, done_chunk])
     tracker = Streaming::TimerTracker.new
 
-    usage = Streaming.consume_stream(response, tracker: tracker)
+    usage, _perf_metrics = Streaming.consume_stream(response, tracker: tracker)
     assert_nil usage
   end
 
@@ -278,7 +271,7 @@ class TestStreaming < Minitest::Test
     response = MockResponse.new([usage1, usage2])
     tracker = Streaming::TimerTracker.new
 
-    usage = Streaming.consume_stream(response, tracker: tracker)
+    usage, _perf_metrics = Streaming.consume_stream(response, tracker: tracker)
     assert_equal({"prompt_tokens" => 10, "completion_tokens" => 5}, usage)
   end
 
@@ -418,6 +411,85 @@ class TestStreaming < Minitest::Test
 
     assert_equal 0, result[:content_tokens]
     assert_equal 30, result[:thinking_tokens]
+  end
+
+  # --- server-side timing (Groq / Fireworks) ---
+
+  def test_extract_token_counts_groq_server_tps
+    usage = {"completion_tokens" => 100, "completion_time" => 2.0}
+    result = Streaming.extract_token_counts(usage)
+    assert_equal 50.0, result[:server_tps]
+    assert_equal 100, result[:completion]
+    assert_equal 0, result[:thinking]
+    assert_equal 100, result[:content]
+  end
+
+  def test_extract_token_counts_fireworks_server_tps
+    usage = {"completion_tokens" => 100}
+    perf_metrics = {"generation-duration" => 2.5}
+    result = Streaming.extract_token_counts(usage, perf_metrics: perf_metrics)
+    assert_equal 40.0, result[:server_tps]
+  end
+
+  def test_extract_token_counts_no_server_tps
+    usage = {"completion_tokens" => 50}
+    result = Streaming.extract_token_counts(usage)
+    assert_nil result[:server_tps]
+  end
+
+  def test_build_stream_result_prefers_server_tps
+    handler = BuildStreamResultHarness.new(1000.0)
+    tracker = Streaming::TimerTracker.new
+    tracker.record_content(1000.1)
+    tracker.record_content(1000.5)
+
+    usage = {"completion_tokens" => 100, "completion_time" => 2.0}
+    result = handler.build_stream_result("[test]", tracker, usage)
+
+    assert_equal 50.0, result[:total_tps], "total_tps should use server-side completion_time"
+  end
+
+  def test_extract_token_counts_groq_server_ttft
+    usage = {"prompt_time" => 0.2, "queue_time" => 0.05, "completion_tokens" => 100}
+    result = Streaming.extract_token_counts(usage)
+    assert_equal 0.25, result[:server_ttft]
+  end
+
+  def test_extract_token_counts_fireworks_server_ttft
+    perf_metrics = {"server-time-to-first-token" => 0.3}
+    usage = {"completion_tokens" => 50}
+    result = Streaming.extract_token_counts(usage, perf_metrics: perf_metrics)
+    assert_equal 0.3, result[:server_ttft]
+  end
+
+  def test_build_stream_result_prefers_server_ttft
+    handler = BuildStreamResultHarness.new(1000.0)
+    tracker = Streaming::TimerTracker.new
+    tracker.record_content(1000.5)  # arrival TTFT would be 0.5
+
+    usage = {"prompt_time" => 0.2, "queue_time" => 0.05, "completion_tokens" => 10}
+    result = handler.build_stream_result("[test]", tracker, usage)
+
+    assert_in_delta 0.25, result[:ttft], 0.001, "ttft should use server-side prompt_time+queue_time"
+  end
+
+  def test_parse_chunk_extracts_perf_metrics
+    chunk = "data: {\"choices\":[],\"perf_metrics\":{\"generation-duration\":1.5,\"server-time-to-first-token\":0.1}}\n\n"
+    cr = Streaming.parse_chunk(chunk)
+    assert cr.perf_metrics
+    assert_equal 1.5, cr.perf_metrics["generation-duration"]
+    assert_equal 0.1, cr.perf_metrics["server-time-to-first-token"]
+  end
+
+  def test_consume_stream_extracts_perf_metrics
+    perf_chunk = "data: {\"choices\":[],\"perf_metrics\":{\"generation-duration\":1.5}}\n\n"
+    done_chunk = "data: [DONE]\n\n"
+    response = MockResponse.new([perf_chunk, done_chunk])
+    tracker = Streaming::TimerTracker.new
+
+    _usage, perf_metrics = Streaming.consume_stream(response, tracker: tracker)
+    assert perf_metrics
+    assert_equal 1.5, perf_metrics["generation-duration"]
   end
 end
 

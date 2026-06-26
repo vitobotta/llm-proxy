@@ -98,6 +98,22 @@ class TestHTTPSupport < Minitest::Test
     body = JSON.parse(request.body)
     assert_equal true, body["stream"]
     assert_equal({"include_usage" => true}, body["stream_options"])
+    refute body.key?("perf_metrics_in_response"), "non-fireworks providers must not set perf_metrics_in_response"
+  end
+
+  def test_build_upstream_request_fireworks_perf_metrics
+    provider_config = {
+      "provider" => "fireworks",
+      "base_url" => "https://api.fireworks.ai/inference/v1",
+      "api_key" => "key",
+      "model" => "fireworks-model",
+      "headers" => nil
+    }
+    _uri, request = HTTPSupport.build_upstream_request(
+      provider_config, "chat/completions", {}, "fireworks-model", nil, stream: true
+    )
+    body = JSON.parse(request.body)
+    assert_equal true, body["perf_metrics_in_response"]
   end
 
   def test_build_upstream_request_preserves_reasoning_and_passthrough_fields

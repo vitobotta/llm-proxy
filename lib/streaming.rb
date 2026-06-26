@@ -30,7 +30,7 @@ module Streaming
   TOOL_CALL_PATTERN = /[^a-zA-Z_]"tool_calls"\s*:\s*\[/
   USAGE_STRING = '"usage"'
 
-  ChunkResult = Struct.new(:usage, :has_thinking, :has_content, :has_tool_call)
+  ChunkResult = Struct.new(:usage, :has_thinking, :has_content, :has_tool_call, :perf_metrics)
 
   class TimerTracker
     attr_reader :first_token, :first_thinking, :last_thinking,
@@ -69,10 +69,12 @@ module Streaming
     end
   end
 
-  def self.parse_chunk(chunk)
-    result = ChunkResult.new(nil, false, false, false)
+  PERF_METRICS_STRING = '"perf_metrics"'
 
-    if chunk.include?(USAGE_STRING)
+  def self.parse_chunk(chunk)
+    result = ChunkResult.new(nil, false, false, false, nil)
+
+    if chunk.include?(USAGE_STRING) || chunk.include?(PERF_METRICS_STRING)
       chunk.scan(/^data:\s*(.+)$/).each do |raw|
         line = raw.first.strip
         next if line == "[DONE]" || line.empty?
@@ -80,8 +82,11 @@ module Streaming
           data = JSON.parse(line)
           if data.key?("usage")
             result.usage = data["usage"]
-            break
           end
+          if data.key?("perf_metrics")
+            result.perf_metrics = data["perf_metrics"]
+          end
+          break if result.usage && result.perf_metrics
         rescue JSON::ParserError
           next
         end
@@ -100,28 +105,8 @@ module Streaming
     result
   end
 
-  def self.extract_sse_content(accumulated)
-    content_len = 0
-    thinking_len = 0
 
-    accumulated.scan(/^data:\s*(.+)$/).each do |raw|
-      line = raw.first.strip
-      next if line == "[DONE]" || line.empty?
-      begin
-        data = JSON.parse(line)
-        delta = data.dig("choices", 0, "delta")
-        next unless delta
-        content_len += delta["content"].to_s.length if delta["content"]
-        thinking_len += delta["reasoning_content"].to_s.length if delta["reasoning_content"]
-      rescue JSON::ParserError
-        next
-      end
-    end
-
-    {content_len: content_len, thinking_len: thinking_len}
-  end
-
-  def self.extract_token_counts(usage_data)
+  def self.extract_token_counts(usage_data, perf_metrics: nil)
     completion = usage_data.dig("completion_tokens") || usage_data.dig("output_tokens")
     thinking = usage_data.dig("completion_tokens_details", "reasoning_tokens") ||
       usage_data.dig("output_tokens_details", "reasoning_tokens") ||
@@ -129,7 +114,40 @@ module Streaming
     raw_content = completion ? completion - thinking : nil
     clamped = !raw_content.nil? && raw_content < 0
     content = clamped ? 0 : raw_content
-    {completion: completion, thinking: thinking, content: content, content_clamped: clamped}
+
+    # Server-side timing — matches provider dashboards when available.
+    server_tps = nil
+    server_ttft = nil
+
+    # Groq: usage["completion_time"] (decode-only seconds) + prompt_time/queue_time.
+    if completion && completion > 0
+      groq_completion_time = usage_data["completion_time"]
+      if groq_completion_time.is_a?(Numeric) && groq_completion_time > 0
+        server_tps = (completion / groq_completion_time).round(1)
+      end
+    end
+
+    groq_prompt_time = usage_data["prompt_time"]
+    groq_queue_time = usage_data["queue_time"]
+    if groq_prompt_time.is_a?(Numeric) && groq_queue_time.is_a?(Numeric)
+      server_ttft = (groq_prompt_time + groq_queue_time).round(3)
+    end
+
+    # Fireworks: perf_metrics["generation-duration"] + server-time-to-first-token.
+    if perf_metrics && server_tps.nil?
+      gen_dur = perf_metrics["generation-duration"]
+      if completion && completion > 0 && gen_dur.is_a?(Numeric) && gen_dur > 0
+        server_tps = (completion / gen_dur).round(1)
+      end
+    end
+
+    if perf_metrics && server_ttft.nil?
+      fw_ttft = perf_metrics["server-time-to-first-token"]
+      server_ttft = fw_ttft.to_f.round(3) if fw_ttft.is_a?(Numeric) && fw_ttft > 0
+    end
+
+    {completion: completion, thinking: thinking, content: content, content_clamped: clamped,
+     server_tps: server_tps, server_ttft: server_ttft}
   end
 
   def self.compute_tps(token_count, first_time, last_time)
@@ -139,26 +157,30 @@ module Streaming
   end
 
   # Walks response.read_body, parsing each chunk and updating `tracker`
-  # with thinking/content timestamps. Captures cr.usage as it appears.
-  # The caller-supplied block receives (chunk, cr, now) per chunk and may
-  # write the chunk to a client, accumulate it, or do nothing.
-  # Returns the most recently seen usage Hash, or nil.
+  # with thinking/content timestamps. Captures cr.usage and cr.perf_metrics
+  # as they appear (last-seen-wins). The caller-supplied block receives
+  # (chunk, cr, now) per chunk and may write the chunk to a client,
+  # accumulate it, or do nothing.
+  # Returns [usage, perf_metrics] — either may be nil.
   def self.consume_stream(response, tracker:)
     usage = nil
+    perf_metrics = nil
     response.read_body do |chunk|
       now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
       cr = parse_chunk(chunk)
       usage = cr.usage if cr.usage
+      perf_metrics = cr.perf_metrics if cr.perf_metrics
       tracker.record_thinking(now) if cr.has_thinking
       tracker.record_content(now) if cr.has_content
       yield(chunk, cr, now) if block_given?
     end
-    usage
+    [usage, perf_metrics]
   end
 
   def self.stream_response(http, request, request_start, on_chunk: nil)
     timers = TimerTracker.new
     usage_data = nil
+    perf_metrics = nil
     error = nil
 
     http.request(request) do |response|
@@ -167,7 +189,7 @@ module Streaming
         next
       end
 
-      usage_data = consume_stream(response, tracker: timers) do |chunk, cr, now|
+      usage_data, perf_metrics = consume_stream(response, tracker: timers) do |chunk, cr, now|
         on_chunk&.call(chunk, cr, now)
       end
     end
@@ -183,6 +205,7 @@ module Streaming
         last_content_time: timers.last_content,
         last_any_token_time: timers.last_any_token,
         usage_data: usage_data,
+        perf_metrics: perf_metrics,
         request_start: request_start
       }
     end
@@ -193,17 +216,21 @@ module Streaming
     tracker.record_content(now) if chunk_result.has_content
   end
 
-  def build_stream_result(log_prefix, tracker, usage_data)
+  def build_stream_result(log_prefix, tracker, usage_data, perf_metrics: nil)
     ttft = tracker.first_token ? (tracker.first_token - @request_start).round(3) : nil
 
     if usage_data
-      tokens = Streaming.extract_token_counts(usage_data)
+      tokens = Streaming.extract_token_counts(usage_data, perf_metrics: perf_metrics)
       if tokens[:content_clamped] && Streaming.note_negative_content_once(log_prefix)
         settings.logger.warn("#{log_prefix} provider reported reasoning_tokens (#{tokens[:thinking]}) > completion_tokens (#{tokens[:completion]}); clamping content to 0. This indicates a bug at the provider — please verify their usage accounting.")
       end
       content_tps = Streaming.compute_tps(tokens[:content], tracker.first_content, tracker.last_content)
       thinking_tps = Streaming.compute_tps(tokens[:thinking], tracker.first_thinking, tracker.last_thinking)
-      total_tps = Streaming.compute_tps(tokens[:completion], tracker.first_token, tracker.last_any_token)
+      # Prefer server-side generation timing (matches provider dashboards) when
+      # the provider reports it; fall back to the arrival-window estimate.
+      total_tps = tokens[:server_tps] || Streaming.compute_tps(tokens[:completion], tracker.first_token, tracker.last_any_token)
+      # Same for TTFT: server-side (queue + prefill) over arrival TTFT.
+      ttft = tokens[:server_ttft] || ttft
 
       log_parts = []
       log_parts << "content=#{tokens[:content]}" if tokens[:content]&.positive?

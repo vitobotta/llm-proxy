@@ -223,6 +223,7 @@ module HTTPSupport
     request_body["model"] = body_model if body_model
     request_body["stream"] = stream
     request_body["stream_options"] = {"include_usage" => true} if stream
+    request_body["perf_metrics_in_response"] = true if stream && provider_config["provider"] == "fireworks"
     request.body = request_body.to_json
 
     [uri, request]

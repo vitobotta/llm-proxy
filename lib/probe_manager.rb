@@ -99,7 +99,6 @@ module ProbeManager
 
       request_start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
       result = Streaming.stream_response(http, request, request_start)
-      stream_end = Process.clock_gettime(Process::CLOCK_MONOTONIC)
 
       if result[:error]
         error_str = result[:error]
@@ -123,6 +122,8 @@ module ProbeManager
         return {ttft: Float::INFINITY, tps: nil}
       end
 
+      # Prefer server-side TTFT (matches provider dashboards) when available;
+      # fall back to the arrival-window estimate.
       ttft = result[:first_token_time] ? (result[:first_token_time] - request_start).round(3) : Float::INFINITY
 
       unless result[:usage_data]
@@ -130,21 +131,15 @@ module ProbeManager
         return {ttft: ttft, tps: nil}
       end
 
-      tokens = Streaming.extract_token_counts(result[:usage_data])
+      tokens = Streaming.extract_token_counts(result[:usage_data], perf_metrics: result[:perf_metrics])
       completion_tokens = tokens[:completion] || 0
 
-      tps = Streaming.compute_tps(completion_tokens, result[:first_token_time], result[:last_any_token_time])
-
-      if tps.nil?
-        tps = Streaming.compute_tps(tokens[:content], result[:first_content_time], result[:last_content_time])
-      end
-
-      if tps.nil? && result[:first_token_time]
-        elapsed = stream_end - result[:first_token_time]
-        if elapsed > 0 && completion_tokens > 0
-          tps = (completion_tokens / elapsed).round(1)
-        end
-      end
+      # Override arrival TTFT with server-side timing when the provider reports it.
+      ttft = tokens[:server_ttft] || ttft
+      # Use server-side TPS when the provider reports it. Probes no longer
+      # emit arrival-window TPS — the tiny-payload probe's arrival TPS is the
+      # noisiest case and would skew the scorer's average.
+      tps = tokens[:server_tps]
 
       if tps.nil? || tps == 0
         diag = []
@@ -152,8 +147,7 @@ module ProbeManager
         diag << "content_tokens=#{tokens[:content]}"
         diag << "first_token_time=#{result[:first_token_time] ? format("%.3f", result[:first_token_time]) : "nil"}"
         diag << "last_any=#{result[:last_any_token_time] ? format("%.3f", result[:last_any_token_time]) : "nil"}"
-        diag << "stream_end=#{format("%.3f", stream_end)}"
-        logger.debug("[probe] #{pname}: TPS=0 diag: #{diag.join(", ")}")
+        logger.debug("[probe] #{pname}: TPS=nil diag: #{diag.join(", ")}")
       end
 
       {ttft: ttft, tps: tps}

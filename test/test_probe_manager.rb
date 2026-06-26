@@ -253,7 +253,7 @@ class ProbeProviderTest < Minitest::Test
 
   def test_probe_provider_success_with_usage_data
     now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-    stub_streaming(first_token_time: now + 0.1, first_content_time: now + 0.1, last_content_time: now + 0.5, last_any_token_time: now + 0.5, usage_data: {"completion_tokens" => 50, "prompt_tokens" => 10}) do
+    stub_streaming(first_token_time: now + 0.1, first_content_time: now + 0.1, last_content_time: now + 0.5, last_any_token_time: now + 0.5, usage_data: {"completion_tokens" => 50, "prompt_tokens" => 10, "completion_time" => 0.5}) do
       result = ProbeManager.probe_provider(@provider_config, "/chat/completions", {}, "m", {}, timeouts: {open: 1, read: 1, write: 1}, logger: @logger, selector: @selector)
       assert result[:tps] && result[:tps] > 0, "tps should be positive, got #{result[:tps]}"
       assert result[:ttft] < Float::INFINITY, "ttft should be finite"
@@ -266,6 +266,24 @@ class ProbeProviderTest < Minitest::Test
       result = ProbeManager.probe_provider(@provider_config, "/chat/completions", {}, "m", {}, timeouts: {open: 1, read: 1, write: 1}, logger: @logger, selector: @selector)
       assert_nil result[:tps]
       assert result[:ttft] < Float::INFINITY
+    end
+  end
+
+  def test_probe_provider_success_nil_tps_without_server_timing
+    now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    stub_streaming(first_token_time: now + 0.1, first_content_time: now + 0.1, last_content_time: now + 0.5, last_any_token_time: now + 0.5, usage_data: {"completion_tokens" => 50, "prompt_tokens" => 10}) do
+      result = ProbeManager.probe_provider(@provider_config, "/chat/completions", {}, "m", {}, timeouts: {open: 1, read: 1, write: 1}, logger: @logger, selector: @selector)
+      assert_nil result[:tps], "tps should be nil without server timing (no arrival-window fallback)"
+      assert result[:ttft] < Float::INFINITY
+    end
+  end
+
+  def test_probe_provider_server_ttft_preferred
+    now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    stub_streaming(first_token_time: now + 0.5, usage_data: {"completion_tokens" => 50, "completion_time" => 0.5}, perf_metrics: {"server-time-to-first-token" => 0.3}) do
+      result = ProbeManager.probe_provider(@provider_config, "/chat/completions", {}, "m", {}, timeouts: {open: 1, read: 1, write: 1}, logger: @logger, selector: @selector)
+      assert_in_delta 0.3, result[:ttft], 0.001, "server TTFT should win over arrival value"
+      assert result[:tps] && result[:tps] > 0
     end
   end
 
