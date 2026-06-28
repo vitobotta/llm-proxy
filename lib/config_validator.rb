@@ -162,6 +162,11 @@ module ConfigValidator
         errors << "metrics.tps_log.eval_window must be 1..86400 seconds (got #{n.inspect})"
       end
     end
+    if (n = config.dig("metrics", "tps_log", "min_tokens"))
+      if !n.is_a?(Integer) || n < 0 || n > 1_000_000
+        errors << "metrics.tps_log.min_tokens must be 0..1000000 (got #{n.inspect})"
+      end
+    end
 
     [errors, warnings]
   end

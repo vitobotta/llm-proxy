@@ -201,6 +201,7 @@ ConfigWatcher.start!(logger: LLMProxy.settings.logger, poll_interval: poll_inter
 TpsReporter.start!(logger: LLMProxy.settings.logger,
   interval: ConfigStore.tps_log_interval,
   activity_window: ConfigStore.tps_log_activity_window,
-  eval_window: ConfigStore.tps_log_eval_window)
+  eval_window: ConfigStore.tps_log_eval_window,
+  min_tokens: ConfigStore.tps_log_min_tokens)
 
 LLMProxy.run! if __FILE__ == $PROGRAM_NAME

@@ -142,3 +142,7 @@ performance:
 #     interval: 5          # How often to log (seconds, set 0 to disable)
 #     activity_window: 10  # Only log providers with activity in this window
 #     eval_window: 60      # Compute the metric over this window
+#     min_tokens: 500      # Suppress log lines until this many tokens have
+#                          # accumulated in the eval window. Short requests
+#                          # (5-15 tokens) produce TPS values dominated by
+#                          # TTFT, not decode throughput. Set 0 to disable.

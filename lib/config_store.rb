@@ -106,6 +106,7 @@ module ConfigStore
   def self.tps_log_interval = @data[:tps_log_interval]
   def self.tps_log_activity_window = @data[:tps_log_activity_window]
   def self.tps_log_eval_window = @data[:tps_log_eval_window]
+  def self.tps_log_min_tokens = @data[:tps_log_min_tokens]
 
   def self.model(name) = @data[:models][name]
   def self.selector(name) = @data[:selectors][name]
@@ -174,6 +175,7 @@ module ConfigStore
       tps_log_interval: raw.dig("metrics", "tps_log", "interval") || TpsReporter::DEFAULT_INTERVAL,
       tps_log_activity_window: raw.dig("metrics", "tps_log", "activity_window") || TpsReporter::DEFAULT_ACTIVITY_WINDOW,
       tps_log_eval_window: raw.dig("metrics", "tps_log", "eval_window") || TpsReporter::DEFAULT_EVAL_WINDOW,
+      tps_log_min_tokens: raw.dig("metrics", "tps_log", "min_tokens") || TpsReporter::DEFAULT_MIN_TOKENS,
     }
   end
 

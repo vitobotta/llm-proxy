@@ -8,6 +8,12 @@ class ProviderSelector
   DEFAULT_SAMPLE_WINDOW = 180
   MAX_SAMPLES = 100
   MIN_SAMPLES = 2
+  # Samples below this token count are excluded from median/p90 computation.
+  # Short requests (5-15 tokens) produce TPS values dominated by TTFT/prefill
+  # time, not decode throughput — they're noise that inflates the percentiles.
+  # The token-weighted aggregate already downweights them; this fixes the
+  # percentile computation which treats every sample equally.
+  PERCENTILE_MIN_TOKENS = 50
   HYSTERESIS = 0.1
 
   CIRCUIT_FAILURE_THRESHOLD = 3
@@ -253,6 +259,11 @@ class ProviderSelector
   # same per-sample TPS value, so they are directly comparable regardless
   # of which server-side timing source (vLLM total-time, Groq decode-only,
   # tokens_per_second, or the arrival-window fallback) produced it.
+  #
+  # Median and p90 exclude samples below PERCENTILE_MIN_TOKENS — short
+  # requests (5-15 tokens) produce TPS values dominated by TTFT/prefill
+  # time rather than decode throughput, which inflates the percentiles.
+  # The token-weighted aggregate already downweights them naturally.
   # Returns nil when there are no usable samples.
   def rolling_tps(provider_name, window: 60)
     @lock.synchronize do
@@ -261,7 +272,10 @@ class ProviderSelector
       samples = (@samples[provider_name] || []).select { |s| s[:timestamp] >= cutoff }
       next nil if samples.empty?
 
-      tps_values = samples.filter_map { |s| s[:tps] }.sort
+      # Percentiles computed only from samples with enough tokens that
+      # the TPS value reflects decode throughput, not TTFT noise.
+      percentile_samples = samples.select { |s| s[:tps] && (s[:tokens] || 0) >= PERCENTILE_MIN_TOKENS }
+      tps_values = percentile_samples.filter_map { |s| s[:tps] }.sort
       median = percentile(tps_values, 0.5)
       p90 = percentile(tps_values, 0.9)
 

@@ -402,14 +402,15 @@ class TestProviderSelector < Minitest::Test
   end
 
   def test_rolling_tps_aggregate_nil_without_tokens
-    # Samples without tokens still produce median/p90 but no aggregate.
+    # Samples without tokens produce no aggregate and no median/p90
+    # (percentiles require samples with >= PERCENTILE_MIN_TOKENS).
     selector.update_metrics("prov_a", 1.0, 100.0)
     selector.update_metrics("prov_a", 1.0, 200.0)
     m = selector.rolling_tps("prov_a", window: 60)
     refute_nil m
     assert_nil m[:aggregate]
-    assert_equal 100.0, m[:median]
-    assert_equal 200.0, m[:p90]
+    assert_nil m[:median]
+    assert_nil m[:p90]
     assert_equal 0, m[:total_tokens]
   end
 
@@ -423,8 +424,9 @@ class TestProviderSelector < Minitest::Test
   end
 
   def test_rolling_tps_median_and_p90
-    # 10 samples at tps 10,20,...,100
-    10.times { |i| selector.update_metrics("prov_a", 1.0, (i + 1) * 10.0, tokens: 10) }
+    # 10 samples at tps 10,20,...,100, each with enough tokens to pass
+    # the PERCENTILE_MIN_TOKENS filter for median/p90 computation.
+    10.times { |i| selector.update_metrics("prov_a", 1.0, (i + 1) * 10.0, tokens: 100) }
     m = selector.rolling_tps("prov_a", window: 60)
     refute_nil m
     # sorted: [10,20,...,100], p50 = ceil(10*0.5)=5th = 50, p90 = ceil(10*0.9)=9th = 90
@@ -457,5 +459,35 @@ class TestProviderSelector < Minitest::Test
     assert_equal 100.0, m[:aggregate]
     assert_equal 2, m[:n]
     assert_equal 100, m[:total_tokens]
+  end
+  def test_rolling_tps_percentile_filter_excludes_short_samples
+    # Short request (10 tokens, high TPS) should be excluded from
+    # median/p90 but still counted in n and total_tokens.
+    selector.update_metrics("prov_a", 1.0, 500.0, tokens: 10)
+    selector.update_metrics("prov_a", 1.0, 50.0, tokens: 200)
+    selector.update_metrics("prov_a", 1.0, 60.0, tokens: 300)
+    m = selector.rolling_tps("prov_a", window: 60)
+    refute_nil m
+    assert_equal 3, m[:n]
+    assert_equal 510, m[:total_tokens]
+    # median/p90 only from the 200+ token samples: [50.0, 60.0]
+    assert_equal 50.0, m[:median]
+    assert_equal 60.0, m[:p90]
+    # aggregate uses all token-bearing samples (token-weighted)
+    expected_agg = (500.0 * 10 + 50.0 * 200 + 60.0 * 300) / 510
+    assert_in_delta expected_agg, m[:aggregate], 0.1
+  end
+
+  def test_rolling_tps_all_samples_below_threshold
+    # All samples below PERCENTILE_MIN_TOKENS — aggregate still computed
+    # (token-weighted), but median/p90 are nil.
+    selector.update_metrics("prov_a", 1.0, 500.0, tokens: 10)
+    selector.update_metrics("prov_a", 1.0, 300.0, tokens: 20)
+    m = selector.rolling_tps("prov_a", window: 60)
+    refute_nil m
+    assert_equal 2, m[:n]
+    assert_nil m[:median]
+    assert_nil m[:p90]
+    refute_nil m[:aggregate], "aggregate should still be computed from token-weighted mean"
   end
 end

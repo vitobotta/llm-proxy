@@ -77,7 +77,7 @@ class TestTpsReporter < Minitest::Test
 
     stub_config_store(selector, model_config)
     TpsReporter.instance_variable_set(:@logger, @logger)
-    TpsReporter.report(activity_window: 10, eval_window: 60)
+    TpsReporter.report(activity_window: 10, eval_window: 60, min_tokens: 0)
 
     tps_lines = @logger.lines.select { |l| l.is_a?(String) && l.include?("[tps]") }
     assert_equal 1, tps_lines.length, "only active provider should be logged"
@@ -90,7 +90,7 @@ class TestTpsReporter < Minitest::Test
 
     stub_config_store(selector, {"name" => "test-model", "providers" => [{"provider" => "prov_a", "model" => "m-a", "primary" => true}]})
     TpsReporter.instance_variable_set(:@logger, @logger)
-    TpsReporter.report(activity_window: 10, eval_window: 60)
+    TpsReporter.report(activity_window: 10, eval_window: 60, min_tokens: 0)
 
     tps_lines = @logger.lines.select { |l| l.is_a?(String) && l.include?("[tps]") }
     refute_empty tps_lines
@@ -98,17 +98,47 @@ class TestTpsReporter < Minitest::Test
     refute tps_lines.first.include?("*"), "aggregate should not have fallback marker: #{tps_lines.first}"
   end
 
-  def test_report_uses_median_fallback_without_tokens
+  def test_report_includes_aggregate_with_min_tokens_zero
+    # With min_tokens: 0, the cumulative gate is disabled and even
+    # small token counts produce a log line.
     selector = make_selector_with_samples
-    selector.update_metrics("prov_a", 1.0, 100.0)  # no tokens/elapsed
+    selector.update_metrics("prov_a", 1.0, 100.0, tokens: 100)
 
     stub_config_store(selector, {"name" => "test-model", "providers" => [{"provider" => "prov_a", "model" => "m-a", "primary" => true}]})
     TpsReporter.instance_variable_set(:@logger, @logger)
-    TpsReporter.report(activity_window: 10, eval_window: 60)
+    TpsReporter.report(activity_window: 10, eval_window: 60, min_tokens: 0)
 
     tps_lines = @logger.lines.select { |l| l.is_a?(String) && l.include?("[tps]") }
     refute_empty tps_lines
-    assert tps_lines.first.include?("tps=100.0*"), "should use median with fallback marker: #{tps_lines.first}"
+    assert tps_lines.first.include?("tps=100.0"), "should include aggregate: #{tps_lines.first}"
+    refute tps_lines.first.include?("*"), "aggregate should not have fallback marker: #{tps_lines.first}"
+  end
+
+  def test_report_suppressed_below_min_tokens_threshold
+    # 100 tokens < default min_tokens (500), so no log line should be emitted.
+    selector = make_selector_with_samples
+    selector.update_metrics("prov_a", 1.0, 100.0, tokens: 100)
+
+    stub_config_store(selector, {"name" => "test-model", "providers" => [{"provider" => "prov_a", "model" => "m-a", "primary" => true}]})
+    TpsReporter.instance_variable_set(:@logger, @logger)
+    TpsReporter.report(activity_window: 10, eval_window: 60, min_tokens: 500)
+
+    tps_lines = @logger.lines.select { |l| l.is_a?(String) && l.include?("[tps]") }
+    assert_empty tps_lines, "should not log when total_tokens < min_tokens"
+  end
+
+  def test_report_logs_when_tokens_exceed_min_tokens_threshold
+    # 600 tokens >= min_tokens (500), so the log line should be emitted.
+    selector = make_selector_with_samples
+    selector.update_metrics("prov_a", 1.0, 100.0, tokens: 600)
+
+    stub_config_store(selector, {"name" => "test-model", "providers" => [{"provider" => "prov_a", "model" => "m-a", "primary" => true}]})
+    TpsReporter.instance_variable_set(:@logger, @logger)
+    TpsReporter.report(activity_window: 10, eval_window: 60, min_tokens: 500)
+
+    tps_lines = @logger.lines.select { |l| l.is_a?(String) && l.include?("[tps]") }
+    refute_empty tps_lines
+    assert tps_lines.first.include?("tokens=600"), "should log when total_tokens >= min_tokens: #{tps_lines.first}"
   end
 
   def test_log_line_format
