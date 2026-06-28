@@ -49,7 +49,7 @@ Every incoming request follows this path:
 - Scores providers by real **TTFT** (time to first token) and **TPS** (tokens per second) — not guesswork
 - **Auto-switches** to the fastest provider after background probes compare performance
 - **Circuit breaker** opens after 3 consecutive failures on a provider (60s cooldown), so bad providers are skipped until they recover
-- **Quota pause** — 429, 402, and 403 (with quota body patterns) responses pause the provider until the reset time given by `Retry-After`, `x-ratelimit-reset-*` headers, or the body. While paused, the provider is skipped and requests fall through to the next provider
+- **Quota pause** — 429, 402, and 403 (with quota body patterns) responses pause the provider until the reset time given by `Retry-After`, `x-ratelimit-reset-*` headers, structured JSON fields in the body, or human-readable durations parsed from the error message (e.g. "Resets in 1 day"). While paused, the provider is skipped and requests fall through to the next provider
 
 ### Resilience
 
@@ -69,6 +69,7 @@ Every incoming request follows this path:
 ### Observability
 
 - **Per-request streaming stats** — TTFT, content/thinking token counts, and tokens-per-second logged for every streaming response
+- **Periodic TPS logging** — a background thread prints a rolling TPS summary every 5 seconds for each provider with recent activity. The headline is a token-weighted aggregate (`sum(tokens*tps)/sum(tokens)`), with p50 and p90 for context. Short requests (< 50 tokens) are excluded from percentiles to avoid TTFT-dominated noise, and a cumulative token gate suppresses log lines until enough real generation has accumulated
 - **Prometheus `/metrics`** — request counts/durations, per-provider success/failure counters with a `reason` label, and a per-provider `upstream_ttft_seconds` histogram
 - **Structured JSON logs** — set `logging.format: json` to emit one JSON record per log line with `request_id` threaded through helper calls
 - **Per-provider detail endpoint** — `GET /v1/health/detail` returns per-model provider stats including active provider, TTFT/TPS metrics, quota pause state, and circuit breaker status
@@ -212,6 +213,20 @@ tracking:
 
 When `enabled: false` the proxy skips all chunk parsing — no string matching, no JSON inspection. Raw bytes pass straight through. TPS logging suppressed. Use this for pure transparent proxy with negligible CPU overhead.
 
+### Periodic TPS Logging
+
+```yaml
+metrics:
+  tps_log:
+    interval: 5          # How often to log (seconds, set 0 to disable)
+    activity_window: 10  # Only log providers with activity in this window
+    eval_window: 60      # Compute the metric over this window
+    min_tokens: 500      # Suppress log lines until this many tokens have
+                         # accumulated in the eval window. Set 0 to disable.
+```
+
+A background thread prints a rolling TPS summary for each provider with recent activity. The headline is a token-weighted aggregate (`sum(tokens*tps)/sum(tokens)`), with p50 and p90 for context. Short requests (< 50 tokens) are excluded from percentile computation to avoid TTFT-dominated noise inflating the distribution. The `min_tokens` gate suppresses log lines entirely until enough real generation has accumulated for the statistics to be meaningful.
+
 ### Performance
 
 ```yaml
@@ -225,7 +240,7 @@ performance:
   config_poll_interval: 2     # seconds between config.yaml change checks (set 0 to disable hot-reload)
 ```
 
-`ConfigValidator` rejects out-of-range values for `retries.max_attempts`, `retries.backoff_base`, `performance.probe_interval`, `performance.probe_max_per_minute`, `performance.sample_window`, `limits.max_request_body`, and `timeouts.{open,read,write}` at boot/reload, so a fat-fingered config can't silently DoS the proxy.
+`ConfigValidator` rejects out-of-range values for `retries.max_attempts`, `retries.backoff_base`, `retries.max_rounds`, `performance.probe_interval`, `performance.probe_max_per_minute`, `performance.sample_window`, `metrics.tps_log.{interval,activity_window,eval_window,min_tokens}`, `limits.max_request_body`, and `timeouts.{open,read,write}` at boot/reload, so a fat-fingered config can't silently DoS the proxy.
 
 ### Authentication (optional)
 
@@ -294,6 +309,17 @@ Every streaming request logs token statistics:
 - **content_tps** — content tokens per second (measured from first content token to last content token)
 - **thinking_tps** — thinking tokens per second (measured from first thinking token to last thinking token)
 - **total_tps** — completion tokens per second. Uses server-side timing when reported by the provider (in priority order: `usage.tokens_per_second`, Groq's `usage.completion_time`, Fireworks' `perf_metrics.generation-duration`, or the vLLM `: energy` comment's `duration_seconds`); falls back to the arrival-window estimate (first token to last of any kind) when no server timing is available
+
+In addition to per-request stats, a periodic TPS summary is logged every 5 seconds for each provider with recent activity:
+
+```
+[tps] glm-5/wafer tps=48.9 p50=47.2 p90=52.1 n=5 tokens=1240
+```
+
+- **tps** — token-weighted aggregate TPS (`sum(tokens*tps)/sum(tokens)`); marked with `*` when only the median is available (no token counts)
+- **p50** / **p90** — median and 90th percentile of per-sample TPS, computed only from samples with ≥ 50 tokens
+- **n** — number of samples in the eval window
+- **tokens** — total tokens generated across all samples in the window
 
 ## Docker Compose Reference
 
