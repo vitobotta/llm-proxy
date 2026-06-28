@@ -330,6 +330,7 @@ module HTTPSupport
         Thread.new do
           begin
             flush_pool!
+            TpsReporter.stop! if defined?(TpsReporter)
             selectors.each { |_, s| s.persist_active_index(logger: logger) }
             StatePersistence.save(logger: logger) if defined?(StatePersistence)
           rescue => e
@@ -342,6 +343,7 @@ module HTTPSupport
 
     at_exit do
       begin
+        TpsReporter.stop! if defined?(TpsReporter) && !$ERROR_INFO.is_a?(SystemExit)
         flush_pool!
         StatePersistence.save(logger: logger) if defined?(StatePersistence) && !$ERROR_INFO.is_a?(SystemExit)
       rescue => e

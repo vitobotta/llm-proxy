@@ -63,7 +63,7 @@ module RequestHandler
         log_prefix = "[#{@request_id}/#{model_name}/#{p_name}]"
         result = yield(provider_config, path, body, p_model, headers, log_prefix)
         if result&.dig(:success)
-          record_metrics(selector, p_name, result) if probing
+          record_metrics(selector, p_name, result)
           selector.record_success(p_name)
           Metrics.increment(:provider_success, labels: {provider: p_name, model: model_name})
           if result[:ttft]
@@ -122,7 +122,8 @@ module RequestHandler
 
   def record_metrics(selector, provider_name, result)
     tps = result[:total_tps] || result[:content_tps]
-    selector.update_metrics(provider_name, result[:ttft], tps) if result[:ttft]
+    selector.update_metrics(provider_name, result[:ttft], tps,
+      tokens: result[:completion_tokens]) if result[:ttft]
   end
 
   # Categorize a failure result into a stable Prometheus label.

@@ -147,6 +147,22 @@ module ConfigValidator
       end
     end
 
+    if (n = config.dig("metrics", "tps_log", "interval"))
+      if !n.is_a?(Integer) || n < 0 || n > 3600
+        errors << "metrics.tps_log.interval must be 0..3600 seconds (got #{n.inspect})"
+      end
+    end
+    if (n = config.dig("metrics", "tps_log", "activity_window"))
+      if !n.is_a?(Integer) || n < 1 || n > 3600
+        errors << "metrics.tps_log.activity_window must be 1..3600 seconds (got #{n.inspect})"
+      end
+    end
+    if (n = config.dig("metrics", "tps_log", "eval_window"))
+      if !n.is_a?(Integer) || n < 1 || n > 86_400
+        errors << "metrics.tps_log.eval_window must be 1..86400 seconds (got #{n.inspect})"
+      end
+    end
+
     [errors, warnings]
   end
 

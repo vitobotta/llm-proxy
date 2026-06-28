@@ -213,8 +213,8 @@ class FakeSelector
     @paused_names << name unless @paused_names.include?(name)
   end
 
-  def update_metrics(name, ttft, tps)
-    @metrics_updates << {name: name, ttft: ttft, tps: tps}
+  def update_metrics(name, ttft, tps, tokens: nil)
+    @metrics_updates << {name: name, ttft: ttft, tps: tps, tokens: tokens}
   end
 
   def record_and_maybe_probe(_interval)

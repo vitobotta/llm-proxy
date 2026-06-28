@@ -4,6 +4,7 @@ require "logger"
 require "yaml"
 require "date"
 require_relative "config_validator"
+require_relative "tps_reporter"
 
 module ConfigStore
   DEFAULT_CONFIG_PATH = File.join(File.dirname(__dir__), "config", "config.yaml")
@@ -102,6 +103,9 @@ module ConfigStore
   def self.backoff_base = @data[:backoff_base]
   def self.max_rounds = @data[:max_rounds]
   def self.quota_pause_default_seconds = @data[:quota_pause_default_seconds]
+  def self.tps_log_interval = @data[:tps_log_interval]
+  def self.tps_log_activity_window = @data[:tps_log_activity_window]
+  def self.tps_log_eval_window = @data[:tps_log_eval_window]
 
   def self.model(name) = @data[:models][name]
   def self.selector(name) = @data[:selectors][name]
@@ -167,6 +171,9 @@ module ConfigStore
       max_attempts: raw.dig("retries", "max_attempts") || 3,
       backoff_base: raw.dig("retries", "backoff_base") || 2,
       max_rounds: raw.dig("retries", "max_rounds") || 3,
+      tps_log_interval: raw.dig("metrics", "tps_log", "interval") || TpsReporter::DEFAULT_INTERVAL,
+      tps_log_activity_window: raw.dig("metrics", "tps_log", "activity_window") || TpsReporter::DEFAULT_ACTIVITY_WINDOW,
+      tps_log_eval_window: raw.dig("metrics", "tps_log", "eval_window") || TpsReporter::DEFAULT_EVAL_WINDOW,
     }
   end
 

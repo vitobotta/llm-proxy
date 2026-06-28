@@ -130,3 +130,15 @@ performance:
   probe_interval: 3           # Run background probe every N requests (only when probing_enabled)
   config_poll_interval: 2     # Seconds between config.yaml change checks (set 0 to disable hot-reload)
   quota_pause_default_seconds: 60  # Seconds to pause a provider after quota exhaustion when no reset time is available
+
+
+# Periodic TPS logging (background thread, not per-request)
+# Every `interval` seconds, logs a rolling TPS summary for each provider
+# that has seen at least one request in the last `activity_window` seconds.
+# Idle providers are skipped to avoid log spam. The metric is computed over
+# `eval_window` seconds (should be longer than `interval` for smoothing).
+# metrics:
+#   tps_log:
+#     interval: 5          # How often to log (seconds, set 0 to disable)
+#     activity_window: 10  # Only log providers with activity in this window
+#     eval_window: 60      # Compute the metric over this window

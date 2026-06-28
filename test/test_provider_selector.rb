@@ -383,4 +383,79 @@ class TestProviderSelector < Minitest::Test
     refute ordered.any? { |p| p["provider"] == "prov_a" }, "quota-paused provider should be excluded"
     assert_equal "prov_b", ordered.first["provider"]
   end
+
+  # --- rolling_tps tests ---
+
+  def test_rolling_tps_returns_nil_with_no_samples
+    assert_nil selector.rolling_tps("prov_a", window: 60)
+  end
+
+  def test_rolling_tps_token_weighted_aggregate
+    # Token-weighted mean of per-sample TPS: (100*100 + 200*200) / (100+200) = 166.67
+    selector.update_metrics("prov_a", 1.0, 100.0, tokens: 100)
+    selector.update_metrics("prov_a", 1.0, 200.0, tokens: 200)
+    m = selector.rolling_tps("prov_a", window: 60)
+    refute_nil m
+    assert_equal 2, m[:n]
+    assert_in_delta 166.7, m[:aggregate], 0.1
+    assert_equal 300, m[:total_tokens]
+  end
+
+  def test_rolling_tps_aggregate_nil_without_tokens
+    # Samples without tokens still produce median/p90 but no aggregate.
+    selector.update_metrics("prov_a", 1.0, 100.0)
+    selector.update_metrics("prov_a", 1.0, 200.0)
+    m = selector.rolling_tps("prov_a", window: 60)
+    refute_nil m
+    assert_nil m[:aggregate]
+    assert_equal 100.0, m[:median]
+    assert_equal 200.0, m[:p90]
+    assert_equal 0, m[:total_tokens]
+  end
+
+  def test_rolling_tps_window_filters_old_samples
+    selector.update_metrics("prov_a", 1.0, 100.0, tokens: 100)
+    # Backdate the sample beyond the eval window
+    samples = selector.instance_variable_get(:@samples)["prov_a"]
+    samples[0][:timestamp] = Time.now.to_f - 120
+    m = selector.rolling_tps("prov_a", window: 60)
+    assert_nil m
+  end
+
+  def test_rolling_tps_median_and_p90
+    # 10 samples at tps 10,20,...,100
+    10.times { |i| selector.update_metrics("prov_a", 1.0, (i + 1) * 10.0, tokens: 10) }
+    m = selector.rolling_tps("prov_a", window: 60)
+    refute_nil m
+    # sorted: [10,20,...,100], p50 = ceil(10*0.5)=5th = 50, p90 = ceil(10*0.9)=9th = 90
+    assert_equal 50.0, m[:median]
+    assert_equal 90.0, m[:p90]
+  end
+
+  def test_tps_active_true_within_window
+    selector.update_metrics("prov_a", 1.0, 50.0)
+    assert selector.tps_active?("prov_a", window: 10)
+  end
+
+  def test_tps_active_false_outside_window
+    selector.update_metrics("prov_a", 1.0, 50.0)
+    samples = selector.instance_variable_get(:@samples)["prov_a"]
+    samples[0][:timestamp] = Time.now.to_f - 20
+    refute selector.tps_active?("prov_a", window: 10)
+  end
+
+  def test_tps_active_false_with_no_samples
+    refute selector.tps_active?("prov_a", window: 10)
+  end
+
+  def test_rolling_tps_mixed_samples_some_without_tokens
+    # One sample with tokens, one without — aggregate uses only the first
+    selector.update_metrics("prov_a", 1.0, 100.0, tokens: 100)
+    selector.update_metrics("prov_a", 1.0, 200.0)
+    m = selector.rolling_tps("prov_a", window: 60)
+    refute_nil m
+    assert_equal 100.0, m[:aggregate]
+    assert_equal 2, m[:n]
+    assert_equal 100, m[:total_tokens]
+  end
 end

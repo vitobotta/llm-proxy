@@ -282,10 +282,10 @@ module Streaming
       log_parts << "total_tps=#{total_tps}" if total_tps&.positive?
 
       settings.logger.info("#{log_prefix} Success | #{log_parts.join(" ")}")
-      {success: true, content_tokens: tokens[:content], thinking_tokens: tokens[:thinking], ttft: ttft, content_tps: content_tps, thinking_tps: thinking_tps, total_tps: total_tps}
+      {success: true, content_tokens: tokens[:content], thinking_tokens: tokens[:thinking], ttft: ttft, content_tps: content_tps, thinking_tps: thinking_tps, total_tps: total_tps, completion_tokens: tokens[:completion]}
     else
       settings.logger.info("#{log_prefix} Success | ttft=#{ttft}s (no usage data from provider)")
-      {success: true, content_tokens: nil, thinking_tokens: nil, ttft: ttft, content_tps: nil, thinking_tps: nil}
+      {success: true, content_tokens: nil, thinking_tokens: nil, ttft: ttft, content_tps: nil, thinking_tps: nil, completion_tokens: nil}
     end
   end
 

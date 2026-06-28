@@ -112,7 +112,7 @@ class ProviderSelector
     end
   end
 
-  def update_metrics(provider_name, ttft, tps)
+  def update_metrics(provider_name, ttft, tps, tokens: nil)
     return unless ttft
     @lock.synchronize do
       now = Time.now.to_f
@@ -120,6 +120,7 @@ class ProviderSelector
       prune_stale_samples!(samples, now)
       sample = {ttft: ttft.to_f, timestamp: now}
       sample[:tps] = tps.to_f if tps
+      sample[:tokens] = tokens.to_i if tokens && tokens.to_i > 0
       samples << sample
       samples.shift if samples.length > MAX_SAMPLES
       @cached_ordered = nil
@@ -246,6 +247,43 @@ class ProviderSelector
     end
   end
 
+  # Token-weighted aggregate TPS over a rolling window. Each sample's
+  # weight is its token count, so a 10-token request can't dominate a
+  # 2000-token one. The aggregate, median, and p90 all derive from the
+  # same per-sample TPS value, so they are directly comparable regardless
+  # of which server-side timing source (vLLM total-time, Groq decode-only,
+  # tokens_per_second, or the arrival-window fallback) produced it.
+  # Returns nil when there are no usable samples.
+  def rolling_tps(provider_name, window: 60)
+    @lock.synchronize do
+      now = Time.now.to_f
+      cutoff = now - window
+      samples = (@samples[provider_name] || []).select { |s| s[:timestamp] >= cutoff }
+      next nil if samples.empty?
+
+      tps_values = samples.filter_map { |s| s[:tps] }.sort
+      median = percentile(tps_values, 0.5)
+      p90 = percentile(tps_values, 0.9)
+
+      weighted = samples.filter_map { |s| s[:tps] && s[:tokens] && s[:tokens] > 0 ? [s[:tps], s[:tokens]] : nil }
+      aggregate = weighted.empty? ? nil : weighted.sum { |tps, tok| tps * tok } / weighted.sum { |_tps, tok| tok }
+
+      total_tokens = samples.sum { |s| s[:tokens] || 0 }
+      {aggregate: aggregate&.round(1), median: median&.round(1), p90: p90&.round(1),
+       n: samples.length, total_tokens: total_tokens}
+    end
+  end
+
+  # True if a provider has recorded at least one sample within the last
+  # `window` seconds. Used by the periodic TPS logger to suppress idle
+  # providers so the log isn't flooded with no-op lines.
+  def tps_active?(provider_name, window: 10)
+    @lock.synchronize do
+      cutoff = Time.now.to_f - window
+      (@samples[provider_name] || []).any? { |s| s[:timestamp] >= cutoff }
+    end
+  end
+
   def circuit_states
     @lock.synchronize do
       @circuits.transform_values do |c|
@@ -361,6 +399,7 @@ class ProviderSelector
   def sample_to_hash(sample)
     h = {"ttft" => sample[:ttft], "ts" => sample[:timestamp]}
     h["tps"] = sample[:tps] if sample[:tps]
+    h["tokens"] = sample[:tokens] if sample[:tokens]
     h
   end
 
@@ -370,6 +409,7 @@ class ProviderSelector
     return nil if now - ts > @sample_window
     sample = {ttft: hash["ttft"].to_f, timestamp: ts}
     sample[:tps] = hash["tps"].to_f if hash["tps"]
+    sample[:tokens] = hash["tokens"].to_i if hash["tokens"]
     sample
   end
 
@@ -443,5 +483,17 @@ class ProviderSelector
     tps_score = [tps / TPS_REFERENCE, 3.0].min
 
     ttft_score * TTFT_WEIGHT + tps_score * TPS_WEIGHT
+  end
+
+  # Nearest-rank percentile of a pre-sorted array. Returns nil for empty
+  # input. Uses ceil(n*p) so P50 of [1,2,3] picks index 1 (value 2), and
+  # P90 of a 10-element array picks index 8 — conservative with small n.
+  def percentile(sorted_values, p)
+    return nil if sorted_values.empty?
+    n = sorted_values.length
+    rank = (n * p).ceil
+    rank = 1 if rank < 1
+    rank = n if rank > n
+    sorted_values[rank - 1]
   end
 end

@@ -18,6 +18,7 @@ require_relative "lib/state_persistence"
 require_relative "lib/probe_manager"
 require_relative "lib/request_handler"
 require_relative "lib/metrics"
+require_relative "lib/tps_reporter"
 require_relative "provider_selector"
 require_relative "lib/routes/completions"
 require_relative "lib/routes/admin"
@@ -196,5 +197,10 @@ HTTPSupport.setup_graceful_shutdown!(LLMProxy.settings.logger, ConfigStore.selec
 
 poll_interval = RAW_CONFIG.dig("performance", "config_poll_interval") || 2
 ConfigWatcher.start!(logger: LLMProxy.settings.logger, poll_interval: poll_interval) if poll_interval > 0
+
+TpsReporter.start!(logger: LLMProxy.settings.logger,
+  interval: ConfigStore.tps_log_interval,
+  activity_window: ConfigStore.tps_log_activity_window,
+  eval_window: ConfigStore.tps_log_eval_window)
 
 LLMProxy.run! if __FILE__ == $PROGRAM_NAME
