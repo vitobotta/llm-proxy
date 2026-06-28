@@ -132,6 +132,73 @@ class TestExtractResetTime < Minitest::Test
     result = HTTPSupport.extract_reset_time(r, nil, 429, default_seconds: 60)
     assert_in_delta now + 60, result, 1.0, "nil body should fall back to default"
   end
+
+  def test_extract_from_text_resets_in_days
+    body = JSON.generate({"error" => {"message" => "Monthly usage limit reached. Resets in 1 day."}})
+    r = make_response(body: body)
+    now = Time.now.to_f
+    result = HTTPSupport.extract_reset_time(r, body, 429, default_seconds: 60)
+    assert_in_delta now + 86400, result, 2.0, "should parse 'Resets in 1 day' from error message"
+  end
+
+  def test_extract_from_text_resets_in_hours
+    body = JSON.generate({"error" => {"message" => "Rate limit exceeded. Resets in 2 hours."}})
+    r = make_response(body: body)
+    now = Time.now.to_f
+    result = HTTPSupport.extract_reset_time(r, body, 429, default_seconds: 60)
+    assert_in_delta now + 7200, result, 2.0, "should parse 'Resets in 2 hours' from error message"
+  end
+
+  def test_extract_from_text_retry_in_minutes
+    body = JSON.generate({"error" => {"message" => "retry in 30 minutes"}})
+    r = make_response(body: body)
+    now = Time.now.to_f
+    result = HTTPSupport.extract_reset_time(r, body, 429, default_seconds: 60)
+    assert_in_delta now + 1800, result, 2.0, "should parse 'retry in 30 minutes' from error message"
+  end
+
+  def test_extract_from_text_plain_body
+    body = "Usage limit reached. Resets in 12 hours. Please upgrade."
+    r = make_response(body: body)
+    now = Time.now.to_f
+    result = HTTPSupport.extract_reset_time(r, body, 429, default_seconds: 60)
+    assert_in_delta now + 43200, result, 2.0, "should parse 'Resets in 12 hours' from plain text body"
+  end
+
+  def test_extract_from_text_top_level_message
+    body = JSON.generate({"message" => "Available in 45 minutes"})
+    r = make_response(body: body)
+    now = Time.now.to_f
+    result = HTTPSupport.extract_reset_time(r, body, 429, default_seconds: 60)
+    assert_in_delta now + 2700, result, 2.0, "should parse from top-level message field"
+  end
+
+  def test_extract_from_text_no_match_falls_back
+    body = JSON.generate({"error" => {"message" => "Something went wrong"}})
+    r = make_response(body: body)
+    now = Time.now.to_f
+    result = HTTPSupport.extract_reset_time(r, body, 429, default_seconds: 60)
+    assert_in_delta now + 60, result, 1.0, "no duration text should fall back to default"
+  end
+
+  def test_retry_after_header_not_capped_at_60
+    # MAX_RETRY_AFTER was raised from 60 to 86400 to allow monthly quota
+    # pauses from Retry-After headers, not just transient rate limits.
+    r = make_response(body: "", headers: {"Retry-After" => "3600"})
+    now = Time.now.to_f
+    result = HTTPSupport.extract_reset_time(r, "", 429, default_seconds: 60)
+    assert_in_delta now + 3600, result, 2.0, "Retry-After of 3600s should not be capped at 60"
+  end
+
+  def test_parse_duration_from_text_variants
+    assert_equal 86400, HTTPSupport.parse_duration_from_text("Resets in 1 day")
+    assert_equal 86400, HTTPSupport.parse_duration_from_text("resets in 1 days")
+    assert_equal 3600, HTTPSupport.parse_duration_from_text("retry in 1 hour")
+    assert_equal 1800, HTTPSupport.parse_duration_from_text("try again in 30 minutes")
+    assert_equal 45, HTTPSupport.parse_duration_from_text("available in 45 seconds")
+    assert_nil HTTPSupport.parse_duration_from_text("no duration here")
+    assert_nil HTTPSupport.parse_duration_from_text(nil)
+  end
 end
 
 class TestProviderSelectorQuotaPause < Minitest::Test

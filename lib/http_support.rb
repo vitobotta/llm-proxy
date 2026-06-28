@@ -40,7 +40,7 @@ module HTTPSupport
   TIMEOUT_EXCEPTIONS = [Net::OpenTimeout, Net::ReadTimeout, Net::WriteTimeout].freeze
 
   MAX_EOF_RETRIES = 2
-  MAX_RETRY_AFTER = 60
+  MAX_RETRY_AFTER = 86400
   KEEP_ALIVE_TIMEOUT = 30
   MAX_UPSTREAM_BODY_SIZE = 5 * 1024 * 1024
   JITTER_FACTOR = 0.5
@@ -138,6 +138,33 @@ module HTTPSupport
     extract_reset_time_from_body(body, default_seconds: default_seconds)
   end
 
+  RESET_TEXT_PATTERNS = [
+    /resets?\s+in\s+(\d+)\s*(day|hour|minute|second)s?/i,
+    /retry\s+in\s+(\d+)\s*(day|hour|minute|second)s?/i,
+    /try\s+again\s+in\s+(\d+)\s*(day|hour|minute|second)s?/i,
+    /available\s+in\s+(\d+)\s*(day|hour|minute|second)s?/i
+  ].freeze
+
+  RESET_UNIT_SECONDS = {
+    "second" => 1,
+    "minute" => 60,
+    "hour" => 3600,
+    "day" => 86400
+  }.freeze
+
+  # Parse a human-readable duration from an error message (e.g. "Resets
+  # in 1 day", "retry in 30 minutes"). Returns the delay in seconds, or
+  # nil if no pattern matches. Provider rate-limit messages often embed
+  # the reset time in prose rather than a structured JSON field.
+  def self.parse_duration_from_text(text)
+    return nil unless text
+    RESET_TEXT_PATTERNS.each do |pat|
+      m = text.match(pat)
+      return m[1].to_i * RESET_UNIT_SECONDS[m[2].downcase] if m && RESET_UNIT_SECONDS[m[2].downcase]
+    end
+    nil
+  end
+
   def self.extract_reset_time_from_body(body, default_seconds:)
     parsed = nil
     begin
@@ -179,8 +206,27 @@ module HTTPSupport
             return Time.now.to_f + v.to_f / 1000.0 if v.respond_to?(:to_f)
           end
         end
+
+        # Parse human-readable duration from error message text.
+        # Many providers embed the reset time in the message string
+        # rather than a structured field: "Monthly usage limit reached.
+        # Resets in 1 day."
+        msg = err["message"]
+        if msg.is_a?(String)
+          delay = parse_duration_from_text(msg)
+          return Time.now.to_f + delay if delay && delay > 0
+        end
+      end
+
+      top_msg = parsed["message"]
+      if top_msg.is_a?(String)
+        delay = parse_duration_from_text(top_msg)
+        return Time.now.to_f + delay if delay && delay > 0
       end
     end
+
+    text_delay = parse_duration_from_text(body.to_s)
+    return Time.now.to_f + text_delay if text_delay && text_delay > 0
 
     Time.now.to_f + default_seconds
   end
