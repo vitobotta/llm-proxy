@@ -262,7 +262,7 @@ module RequestHandler
 
   def forward_chunk_to_client(out, chunk)
     out << chunk
-  rescue Errno::EPIPE, IOError
+  rescue Errno::EPIPE, IOError, Puma::ConnectionError
     raise HTTPSupport::ClientDisconnected
   end
 end

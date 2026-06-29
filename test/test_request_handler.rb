@@ -513,6 +513,14 @@ class ForwardChunkTest < Minitest::Test
       HandlerTestApp.new.forward_chunk_to_client(broken, "data")
     end
   end
+
+  def test_forward_chunk_raises_client_disconnected_on_puma_connection_error
+    broken = Object.new
+    broken.define_singleton_method(:<<) { |_| raise Puma::ConnectionError, "Socket timeout writing data" }
+    assert_raises(HTTPSupport::ClientDisconnected) do
+      HandlerTestApp.new.forward_chunk_to_client(broken, "data")
+    end
+  end
 end
 
 class RecordMetricsTest < Minitest::Test
