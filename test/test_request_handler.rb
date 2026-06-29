@@ -489,6 +489,29 @@ class RoundLoopTest < Minitest::Test
     assert result[:success]
     assert_equal 1, call_count, "should stop after first success"
   end
+
+  # Single provider, real ProviderSelector: the circuit opens after the first
+  # failure (threshold 1). The last-resort path in ordered_providers must keep
+  # returning the provider so the loop retries across all 3 rounds instead of
+  # aborting with "No providers available". Without the fix, round 2's
+  # ordered_providers returns [] and the loop stops after 1 attempt.
+  def test_single_provider_retries_after_circuit_open_real_selector
+    real_selector = ProviderSelector.new("test-model", [make_provider("solo")],
+      model_config: @model_entry,
+      circuit_failure_threshold: 1, circuit_cooldown: 600)
+    ConfigStore.instance_variable_get(:@data)[:selectors]["test-model"] = real_selector
+
+    call_count = 0
+    result = @app.with_auto_select(model: @model_entry, model_name: "test-model", path: "/chat/completions", body: {}, headers: {}) do
+      call_count += 1
+      # Fails rounds 1 and 2 (calls 1, 2), succeeds on round 3 (call 3).
+      {success: call_count >= 3}
+    end
+
+    assert result[:success], "single provider should retry across all rounds even with circuit open"
+    assert_equal 3, call_count, "should make 3 attempts (1 per round × 3 rounds), not abort after round 1"
+  end
+
 end
 
 class ForwardChunkTest < Minitest::Test

@@ -384,6 +384,38 @@ class TestProviderSelector < Minitest::Test
     assert_equal "prov_b", ordered.first["provider"]
   end
 
+  # Last resort: a single provider whose circuit is open is still returned
+  # (no alternative to fall back to) so the request loop keeps retrying.
+  def test_ordered_providers_last_resort_single_provider_circuit_open
+    providers = [
+      {"provider" => "solo", "model" => "m", "base_url" => "https://solo.example.com/v1", "api_key" => "k"}
+    ]
+    model_config = {"name" => "test-model", "providers" => [{"provider" => "solo", "primary" => true}]}
+    s = ProviderSelector.new("test-model", providers, model_config: model_config,
+      circuit_failure_threshold: 1, circuit_cooldown: 600)
+
+    s.record_failure("solo")
+
+    ordered = s.ordered_providers
+    assert_equal 1, ordered.length, "last-resort must still return the only provider"
+    assert_equal "solo", ordered.first["provider"]
+  end
+
+  # Last resort: when every provider is circuit-broken (no healthy alternative),
+  # ordered_providers returns all providers, active first (rotate order).
+  def test_ordered_providers_last_resort_all_circuit_open
+    s = ProviderSelector.new("test-model", @providers, model_config: @model_config,
+      circuit_failure_threshold: 1, circuit_cooldown: 600)
+
+    s.record_failure("prov_a")
+    s.record_failure("prov_b")
+
+    ordered = s.ordered_providers
+    assert_equal 2, ordered.length, "last-resort must return both providers when no alternative exists"
+    assert_equal "prov_a", ordered.first["provider"], "active provider should come first"
+    assert_equal ["prov_a", "prov_b"], ordered.map { |p| p["provider"] }
+  end
+
   # --- rolling_tps tests ---
 
   def test_rolling_tps_returns_nil_with_no_samples

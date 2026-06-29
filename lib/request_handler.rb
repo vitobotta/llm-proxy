@@ -23,7 +23,7 @@ module RequestHandler
       providers = selector.ordered_providers(auto_switch: auto_switch)
 
       if providers.empty?
-        settings.logger.info("[#{@request_id}/#{model_name}] No providers available for round #{round + 1}/#{max_rounds}, stopping")
+        settings.logger.warn("[#{@request_id}/#{model_name}] No providers configured for model, aborting")
         break
       end
 

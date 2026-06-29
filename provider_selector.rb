@@ -86,7 +86,16 @@ class ProviderSelector
         if check_circuit_open(active["provider"]) || check_quota_paused(active["provider"])
           available = @providers.reject { |p| check_circuit_open(p["provider"]) || check_quota_paused(p["provider"]) }
           available = available.sort_by { |p| -score_provider(p["provider"]) } if auto_switch && available.length > 1
-          available
+          if available.empty?
+            # Last resort: every provider is circuit-broken or quota-paused, but
+            # there is no alternative. Return all providers (active first) so the
+            # request loop keeps retrying instead of aborting with "No providers
+            # available". Circuit/quota state is still tracked; this only avoids a
+            # hard stop when there is nothing to fall back to.
+            @providers.rotate(@active_index)
+          else
+            available
+          end
         else
           others = @providers.reject.with_index { |_, i| i == @active_index }
             .reject { |p| check_circuit_open(p["provider"]) }
