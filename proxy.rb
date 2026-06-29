@@ -89,6 +89,11 @@ class LLMProxy < Sinatra::Base
   ConfigStore.load!(RAW_CONFIG, logger: BOOT_LOGGER)
   ConfigStore.register_app!(self)
 
+  if ENV.fetch("RACK_ENV", "development") == "production" && !ConfigStore.auth_token
+    BOOT_LOGGER.error("[BOOT] auth.token must be set in production. Refusing to start.")
+    exit(78)
+  end
+
   begin
     StatePersistence.restore!(logger: BOOT_LOGGER)
   rescue => e
@@ -102,11 +107,19 @@ class LLMProxy < Sinatra::Base
     Thread.current[:request_id] = @request_id
     settings.logger.info("[#{@request_id}] #{request.request_method} #{request.path} from #{@client_ip}")
 
+    if HTTPSupport.shutting_down?
+      halt json_error(status: 503, message: "Server is shutting down", type: "server_error")
+    end
+    HTTPSupport.in_flight_increment!
+
     auth_token = ConfigStore.auth_token
     if auth_token && requires_auth?(request.path)
       auth_header = request.env["HTTP_AUTHORIZATION"].to_s
-      token = auth_header.start_with?("Bearer ") ? auth_header[7..] : auth_header
-      unless token && Rack::Utils.secure_compare(token, auth_token)
+      unless auth_header.start_with?("Bearer ")
+        halt json_error(status: 401, message: "Unauthorized — expected Bearer token", type: "authentication_error")
+      end
+      token = auth_header[7..]
+      unless token && !token.empty? && Rack::Utils.secure_compare(token, auth_token)
         halt json_error(status: 401, message: "Unauthorized", type: "authentication_error")
       end
     end
@@ -114,20 +127,37 @@ class LLMProxy < Sinatra::Base
 
   def requires_auth?(path)
     # /health is always public so load balancers can probe.
-    # /metrics is public by default; if auth.metrics_token is set,
-    # it is gated separately below via metrics_token_required!
+    # /metrics is gated by its own metrics_token_required! — if no
+    # metrics_token is set, it falls through to the main auth.token.
     return false if path == "/health"
-    return false if path == "/metrics"
+    return false if path == "/metrics" && ConfigStore.metrics_token
     true
   end
 
   def metrics_token_required!
     token = ConfigStore.metrics_token
-    return unless token
-    auth_header = request.env["HTTP_AUTHORIZATION"].to_s
-    provided = auth_header.start_with?("Bearer ") ? auth_header[7..] : auth_header
-    unless provided && Rack::Utils.secure_compare(provided, token)
-      halt json_error(status: 401, message: "Unauthorized", type: "authentication_error")
+    if token
+      auth_header = request.env["HTTP_AUTHORIZATION"].to_s
+      unless auth_header.start_with?("Bearer ")
+        halt json_error(status: 401, message: "Unauthorized — expected Bearer token", type: "authentication_error")
+      end
+      provided = auth_header[7..]
+      unless provided && !provided.empty? && Rack::Utils.secure_compare(provided, token)
+        halt json_error(status: 401, message: "Unauthorized", type: "authentication_error")
+      end
+    else
+      # No separate metrics token — fall back to the main auth.token.
+      # If auth.token is also unset, the before hook already skipped auth.
+      auth_token = ConfigStore.auth_token
+      return unless auth_token
+      auth_header = request.env["HTTP_AUTHORIZATION"].to_s
+      unless auth_header.start_with?("Bearer ")
+        halt json_error(status: 401, message: "Unauthorized — expected Bearer token", type: "authentication_error")
+      end
+      provided = auth_header[7..]
+      unless provided && !provided.empty? && Rack::Utils.secure_compare(provided, auth_token)
+        halt json_error(status: 401, message: "Unauthorized", type: "authentication_error")
+      end
     end
   end
 
@@ -137,6 +167,7 @@ class LLMProxy < Sinatra::Base
     Metrics.increment(:requests_total, labels: {status: response.status})
     Metrics.observe(:request_duration_seconds, elapsed)
     Thread.current[:request_id] = nil
+    HTTPSupport.in_flight_decrement!
   end
 
   def json_error(status:, message:, detail: nil, type: "proxy_error")
@@ -148,9 +179,19 @@ class LLMProxy < Sinatra::Base
 
   def parse_request(allowed_headers: ["Authorization", "OpenAI-Organization", "OpenAI-Beta"])
     max_body_size = ConfigStore.max_body_size
-    body_raw = request.body.read
-    if body_raw.bytesize > max_body_size
+    cl = request.env["CONTENT_LENGTH"]&.to_i
+    if cl && cl > max_body_size
       halt json_error(status: 413, message: "Request body too large (max #{max_body_size / 1024 / 1024}MB)", type: "request_too_large")
+    end
+
+    # Read the body in bounded chunks so a client can't OOM the proxy
+    # by streaming a huge body past the size check.
+    body_raw = +""
+    while (chunk = request.body.read(65536))
+      body_raw << chunk
+      if body_raw.bytesize > max_body_size
+        halt json_error(status: 413, message: "Request body too large (max #{max_body_size / 1024 / 1024}MB)", type: "request_too_large")
+      end
     end
     body = JSON.parse(body_raw)
 
@@ -188,7 +229,7 @@ class LLMProxy < Sinatra::Base
       settings.logger.error(e.backtrace.first(20).join("\n"))
       settings.logger.debug(e.backtrace.join("\n"))
     end
-    json_error(status: 500, message: "Internal server error", detail: e.message, type: "internal_error")
+    json_error(status: 500, message: "Internal server error", detail: "request_id=#{@request_id}", type: "internal_error")
   end
 end
 

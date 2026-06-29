@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require_relative "test_helper"
+require_relative "../lib/config_store"
 require_relative "../lib/tps_reporter"
 
 # Capturing logger that appends to a shared array. Defined at top level so
@@ -58,8 +59,15 @@ class TestTpsReporter < Minitest::Test
   end
 
   def stub_config_store(selector, model_config)
-    ConfigStore.define_singleton_method(:selectors) { {"test-model" => selector} }
-    ConfigStore.define_singleton_method(:models) { {"test-model" => model_config} }
+    # Set @data directly so the real ConfigStore.snapshot/Selectors/models
+    # accessors return the test's data.  Using define_singleton_method
+    # here would permanently override the real methods and leak into
+    # other test classes (e.g. WithAutoSelectTest) when the full suite
+    # runs in random order.
+    ConfigStore.instance_variable_set(:@data, {
+      selectors: {"test-model" => selector},
+      models: {"test-model" => model_config}
+    })
   end
 
   def test_report_skips_idle_providers

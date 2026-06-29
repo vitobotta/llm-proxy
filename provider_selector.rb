@@ -32,17 +32,22 @@ class ProviderSelector
 
   def self.persist_active_provider(model_name, provider_index, logger: nil)
     CONFIG_LOCK.synchronize do
-      raw = defined?(ConfigStore) ? ConfigStore.load_yaml_file(config_path) : YAML.safe_load_file(config_path, permitted_classes: [Symbol, Date, Time], aliases: true)
+      raw = defined?(ConfigStore) ? ConfigStore.load_yaml_file(config_path) : YAML.safe_load_file(config_path, permitted_classes: [Symbol, Date, Time])
       model_entry = raw["models"].find { |m| m["name"] == model_name }
       return unless model_entry && model_entry["providers"]
 
       model_entry["providers"].each { |p| p.delete("primary") }
       model_entry["providers"][provider_index]["primary"] = true
 
-      ConfigWatcher.expecting_write! if defined?(ConfigWatcher)
+      yaml_content = YAML.dump(raw)
+      # Compute the hash of the exact content being written so the config
+      # watcher can recognise our own write and skip the reload. Capturing
+      # the pre-write file hash (the old approach) never matched the
+      # post-write file hash, causing a spurious reload on every write.
+      ConfigWatcher.expecting_write!(yaml_content) if defined?(ConfigWatcher)
       tmp = "#{config_path}.tmp.#{Process.pid}"
       File.open(tmp, File::WRONLY | File::CREAT | File::TRUNC) do |f|
-        f.write(YAML.dump(raw))
+        f.write(yaml_content)
         f.fsync
       end
       File.rename(tmp, config_path)
@@ -81,6 +86,15 @@ class ProviderSelector
 
   def ordered_providers(auto_switch: true)
     @lock.synchronize do
+      # Check if any cached exclusions (circuit-broken or quota-paused) have
+      # expired since the cache was built. If so, invalidate and rebuild so
+      # recovered providers are included.
+      if @cached_ordered
+        now = Time.now.to_f
+        expired = @circuits.any? { |_, c| c.opened_at && now - c.opened_at > @circuit_cooldown } ||
+                  @quota_pauses.any? { |_, qp| qp.paused_until && now >= qp.paused_until }
+        @cached_ordered = nil if expired
+      end
       @cached_ordered ||= begin
         active = @providers[@active_index]
         if check_circuit_open(active["provider"]) || check_quota_paused(active["provider"])
@@ -143,10 +157,7 @@ class ProviderSelector
   end
 
   def evaluate_and_select(logger, auto_switch: true)
-    best_index = nil
-    best_avg = nil
-    active_avg = nil
-    old_name = nil
+    switch_info = nil
 
     @lock.synchronize do
       scored = @providers.each_with_index.map do |p, i|
@@ -174,12 +185,19 @@ class ProviderSelector
         if auto_switch
           @active_index = best_index
           @cached_ordered = nil
-          logger.info("[#{@model_name}] Switched to #{new_name} (avg_ttft=#{best_avg[:avg_ttft].round(3)}s, avg_tps=#{best_avg[:avg_tps].round(1)}, n=#{best_avg[:sample_count]}) from #{old_name} (avg_ttft=#{active_avg&.dig(:avg_ttft)&.round(3)}s, avg_tps=#{active_avg&.dig(:avg_tps)&.round(1)}, n=#{active_avg&.dig(:sample_count)})")
-          StatePersistence.save(logger: logger) if defined?(StatePersistence)
+          switch_info = {new_name: new_name, old_name: old_name, best_avg: best_avg, active_avg: active_avg}
         else
           logger.info("[#{@model_name}] Suggest switch to #{new_name} (avg_ttft=#{best_avg[:avg_ttft].round(3)}s, avg_tps=#{best_avg[:avg_tps].round(1)}, n=#{best_avg[:sample_count]}) from #{old_name} (avg_ttft=#{active_avg&.dig(:avg_ttft)&.round(3)}s, avg_tps=#{active_avg&.dig(:avg_tps)&.round(1)}, n=#{active_avg&.dig(:sample_count)})")
         end
       end
+    end
+
+    # Log and persist OUTSIDE the lock to avoid self-deadlock:
+    # StatePersistence.save → build_state → to_state re-acquires @lock.
+    if switch_info
+      sa = switch_info[:active_avg]
+      logger.info("[#{@model_name}] Switched to #{switch_info[:new_name]} (avg_ttft=#{switch_info[:best_avg][:avg_ttft].round(3)}s, avg_tps=#{switch_info[:best_avg][:avg_tps].round(1)}, n=#{switch_info[:best_avg][:sample_count]}) from #{switch_info[:old_name]} (avg_ttft=#{sa&.dig(:avg_ttft)&.round(3)}s, avg_tps=#{sa&.dig(:avg_tps)&.round(1)}, n=#{sa&.dig(:sample_count)})")
+      StatePersistence.save(logger: logger) if defined?(StatePersistence)
     end
   end
 
@@ -198,7 +216,11 @@ class ProviderSelector
       circuit = @circuits[provider_name]
       return unless circuit
       circuit.failures += 1
-      if circuit.failures >= @circuit_failure_threshold
+      # Only open the circuit (and stamp opened_at) on the first crossing of
+      # the threshold — not on every subsequent failure, which would reset
+      # the cooldown timer and keep the circuit open indefinitely under
+      # sustained failures.
+      if circuit.failures >= @circuit_failure_threshold && !circuit.opened_at
         circuit.opened_at = Time.now.to_f
         @cached_ordered = nil
       end
@@ -209,8 +231,12 @@ class ProviderSelector
     @lock.synchronize do
       qp = @quota_pauses[provider_name]
       return unless qp
+      # Only update the reason if the new pause extends the existing one —
+      # a shorter pause shouldn't overwrite the reason from a longer pause.
+      if reason && paused_until >= (qp.paused_until || 0)
+        qp.reason = reason
+      end
       qp.paused_until = [qp.paused_until || 0, paused_until].max
-      qp.reason = reason if reason
       @cached_ordered = nil
     end
   end
@@ -235,6 +261,10 @@ class ProviderSelector
       @last_success_at[provider_name] = Time.now.to_f
       circuit = @circuits[provider_name]
       return unless circuit
+      # Invalidate cache if the circuit was open — it's now closed.
+      if circuit.opened_at
+        @cached_ordered = nil
+      end
       circuit.failures = 0
       circuit.opened_at = nil
     end
@@ -451,6 +481,7 @@ class ProviderSelector
     if now - circuit.opened_at > @circuit_cooldown
       circuit.opened_at = nil
       circuit.failures = 0
+      @cached_ordered = nil
       false
     else
       true
@@ -465,6 +496,7 @@ class ProviderSelector
     if now >= qp.paused_until
       qp.paused_until = nil
       qp.reason = nil
+      @cached_ordered = nil
       false
     else
       true

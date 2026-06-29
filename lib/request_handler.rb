@@ -2,12 +2,13 @@
 
 module RequestHandler
   def with_auto_select(model:, model_name:, path:, body:, headers:)
-    selector = ConfigStore.selector(model_name)
-    model_entry = ConfigStore.model(model_name)
+    snap = ConfigStore.snapshot
+    selector = snap[:selectors][model_name]
+    model_entry = snap[:models][model_name]
 
     probing = model_entry&.dig("probing_enabled") != false
     auto_switch = model_entry&.dig("auto_switch") == true
-    probe_interval = model_entry&.dig("probe_interval") || ConfigStore.probe_interval
+    probe_interval = model_entry&.dig("probe_interval") || snap[:probe_interval] || 3
 
     deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + REQUEST_DEADLINE
     max_rounds = settings.max_rounds || 3
@@ -61,7 +62,8 @@ module RequestHandler
         end
 
         log_prefix = "[#{@request_id}/#{model_name}/#{p_name}]"
-        result = yield(provider_config, path, body, p_model, headers, log_prefix)
+        remaining = [deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC), 1].max
+        result = yield(provider_config, path, body, p_model, headers, log_prefix, remaining)
         if result&.dig(:success)
           record_metrics(selector, p_name, result)
           selector.record_success(p_name)
@@ -115,7 +117,7 @@ module RequestHandler
     {
       success: false,
       error: "#{msg}: #{summary_lines.join("; ")}",
-      detail: {attempts: attempts, deadline_hit: deadline_hit},
+      detail: {attempts: attempts.map { |a| {provider: a[:provider], status: a[:status], reason: a[:reason]} }, deadline_hit: deadline_hit},
       status: fallback_status
     }
   end
@@ -146,14 +148,20 @@ module RequestHandler
   end
 
   MAX_ACCUMULATED_SIZE = 512 * 1024
+  ACCUMULATED_TAIL_SIZE = 64 * 1024
   REQUEST_DEADLINE = 600
-  def try_stream(provider_config, path, body, body_model, incoming_headers, out:, log_prefix:)
+  def try_stream(provider_config, path, body, body_model, incoming_headers, out:, log_prefix:, deadline_remaining: nil)
     uri, request = HTTPSupport.build_upstream_request(provider_config, path, body, body_model, incoming_headers, stream: true)
 
     try_with_retries(log_prefix: log_prefix, body_model: body_model) do
-      http = HTTPSupport.create_http(uri, timeouts: ConfigStore.timeouts)
+      timeouts = ConfigStore.timeouts
+      if deadline_remaining
+        timeouts = timeouts.merge(read: [timeouts[:read], deadline_remaining].min)
+      end
+      http = HTTPSupport.create_http(uri, timeouts: timeouts)
       http.start unless http.started?
       pooled = true
+      streamed_any = false
 
       timers = Streaming::TimerTracker.new
       usage_data = nil
@@ -169,15 +177,19 @@ module RequestHandler
             if tracking
               usage_data, perf_metrics, server_duration = Streaming.consume_stream(response, tracker: timers) do |chunk, cr, _now|
                 forward_chunk_to_client(out, chunk)
+                streamed_any = true
                 if accumulated
                   accumulated << chunk
-                  accumulated = nil if accumulated.bytesize > MAX_ACCUMULATED_SIZE
+                  if accumulated.bytesize > MAX_ACCUMULATED_SIZE
+                    accumulated = accumulated.byteslice(-ACCUMULATED_TAIL_SIZE, ACCUMULATED_TAIL_SIZE)
+                  end
                 end
-                accumulated = nil if cr.usage # once we have usage, stop buffering
+                accumulated = nil if cr.usage
               end
             else
               response.read_body do |chunk|
                 forward_chunk_to_client(out, chunk)
+                streamed_any = true
               end
             end
 
@@ -197,8 +209,11 @@ module RequestHandler
             stream_result = handle_upstream_error(response, log_prefix)
           end
         end
-      rescue Net::OpenTimeout, Net::ReadTimeout, Net::WriteTimeout, IOError, EOFError, Errno::ECONNRESET, Errno::ECONNREFUSED, SocketError
+      rescue Net::OpenTimeout, Net::ReadTimeout, Net::WriteTimeout, IOError, EOFError, Errno::ECONNRESET, Errno::ECONNREFUSED, SocketError, HTTPSupport::ClientDisconnected
         pooled = false
+        # If we've already streamed data to the client, we can't retry —
+        # the client would receive a garbled duplicate stream.
+        raise HTTPSupport::ClientDisconnected if streamed_any
         raise
       ensure
         if pooled
@@ -211,11 +226,15 @@ module RequestHandler
     end
   end
 
-  def try_single_request(provider_config, path, body, body_model, incoming_headers, log_prefix:)
+  def try_single_request(provider_config, path, body, body_model, incoming_headers, log_prefix:, deadline_remaining: nil)
     uri, request = HTTPSupport.build_upstream_request(provider_config, path, body, body_model, incoming_headers, stream: false)
 
     try_with_retries(log_prefix: log_prefix, body_model: body_model) do
-      http = HTTPSupport.create_http(uri, timeouts: ConfigStore.timeouts)
+      timeouts = ConfigStore.timeouts
+      if deadline_remaining
+        timeouts = timeouts.merge(read: [timeouts[:read], deadline_remaining].min)
+      end
+      http = HTTPSupport.create_http(uri, timeouts: timeouts)
       http.start unless http.started?
       pooled = true
       begin
@@ -227,7 +246,7 @@ module RequestHandler
         else
           handle_upstream_error(response, log_prefix)
         end
-      rescue Net::OpenTimeout, Net::ReadTimeout, Net::WriteTimeout, IOError, EOFError, Errno::ECONNRESET, Errno::ECONNREFUSED, SocketError
+      rescue Net::OpenTimeout, Net::ReadTimeout, Net::WriteTimeout, IOError, EOFError, Errno::ECONNRESET, Errno::ECONNREFUSED, SocketError, HTTPSupport::ClientDisconnected
         pooled = false
         raise
       ensure

@@ -191,18 +191,35 @@ class TestProviderSelector < Minitest::Test
   end
 
   def test_persist_active_index_writes_primary_flag
+    require_relative "../lib/config_store"
     mock_path = File.join(__dir__, "tmp_config_#{Process.pid}.yaml")
 
     begin
-      File.write(mock_path, YAML.dump(MOCK_CONFIG))
+      # Config where provider 0 has primary and active index is 1.
+      # auto_switch: true is required for persist_active_index to proceed.
+      cfg = MOCK_CONFIG.merge(
+        "models" => [{
+          "name" => "test-model",
+          "auto_switch" => true,
+          "providers" => [
+            {"provider" => "prov_a", "model" => "model-a", "primary" => true},
+            {"provider" => "prov_b", "model" => "model-b"}
+          ]
+        }]
+      )
+      File.write(mock_path, YAML.dump(cfg))
       old_method = ProviderSelector.method(:config_path)
       ProviderSelector.define_singleton_method(:config_path) { mock_path }
 
-      selector.persist_active_index
+      s = ProviderSelector.new("test-model", @providers, model_config: cfg["models"].first)
+      # Force active index to 1 (prov_b) so persist should move primary.
+      s.instance_variable_set(:@active_index, 1)
+      s.persist_active_index
 
       raw = YAML.unsafe_load_file(mock_path)
       model = raw["models"].find { |m| m["name"] == "test-model" }
-      assert model["providers"][0]["primary"]
+      refute model["providers"][0]["primary"], "old active provider should lose primary flag"
+      assert model["providers"][1]["primary"], "new active provider should gain primary flag"
     ensure
       ProviderSelector.define_singleton_method(:config_path, old_method)
       File.delete(mock_path) if File.exist?(mock_path)

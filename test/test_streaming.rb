@@ -548,6 +548,10 @@ class MockHTTPResponse
   def is_a?(klass)
     klass.name == "Net::HTTPSuccess" && @code == "200"
   end
+
+  def [](_key)
+    nil
+  end
 end
 
 class MockHTTP

@@ -12,6 +12,7 @@ module ConfigWatcher
   @running = false
   @reloading = false
   @logger = nil
+  @thread = nil
 
   def self.start!(logger:, poll_interval: DEFAULT_POLL_INTERVAL)
     @logger = logger
@@ -19,7 +20,7 @@ module ConfigWatcher
     @last_mtime = begin; File.mtime(ConfigStore.config_path); rescue Errno::ENOENT; nil; end
     @running = true
 
-    Thread.new do
+    @thread = Thread.new do
       loop do
         sleep(poll_interval)
         break unless @running
@@ -30,12 +31,15 @@ module ConfigWatcher
     end
     begin
       Signal.trap("USR1") do
-        next if @reloading
-        @reloading = true
+        already_reloading = @lock.synchronize { @reloading }
+        next if already_reloading
+        @lock.synchronize { @reloading = true }
         Thread.new do
-          trigger_reload("SIGUSR1")
-        ensure
-          @reloading = false
+          begin
+            trigger_reload("SIGUSR1")
+          ensure
+            @lock.synchronize { @reloading = false }
+          end
         end
       end
     rescue ArgumentError
@@ -47,11 +51,17 @@ module ConfigWatcher
 
   def self.stop!
     @running = false
+    @thread&.join(5)
+    @thread = nil
   end
 
-  def self.expecting_write!
+  def self.expecting_write!(content = nil)
     @lock.synchronize do
-      @expected_hash = file_hash
+      @expected_hash = if content
+        Digest::SHA256.hexdigest(content)
+      else
+        file_hash
+      end
     end
   end
 

@@ -81,7 +81,7 @@ class TestRequestHandler < Minitest::Test
     assert_includes result[:error], "p_a: server_error"
     assert_includes result[:error], "p_b: rate_limited"
     assert_equal 429, result[:status], "last attempt status should be propagated"
-    assert_equal attempts, result[:detail][:attempts]
+    assert_equal [{provider: "p_a", status: 500, reason: "server_error"}, {provider: "p_b", status: 429, reason: "rate_limited"}], result[:detail][:attempts]
     refute result[:detail][:deadline_hit]
   end
 
@@ -162,6 +162,7 @@ end
 class HandlerTestApp
   include RequestHandler
   include Streaming
+  include HTTPSupport
 
   attr_accessor :request_id
 
@@ -566,5 +567,200 @@ class RecordMetricsTest < Minitest::Test
     selector = FakeSelector.new
     HandlerTestApp.new.record_metrics(selector, "openai", {ttft: 0.3, content_tps: 60.0})
     assert_equal 60.0, selector.metrics_updates.first[:tps]
+  end
+end
+
+# --- H1: EOF retries must not consume the max_attempts budget ---
+
+class EofRetryBudgetTest < Minitest::Test
+  def make_app(max_attempts: 3)
+    app = HandlerTestApp.new
+    app.define_singleton_method(:settings) do
+      @_logs ||= []
+      logger = Object.new
+      logs_ref = @_logs
+      logger.define_singleton_method(:info) { |m| logs_ref << [:info, m] }
+      logger.define_singleton_method(:warn) { |m| logs_ref << [:warn, m] }
+      logger.define_singleton_method(:error) { |m| logs_ref << [:error, m] }
+      logger.define_singleton_method(:debug) { |m| logs_ref << [:debug, m] }
+      Struct.new(:logger, :max_attempts, :backoff_base, :max_rounds).new(logger, max_attempts, 0, 3)
+    end
+    app.define_singleton_method(:sleep) { |*| }
+    app
+  end
+
+  def test_eof_retries_do_not_consume_attempt_budget
+    app = make_app(max_attempts: 3)
+    call_sequence = []
+
+    result = app.try_with_retries(log_prefix: "[test]", body_model: "m") do
+      call_sequence << :call
+      n = call_sequence.size
+      if n <= 2
+        raise EOFError, "stale connection"
+      elsif n <= 5
+        raise HTTPSupport::RetryableError, "real failure #{n - 2}"
+      else
+        {success: true}
+      end
+    end
+
+    # 2 EOF retries + 3 real attempts = 5 calls before maybe_retry gives up
+    assert_equal 5, call_sequence.size, "2 EOF + 3 real retries should be 5 calls"
+    refute result[:success]
+  end
+
+  def test_eof_retries_then_success
+    app = make_app(max_attempts: 3)
+    call_sequence = []
+
+    result = app.try_with_retries(log_prefix: "[test]", body_model: "m") do
+      call_sequence << :call
+      n = call_sequence.size
+      if n <= 2
+        raise EOFError, "stale connection"
+      else
+        {success: true}
+      end
+    end
+
+    assert result[:success]
+    assert_equal 3, call_sequence.size, "2 EOF + 1 success"
+  end
+end
+
+# --- H2: Mid-stream network error after data sent must not retry ---
+
+class StreamCorruptionGuardTest < Minitest::Test
+  class MockHTTP
+    attr_accessor :started
+    def initialize; @started = false; end
+    def start; @started = true; end
+    def started?; @started; end
+    def finish; @started = false; end
+    def request(_req)
+      yield MockSuccessResponse.new
+    end
+  end
+
+  class MockSuccessResponse < Net::HTTPSuccess
+    def initialize
+      super("1.1", "200", "OK")
+    end
+    def read_body
+      yield "data: hello\n\n"
+      raise EOFError, "connection reset mid-stream"
+    end
+    def [](key); nil; end
+    def body; ""; end
+  end
+
+  def setup
+    @app = HandlerTestApp.new
+    @app.define_singleton_method(:settings) do
+      logger = Object.new
+      logger.define_singleton_method(:info) { |m| }
+      logger.define_singleton_method(:warn) { |m| }
+      logger.define_singleton_method(:error) { |m| }
+      logger.define_singleton_method(:debug) { |m| }
+      Struct.new(:logger, :max_attempts, :backoff_base, :max_rounds).new(logger, 3, 0, 1)
+    end
+    @app.define_singleton_method(:sleep) { |*| }
+
+    ConfigStore.instance_variable_set(:@data, {
+      selectors: {},
+      models: {},
+      probe_interval: 60,
+      timeouts: {open: 5, read: 10, write: 5},
+      tracking_enabled: false,
+      quota_pause_default_seconds: 60
+    })
+
+    @orig_create_http = HTTPSupport.method(:create_http)
+    @orig_discard_http = HTTPSupport.method(:discard_http)
+    @orig_checkin_http = HTTPSupport.method(:checkin_http)
+    @orig_build_upstream = HTTPSupport.method(:build_upstream_request)
+  end
+
+  def teardown
+    HTTPSupport.define_singleton_method(:create_http, @orig_create_http)
+    HTTPSupport.define_singleton_method(:discard_http, @orig_discard_http)
+    HTTPSupport.define_singleton_method(:checkin_http, @orig_checkin_http)
+    HTTPSupport.define_singleton_method(:build_upstream_request, @orig_build_upstream)
+  end
+
+  def test_mid_stream_error_after_data_sent_does_not_retry
+    call_count = 0
+    chunks_sent = []
+
+    mock_http = MockHTTP.new
+
+    HTTPSupport.define_singleton_method(:create_http) { |*a, **kw| mock_http }
+    HTTPSupport.define_singleton_method(:discard_http) { |*a| }
+    HTTPSupport.define_singleton_method(:checkin_http) { |*a| }
+    HTTPSupport.define_singleton_method(:build_upstream_request) do |*args, **kw|
+      [URI.parse("https://upstream.example.com/v1"), Object.new]
+    end
+
+    out = []
+    out.define_singleton_method(:<<) { |data| chunks_sent << data }
+
+    result = @app.try_stream(
+      {"base_url" => "https://upstream.example.com/v1", "api_key" => "k"},
+      "/chat/completions", {}, "m", {},
+      out: out, log_prefix: "[test]", deadline_remaining: 60
+    )
+
+    # The EOFError after data was sent should be converted to
+    # ClientDisconnected, which try_with_retries catches and returns
+    # without retrying.
+    refute result[:success], "should fail"
+    assert_equal 1, chunks_sent.size, "one chunk should have been forwarded"
+  end
+end
+
+# --- M1: x-ratelimit-reset-* header parsing ---
+
+class RatelimitResetParsingTest < Minitest::Test
+  def test_parse_duration_string_seconds
+    t = HTTPSupport.parse_ratelimit_reset("6s")
+    assert_in_delta 6, t - Time.now.to_f, 1
+  end
+
+  def test_parse_duration_string_minutes
+    t = HTTPSupport.parse_ratelimit_reset("1m")
+    assert_in_delta 60, t - Time.now.to_f, 1
+  end
+
+  def test_parse_duration_string_milliseconds
+    t = HTTPSupport.parse_ratelimit_reset("500ms")
+    assert_in_delta 0.5, t - Time.now.to_f, 1
+  end
+
+  def test_parse_plain_seconds
+    t = HTTPSupport.parse_ratelimit_reset("30")
+    assert_in_delta 30, t - Time.now.to_f, 1
+  end
+
+  def test_parse_absolute_timestamp
+    future = (Time.now.to_f + 3600).to_i.to_s
+    t = HTTPSupport.parse_ratelimit_reset(future)
+    assert_in_delta 3600, t - Time.now.to_f, 2
+  end
+
+  def test_parse_invalid_returns_nil
+    assert_nil HTTPSupport.parse_ratelimit_reset("invalid")
+    assert_nil HTTPSupport.parse_ratelimit_reset("")
+    assert_nil HTTPSupport.parse_ratelimit_reset(nil)
+  end
+
+  def test_parse_duration_from_text_supports_short_units
+    assert_equal 90, HTTPSupport.parse_duration_from_text("resets in 90 secs")
+    assert_equal 120, HTTPSupport.parse_duration_from_text("retry in 2 min")
+    assert_equal 7200, HTTPSupport.parse_duration_from_text("available in 2 hrs")
+  end
+
+  def test_parse_duration_from_text_supports_decimals
+    assert_in_delta 1.5, HTTPSupport.parse_duration_from_text("resets in 1.5 seconds"), 0.01
   end
 end
