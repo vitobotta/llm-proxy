@@ -10,6 +10,7 @@ module TpsReporter
   @thread = nil
   @logger = nil
   @stop_signal = nil
+  @stop_lock = Mutex.new
 
   def self.start!(logger:, interval: DEFAULT_INTERVAL, activity_window: DEFAULT_ACTIVITY_WINDOW, eval_window: DEFAULT_EVAL_WINDOW, min_tokens: DEFAULT_MIN_TOKENS)
     return if @running || interval.nil? || interval <= 0
@@ -33,14 +34,14 @@ module TpsReporter
   end
 
   def self.stop!
-    return unless @running
-
-    @stop_signal << :stop if @stop_signal
-    @thread&.join(2)
-  ensure
-    @running = false
-    @thread = nil
-    @stop_signal = nil
+    @stop_lock.synchronize do
+      return unless @running
+      @running = false
+      @stop_signal << :stop if @stop_signal
+      @thread&.join(2)
+      @thread = nil
+      @stop_signal = nil
+    end
   end
 
   def self.running?
@@ -50,8 +51,9 @@ module TpsReporter
   def self.report(activity_window:, eval_window:, min_tokens: DEFAULT_MIN_TOKENS)
     return unless defined?(ConfigStore)
 
-    selectors = ConfigStore.selectors
-    models = ConfigStore.models
+    snap = ConfigStore.snapshot
+    selectors = snap[:selectors]
+    models = snap[:models]
 
     selectors.each do |model_name, selector|
       report_model(model_name, selector, models[model_name], activity_window, eval_window, min_tokens)

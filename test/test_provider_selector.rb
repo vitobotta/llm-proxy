@@ -191,18 +191,35 @@ class TestProviderSelector < Minitest::Test
   end
 
   def test_persist_active_index_writes_primary_flag
+    require_relative "../lib/config_store"
     mock_path = File.join(__dir__, "tmp_config_#{Process.pid}.yaml")
 
     begin
-      File.write(mock_path, YAML.dump(MOCK_CONFIG))
+      # Config where provider 0 has primary and active index is 1.
+      # auto_switch: true is required for persist_active_index to proceed.
+      cfg = MOCK_CONFIG.merge(
+        "models" => [{
+          "name" => "test-model",
+          "auto_switch" => true,
+          "providers" => [
+            {"provider" => "prov_a", "model" => "model-a", "primary" => true},
+            {"provider" => "prov_b", "model" => "model-b"}
+          ]
+        }]
+      )
+      File.write(mock_path, YAML.dump(cfg))
       old_method = ProviderSelector.method(:config_path)
       ProviderSelector.define_singleton_method(:config_path) { mock_path }
 
-      selector.persist_active_index
+      s = ProviderSelector.new("test-model", @providers, model_config: cfg["models"].first)
+      # Force active index to 1 (prov_b) so persist should move primary.
+      s.instance_variable_set(:@active_index, 1)
+      s.persist_active_index
 
       raw = YAML.unsafe_load_file(mock_path)
       model = raw["models"].find { |m| m["name"] == "test-model" }
-      assert model["providers"][0]["primary"]
+      refute model["providers"][0]["primary"], "old active provider should lose primary flag"
+      assert model["providers"][1]["primary"], "new active provider should gain primary flag"
     ensure
       ProviderSelector.define_singleton_method(:config_path, old_method)
       File.delete(mock_path) if File.exist?(mock_path)
@@ -382,6 +399,38 @@ class TestProviderSelector < Minitest::Test
     ordered = s.ordered_providers
     refute ordered.any? { |p| p["provider"] == "prov_a" }, "quota-paused provider should be excluded"
     assert_equal "prov_b", ordered.first["provider"]
+  end
+
+  # Last resort: a single provider whose circuit is open is still returned
+  # (no alternative to fall back to) so the request loop keeps retrying.
+  def test_ordered_providers_last_resort_single_provider_circuit_open
+    providers = [
+      {"provider" => "solo", "model" => "m", "base_url" => "https://solo.example.com/v1", "api_key" => "k"}
+    ]
+    model_config = {"name" => "test-model", "providers" => [{"provider" => "solo", "primary" => true}]}
+    s = ProviderSelector.new("test-model", providers, model_config: model_config,
+      circuit_failure_threshold: 1, circuit_cooldown: 600)
+
+    s.record_failure("solo")
+
+    ordered = s.ordered_providers
+    assert_equal 1, ordered.length, "last-resort must still return the only provider"
+    assert_equal "solo", ordered.first["provider"]
+  end
+
+  # Last resort: when every provider is circuit-broken (no healthy alternative),
+  # ordered_providers returns all providers, active first (rotate order).
+  def test_ordered_providers_last_resort_all_circuit_open
+    s = ProviderSelector.new("test-model", @providers, model_config: @model_config,
+      circuit_failure_threshold: 1, circuit_cooldown: 600)
+
+    s.record_failure("prov_a")
+    s.record_failure("prov_b")
+
+    ordered = s.ordered_providers
+    assert_equal 2, ordered.length, "last-resort must return both providers when no alternative exists"
+    assert_equal "prov_a", ordered.first["provider"], "active provider should come first"
+    assert_equal ["prov_a", "prov_b"], ordered.map { |p| p["provider"] }
   end
 
   # --- rolling_tps tests ---

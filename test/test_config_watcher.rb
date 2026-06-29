@@ -147,9 +147,10 @@ class TestConfigWatcher < Minitest::Test
   end
 
   def test_expect_write_suppresses_poll_reload
-    ConfigWatcher.expecting_write!
     new_cfg = MOCK_CONFIG.merge("retries" => {"max_attempts" => 8, "backoff_base" => 1})
-    File.write(@config_path, YAML.dump(new_cfg))
+    yaml_content = YAML.dump(new_cfg)
+    ConfigWatcher.expecting_write!(yaml_content)
+    File.write(@config_path, yaml_content)
 
     before_count = ConfigStore.__reload_counter.size
     ConfigWatcher.start!(logger: @logger, poll_interval: 0.1)

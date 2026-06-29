@@ -46,6 +46,19 @@ module ConfigValidator
       end
       if p["base_url"].nil? || p["base_url"].to_s.strip.empty?
         errors << "Provider '#{name}' has no base_url"
+      elsif p["base_url"].is_a?(String)
+        begin
+          uri = URI.parse(p["base_url"].strip)
+          unless uri.scheme&.match?(/\Ahttps?\z/)
+            errors << "Provider '#{name}' base_url must use http or https scheme"
+          end
+          host = uri.host.to_s
+          if host.match?(/\A(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.)/i)
+            warnings << "Provider '#{name}' base_url points to a private/loopback address (#{host}) — ensure this is intentional"
+          end
+        rescue URI::InvalidURIError
+          errors << "Provider '#{name}' base_url is not a valid URI"
+        end
       end
     end
 

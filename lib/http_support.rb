@@ -7,7 +7,13 @@ require "time"
 require "securerandom"
 
 module HTTPSupport
-  class RetryableError < StandardError; end
+  class RetryableError < StandardError
+    attr_reader :retry_after
+    def initialize(message, retry_after: nil)
+      super(message)
+      @retry_after = retry_after
+    end
+  end
   class ClientDisconnected < StandardError; end
 
   class QuotaExhaustedError < StandardError
@@ -21,7 +27,7 @@ module HTTPSupport
     end
   end
 
-  RETRYABLE_CODES = [500, 502, 503, 504].freeze
+  RETRYABLE_CODES = [408, 500, 502, 503, 504].freeze
 
   QUOTA_BODY_PATTERNS = [
     /insufficient_quota/i,
@@ -60,6 +66,7 @@ module HTTPSupport
 
   POOL_MAX_AGE = 300
   POOL_MAX_IDLE = 60
+  MAX_POOL_SIZE = 32
   CONNECTION_POOL = {}
   POOL_LOCK = Mutex.new
 
@@ -112,6 +119,32 @@ module HTTPSupport
     QUOTA_BODY_PATTERNS.any? { |pat| pat.match?(body) }
   end
 
+  # Parses an x-ratelimit-reset-* header value. OpenAI sends duration
+  # strings like "6s", "1m", "500ms"; some providers send plain seconds
+  # or absolute Unix timestamps. Returns an absolute resume time (Float)
+  # or nil if the value can't be parsed.
+  def self.parse_ratelimit_reset(val)
+    stripped = val.to_s.strip
+    return nil if stripped.empty?
+
+    # Pure number: small values are relative seconds, large values are
+    # absolute Unix timestamps.
+    if /\A\d+(\.\d+)?\z/.match?(stripped)
+      num = stripped.to_f
+      return num > 86400 ? num : Time.now.to_f + [num, MAX_RETRY_AFTER].min
+    end
+
+    # Duration string: "6s", "1m", "500ms", "1h", "2d"
+    if (m = stripped.match(/\A(\d+(?:\.\d+)?)(ms|s|m|h|d)\z/i))
+      num = m[1].to_f
+      unit = m[2].downcase
+      multiplier = {"ms" => 0.001, "s" => 1, "m" => 60, "h" => 3600, "d" => 86400}
+      return Time.now.to_f + [num * multiplier[unit], MAX_RETRY_AFTER].min
+    end
+
+    nil
+  end
+
   def self.extract_reset_time(response, body, status, default_seconds:)
     ra = parse_retry_after(response["Retry-After"])
     if ra > 0
@@ -122,12 +155,9 @@ module HTTPSupport
     %w[x-ratelimit-reset-requests x-ratelimit-reset-tokens].each do |hdr|
       val = response[hdr]
       next unless val
-      begin
-        t = Float(val)
-        return t if t > Time.now.to_f
-      rescue ArgumentError
-        nil
-    end
+      reset = parse_ratelimit_reset(val)
+      next unless reset
+      return [reset, Time.now.to_f + MAX_RETRY_AFTER].min if reset > Time.now.to_f
     end
 
     extract_reset_time_from_body(body, default_seconds: default_seconds)
@@ -139,17 +169,17 @@ module HTTPSupport
   end
 
   RESET_TEXT_PATTERNS = [
-    /resets?\s+in\s+(\d+)\s*(day|hour|minute|second)s?/i,
-    /retry\s+in\s+(\d+)\s*(day|hour|minute|second)s?/i,
-    /try\s+again\s+in\s+(\d+)\s*(day|hour|minute|second)s?/i,
-    /available\s+in\s+(\d+)\s*(day|hour|minute|second)s?/i
+    /resets?\s+in\s+(\d+(?:\.\d+)?)\s*(days?|hours?|hrs?|minutes?|mins?|seconds?|secs?|d|h|m|s)\b/i,
+    /retry\s+in\s+(\d+(?:\.\d+)?)\s*(days?|hours?|hrs?|minutes?|mins?|seconds?|secs?|d|h|m|s)\b/i,
+    /try\s+again\s+in\s+(\d+(?:\.\d+)?)\s*(days?|hours?|hrs?|minutes?|mins?|seconds?|secs?|d|h|m|s)\b/i,
+    /available\s+in\s+(\d+(?:\.\d+)?)\s*(days?|hours?|hrs?|minutes?|mins?|seconds?|secs?|d|h|m|s)\b/i
   ].freeze
 
   RESET_UNIT_SECONDS = {
-    "second" => 1,
-    "minute" => 60,
-    "hour" => 3600,
-    "day" => 86400
+    "second" => 1, "seconds" => 1, "sec" => 1, "secs" => 1, "s" => 1,
+    "minute" => 60, "minutes" => 60, "min" => 60, "mins" => 60, "m" => 60,
+    "hour" => 3600, "hours" => 3600, "hr" => 3600, "hrs" => 3600, "h" => 3600,
+    "day" => 86400, "days" => 86400, "d" => 86400
   }.freeze
 
   # Parse a human-readable duration from an error message (e.g. "Resets
@@ -160,7 +190,7 @@ module HTTPSupport
     return nil unless text
     RESET_TEXT_PATTERNS.each do |pat|
       m = text.match(pat)
-      return m[1].to_i * RESET_UNIT_SECONDS[m[2].downcase] if m && RESET_UNIT_SECONDS[m[2].downcase]
+      return m[1].to_f * RESET_UNIT_SECONDS[m[2].downcase] if m && RESET_UNIT_SECONDS[m[2].downcase]
     end
     nil
   end
@@ -298,10 +328,11 @@ module HTTPSupport
       return nil unless entries
       now = Time.now.to_f
       while (entry = entries.pop)
-        next if now - entry[:created] > POOL_MAX_AGE
-        next if now - entry[:last_used] > POOL_MAX_IDLE
+        if now - entry[:created] > POOL_MAX_AGE || now - entry[:last_used] > POOL_MAX_IDLE
+          begin; entry[:http].finish if entry[:http].started?; rescue; nil; end
+          next
+        end
         if entry[:http].started?
-          entry[:http].instance_variable_set(:@last_used_at, now)
           return entry[:http]
         end
       end
@@ -317,7 +348,7 @@ module HTTPSupport
       entries = (CONNECTION_POOL[key] ||= [])
       # Evict stale entries
       entries.reject! { |e| now - e[:created] > POOL_MAX_AGE || now - e[:last_used] > POOL_MAX_IDLE }
-      entries << {http: http, created: now, last_used: now}
+      entries << {http: http, created: now, last_used: now} if entries.size < MAX_POOL_SIZE
     end
   rescue
     # If checkin fails, just let http get GC'd
@@ -365,6 +396,23 @@ module HTTPSupport
     end
   end
 
+  @shutting_down = false
+  @in_flight = 0
+  @in_flight_lock = Mutex.new
+  SHUTDOWN_DRAIN_SECONDS = 30
+
+  def self.in_flight_increment!
+    @in_flight_lock.synchronize { @in_flight += 1 }
+  end
+
+  def self.in_flight_decrement!
+    @in_flight_lock.synchronize { @in_flight -= 1 }
+  end
+
+  def self.shutting_down?
+    @shutting_down
+  end
+
   def self.setup_graceful_shutdown!(logger, selectors)
     @shutting_down = false
 
@@ -375,9 +423,23 @@ module HTTPSupport
         logger.info("\nShutting down gracefully...")
         Thread.new do
           begin
+            # Drain: wait for in-flight requests to complete (up to deadline).
+            deadline = Time.now.to_f + SHUTDOWN_DRAIN_SECONDS
+            loop do
+              count = @in_flight_lock.synchronize { @in_flight }
+              break if count == 0
+              break if Time.now.to_f > deadline
+              sleep(0.5)
+            end
+            count = @in_flight_lock.synchronize { @in_flight }
+            logger.info("Shutdown: #{count} in-flight request(s) still running") if count > 0
+
             flush_pool!
             TpsReporter.stop! if defined?(TpsReporter)
-            selectors.each { |_, s| s.persist_active_index(logger: logger) }
+            # Re-read selectors at exit time so models added via hot-reload
+            # are persisted (the boot-captured closure only has the original set).
+            current_selectors = defined?(ConfigStore) ? ConfigStore.selectors : selectors
+            current_selectors.each { |_, s| s.persist_active_index(logger: logger) }
             StatePersistence.save(logger: logger) if defined?(StatePersistence)
           rescue => e
             logger.error("Shutdown error: #{e.class}: #{e.message}")
@@ -403,9 +465,13 @@ module HTTPSupport
     sleep(base * (JITTER_FACTOR + rand * JITTER_FACTOR))
   end
 
-  def maybe_retry(attempts)
+  def maybe_retry(attempts, retry_after: nil)
     return false unless attempts < settings.max_attempts
-    backoff(attempts - 1)
+    if retry_after && retry_after > 0
+      sleep([retry_after, MAX_RETRY_AFTER].min)
+    else
+      backoff(attempts - 1)
+    end
     true
   end
 
@@ -430,7 +496,7 @@ module HTTPSupport
         settings.logger.warn("#{log_prefix} Quota exhausted (#{e.reason}), pausing provider until #{Time.at(e.reset_time).utc.iso8601}")
         return {success: false, error: e.message, status: e.status, quota_pause_until: e.reset_time, quota_pause_reason: e.reason}
       rescue RetryableError => e
-        return retry_or_fail(log_prefix, error_label: "Failed", detail: e.message) unless maybe_retry(attempts)
+        return retry_or_fail(log_prefix, error_label: "Failed", detail: e.message) unless maybe_retry(attempts, retry_after: e.retry_after)
       rescue ClientDisconnected
         settings.logger.info("#{log_prefix} Client disconnected")
         return {success: false, error: "Client disconnected"}
@@ -438,6 +504,7 @@ module HTTPSupport
         eof_retries += 1
         if eof_retries <= MAX_EOF_RETRIES
           settings.logger.warn("#{log_prefix} EOF on stale connection (retry #{eof_retries}/2, not counting against attempts)")
+          attempts -= 1
           next
         end
         settings.logger.warn("#{log_prefix} EOF persisted after #{eof_retries} retries, counting as attempt failure")
@@ -475,9 +542,12 @@ module HTTPSupport
     end
 
     if RETRYABLE_CODES.include?(code)
-      raise RetryableError, error_msg
+      ra = HTTPSupport.parse_retry_after(response["Retry-After"])
+      raise RetryableError.new(error_msg, retry_after: ra > 0 ? ra : nil)
     end
 
-    {success: false, error: error_msg, status: code}
+    # Return a sanitized message to the client; the full upstream body is
+    # logged above for operator debugging but not exposed to callers.
+    {success: false, error: "Upstream returned HTTP #{code}", status: code}
   end
 end

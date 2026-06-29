@@ -17,7 +17,7 @@ module Routes
               result = with_auto_select(
                 model: req[:model], model_name: req[:model_name],
                 path: endpoint, body: req[:body], headers: req[:headers]
-              ) { |pc, p, b, pm, h, lp| try_stream(pc, p, b, pm, h, out: out, log_prefix: lp) }
+              ) { |pc, p, b, pm, h, lp, dr| try_stream(pc, p, b, pm, h, out: out, log_prefix: lp, deadline_remaining: dr) }
               handle_streaming_error(result, out)
             rescue HTTPSupport::ClientDisconnected
               settings.logger.info("[#{@request_id}] Client disconnected mid-stream")
@@ -25,7 +25,7 @@ module Routes
               settings.logger.error("[#{@request_id}] Streaming error: #{e.class}: #{e.message}")
               settings.logger.debug(e.backtrace.join("\n")) if e.backtrace
               begin
-                out << streaming_error("Streaming error: #{e.class}", detail: e.message)
+                out << streaming_error("Internal streaming error", detail: "request_id=#{@request_id}")
                 out << "data: [DONE]\n\n"
               rescue
                 nil
@@ -35,7 +35,7 @@ module Routes
             result = with_auto_select(
               model: req[:model], model_name: req[:model_name],
               path: endpoint, body: req[:body], headers: req[:headers]
-            ) { |pc, p, b, pm, h, lp| try_single_request(pc, p, b, pm, h, log_prefix: lp) }
+            ) { |pc, p, b, pm, h, lp, dr| try_single_request(pc, p, b, pm, h, log_prefix: lp, deadline_remaining: dr) }
             handle_non_stream_result(result)
           end
         end
@@ -46,7 +46,7 @@ module Routes
         result = with_auto_select(
           model: req[:model], model_name: req[:model_name],
           path: "embeddings", body: req[:body], headers: req[:headers]
-        ) { |pc, p, b, pm, h, lp| try_single_request(pc, p, b, pm, h, log_prefix: lp) }
+        ) { |pc, p, b, pm, h, lp, dr| try_single_request(pc, p, b, pm, h, log_prefix: lp, deadline_remaining: dr) }
         handle_non_stream_result(result)
       end
     end

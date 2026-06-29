@@ -10,5 +10,5 @@ services:
       - ./data:/app/data
     restart: unless-stopped
     environment:
-      - RACK_ENV=production
+      - RACK_ENV=development
       - CONFIG_FILE=/app/config/config.yaml

@@ -16,7 +16,7 @@ module ConfigStore
   YAML_PERMITTED_CLASSES = [Symbol, Date, Time].freeze
 
   def self.load_yaml_file(path)
-    YAML.safe_load_file(path, permitted_classes: YAML_PERMITTED_CLASSES, aliases: true)
+    YAML.safe_load_file(path, permitted_classes: YAML_PERMITTED_CLASSES)
   end
 
   # Writer-side lock: only serializes concurrent load!/reload! callers.
@@ -85,6 +85,14 @@ module ConfigStore
 
   # All accessors below are LOCK-FREE — they perform a single ivar read
   # plus a hash lookup. Safe under MRI's GVL; see the @data comment above.
+
+  # Returns the full data snapshot in a single ivar read. Use this when
+  # you need multiple fields (selector + model + probe_interval, etc.)
+  # to ensure they all come from the same consistent snapshot —
+  # individual accessors can each see a different snapshot if a reload
+  # swaps @data between calls.
+  def self.snapshot = @data
+
   def self.config = @data[:config]
   def self.providers = @data[:providers]
   def self.models = @data[:models]

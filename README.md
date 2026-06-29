@@ -190,7 +190,7 @@ Retry behaviour:
 2. Fall through to the next provider (config order when auto_switch is off, by score when on) and retry there.
 3. After every provider in a round fails, start the next round — re-walking the provider list — with an inter-round backoff delay. This gives transient outages time to recover: `A×3 → B×3` ⟶ delay ⟶ `A×3 → B×3` ⟶ delay ⟶ `A×3 → B×3`.
 4. Repeat up to `max_rounds` times. With a single provider, this becomes repeated retry groups with a delay between them.
-5. The circuit breaker (3 consecutive failures, 60s cooldown) and quota pauses are re-evaluated each round. A provider that opens its circuit or hits quota is excluded from subsequent rounds, so the loop naturally narrows to providers that are still healthy.
+5. The circuit breaker (3 consecutive failures, 60s cooldown) and quota pauses are re-evaluated each round. A provider that opens its circuit or hits quota is excluded from subsequent rounds, so the loop naturally narrows to providers that are still healthy. When every provider for a model is circuit-broken or quota-paused and no alternative exists, the proxy falls back to retrying the configured providers (active first) rather than aborting — so single-provider models keep retrying across `max_rounds` instead of stopping early.
 6. EOF on stale connection gets 2 fast retries that do **not** count against attempts; then counts as a normal failure.
 7. Timeouts count as failures and trigger retry/backoff.
 8. 429, 402, and 403 (with quota body patterns) immediately pause the provider and fall through to the next one — no retry on the same provider. The provider is skipped until its stated reset time expires.

@@ -19,15 +19,15 @@ module Streaming
   end
 
   THINKING_PATTERNS = [
-    /[^a-zA-Z_]"reasoning_content"\s*:\s*"/,
-    /[^a-zA-Z_]"thinking"\s*:\s*"/,
-    /[^a-zA-Z_]"reasoning"\s*:\s*"/
+    /(?:^|[^a-zA-Z_])"reasoning_content"\s*:\s*"/,
+    /(?:^|[^a-zA-Z_])"thinking"\s*:\s*"/,
+    /(?:^|[^a-zA-Z_])"reasoning"\s*:\s*"/
   ].freeze
   CONTENT_PATTERNS = [
-    /[^a-zA-Z_]"content"\s*:\s*"[^"}]/,
-    /[^a-zA-Z_]"text"\s*:\s*"[^"}]/
+    /(?:^|[^a-zA-Z_])"content"\s*:\s*"[^"}]/,
+    /(?:^|[^a-zA-Z_])"text"\s*:\s*"[^"}]/
   ].freeze
-  TOOL_CALL_PATTERN = /[^a-zA-Z_]"tool_calls"\s*:\s*\[/
+  TOOL_CALL_PATTERN = /(?:^|[^a-zA-Z_])"tool_calls"\s*:\s*\[/
   USAGE_STRING = '"usage"'
 
   ChunkResult = Struct.new(:usage, :has_thinking, :has_content, :has_tool_call, :perf_metrics, :server_duration)
@@ -225,7 +225,7 @@ module Streaming
 
     http.request(request) do |response|
       unless response.is_a?(Net::HTTPSuccess)
-        error = "HTTP #{response.code}: #{response.body}"
+        error = "HTTP #{response.code}: #{HTTPSupport.read_capped_error_body(response)}"
         next
       end
 
