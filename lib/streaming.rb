@@ -198,8 +198,15 @@ module Streaming
   # cr.server_duration as they appear (last-seen-wins). The caller-supplied
   # block receives (chunk, cr, now) per chunk and may write the chunk to a
   # client, accumulate it, or do nothing.
+  #
+  # When ttft_timeout is set and request_start is provided, raises
+  # HTTPSupport::TTFTTimeoutError if no first token (thinking or content)
+  # has arrived within ttft_timeout seconds. This catches providers that
+  # send keep-alive pings or empty deltas during prefill but never start
+  # generating. The check runs BEFORE yielding so the timeout chunk is
+  # not forwarded to the client.
   # Returns [usage, perf_metrics, server_duration] — any may be nil.
-  def self.consume_stream(response, tracker:)
+  def self.consume_stream(response, tracker:, ttft_timeout: nil, request_start: nil)
     usage = nil
     perf_metrics = nil
     server_duration = nil
@@ -211,6 +218,9 @@ module Streaming
       server_duration = cr.server_duration if cr.server_duration
       tracker.record_thinking(now) if cr.has_thinking
       tracker.record_content(now) if cr.has_content
+      if ttft_timeout && tracker.first_token.nil? && request_start && (now - request_start) > ttft_timeout
+        raise HTTPSupport::TTFTTimeoutError, "No first token within #{ttft_timeout}s"
+      end
       yield(chunk, cr, now) if block_given?
     end
     [usage, perf_metrics, server_duration]

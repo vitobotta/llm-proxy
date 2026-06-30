@@ -15,6 +15,7 @@ module HTTPSupport
     end
   end
   class ClientDisconnected < StandardError; end
+  class TTFTTimeoutError < StandardError; end
 
   class QuotaExhaustedError < StandardError
     attr_reader :reset_time, :status, :reason
@@ -500,6 +501,9 @@ module HTTPSupport
       rescue ClientDisconnected
         settings.logger.info("#{log_prefix} Client disconnected")
         return {success: false, error: "Client disconnected"}
+      rescue TTFTTimeoutError => e
+        settings.logger.warn("#{log_prefix} TTFT timeout: #{e.message}")
+        return retry_or_fail(log_prefix, error_label: "TTFT timeout", detail: e.message) unless maybe_retry(attempts)
       rescue EOFError
         eof_retries += 1
         if eof_retries <= MAX_EOF_RETRIES

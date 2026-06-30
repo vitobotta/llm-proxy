@@ -141,6 +141,7 @@ module RequestHandler
       return "server_error" if status >= 500
     end
     return "timeout" if err.include?("Timeout")
+    return "ttft_timeout" if err.include?("TTFT")
     return "client_disconnect" if err == "Client disconnected"
     return "rate_limited" if err.include?("Rate limited")
     return "connection_reset" if err.include?("Connection reset")
@@ -171,11 +172,33 @@ module RequestHandler
       tracking = ConfigStore.tracking_enabled
       accumulated = tracking ? +"" : nil
 
+      # TTFT timeout: lower read_timeout before the request so a provider
+      # that sends nothing at all is broken out of read_body quickly.
+      # read_timeout is restored to the normal value as soon as ANY data
+      # arrives (first chunk in consume_stream). The application-level check
+      # in consume_stream then catches providers that send keep-alive pings
+      # or empty deltas but no actual content/thinking tokens, using a
+      # total deadline (request_start + ttft_timeout) rather than an idle
+      # timeout. Requires tracking enabled — chunk parsing is needed to
+      # detect the first token. When tracking is off the feature is skipped.
+      ttft_timeout = tracking && timeouts[:ttft]
+      normal_read_timeout = timeouts[:read]
+      if ttft_timeout && ttft_timeout > 0 && ttft_timeout < normal_read_timeout
+        http.read_timeout = ttft_timeout
+      end
+
       begin
         http.request(request) do |response|
           if response.is_a?(Net::HTTPSuccess)
             if tracking
-              usage_data, perf_metrics, server_duration = Streaming.consume_stream(response, tracker: timers) do |chunk, cr, _now|
+              usage_data, perf_metrics, server_duration = Streaming.consume_stream(response,
+                tracker: timers, ttft_timeout: ttft_timeout, request_start: @request_start) do |chunk, cr, _now|
+                # Restore read_timeout as soon as ANY data arrives from the
+                # upstream. The application-level TTFT check in consume_stream
+                # handles the "pings but no content" case using a total deadline.
+                if http.read_timeout != normal_read_timeout
+                  http.read_timeout = normal_read_timeout
+                end
                 forward_chunk_to_client(out, chunk)
                 streamed_any = true
                 if accumulated
@@ -209,6 +232,13 @@ module RequestHandler
             stream_result = handle_upstream_error(response, log_prefix)
           end
         end
+      rescue HTTPSupport::TTFTTimeoutError
+        pooled = false
+        # Safe to retry: TTFTTimeoutError fires only when no first token
+        # (thinking or content) has arrived, so no content was forwarded
+        # to the client. Keep-alive pings may have been forwarded but
+        # SSE clients ignore comment lines.
+        raise
       rescue Net::OpenTimeout, Net::ReadTimeout, Net::WriteTimeout, IOError, EOFError, Errno::ECONNRESET, Errno::ECONNREFUSED, SocketError, HTTPSupport::ClientDisconnected
         pooled = false
         # If we've already streamed data to the client, we can't retry —

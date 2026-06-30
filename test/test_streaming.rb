@@ -519,6 +519,78 @@ class TestStreaming < Minitest::Test
     _usage, _perf_metrics, server_duration = Streaming.consume_stream(response, tracker: tracker)
     assert_equal 1.5, server_duration
   end
+
+  # --- consume_stream TTFT timeout ---
+
+  def test_consume_stream_raises_ttft_timeout_when_no_first_token
+    ping_chunk = ": ping\n\n"
+    done_chunk = "data: [DONE]\n\n"
+    response = MockResponse.new([ping_chunk, done_chunk])
+    tracker = Streaming::TimerTracker.new
+    request_start = Process.clock_gettime(Process::CLOCK_MONOTONIC) - 100
+
+    assert_raises(HTTPSupport::TTFTTimeoutError) do
+      Streaming.consume_stream(response, tracker: tracker, ttft_timeout: 5, request_start: request_start)
+    end
+  end
+
+  def test_consume_stream_does_not_raise_when_first_token_within_deadline
+    content_chunk = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"
+    done_chunk = "data: [DONE]\n\n"
+    response = MockResponse.new([content_chunk, done_chunk])
+    tracker = Streaming::TimerTracker.new
+    request_start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+    usage, _perf, _sd = Streaming.consume_stream(response, tracker: tracker,
+      ttft_timeout: 100, request_start: request_start)
+    assert tracker.first_token, "first_token should be set"
+  end
+
+  def test_consume_stream_no_ttft_timeout_when_disabled
+    ping_chunk = ": ping\n\n"
+    response = MockResponse.new([ping_chunk])
+    tracker = Streaming::TimerTracker.new
+    request_start = Process.clock_gettime(Process::CLOCK_MONOTONIC) - 1000
+
+    Streaming.consume_stream(response, tracker: tracker, ttft_timeout: nil, request_start: request_start)
+  end
+
+  def test_consume_stream_ttft_check_before_yield
+    ping_chunk = ": ping\n\n"
+    response = MockResponse.new([ping_chunk])
+    tracker = Streaming::TimerTracker.new
+    request_start = Process.clock_gettime(Process::CLOCK_MONOTONIC) - 100
+    yielded = false
+
+    assert_raises(HTTPSupport::TTFTTimeoutError) do
+      Streaming.consume_stream(response, tracker: tracker, ttft_timeout: 5, request_start: request_start) do |_c, _cr, _n|
+        yielded = true
+      end
+    end
+    refute yielded, "block should not be called when TTFT times out"
+  end
+
+  def test_consume_stream_ttft_not_raised_after_first_token
+    content_chunk = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"
+    ping_chunk = ": ping\n\n"
+    done_chunk = "data: [DONE]\n\n"
+    response = MockResponse.new([content_chunk, ping_chunk, done_chunk])
+    tracker = Streaming::TimerTracker.new
+    # Deadline is in the past, but first_token is set on chunk 1.
+    # Subsequent chunks should NOT trigger the timeout.
+    request_start = Process.clock_gettime(Process::CLOCK_MONOTONIC) - 100
+
+    Streaming.consume_stream(response, tracker: tracker, ttft_timeout: 5, request_start: request_start)
+    assert tracker.first_token, "first_token should be set"
+  end
+
+  def test_consume_stream_no_request_start_skips_ttft_check
+    ping_chunk = ": ping\n\n"
+    response = MockResponse.new([ping_chunk])
+    tracker = Streaming::TimerTracker.new
+
+    Streaming.consume_stream(response, tracker: tracker, ttft_timeout: 5, request_start: nil)
+  end
 end
 
 # --- Mock helpers ---

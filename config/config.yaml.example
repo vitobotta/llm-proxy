@@ -12,6 +12,9 @@ timeouts:
   open: 30
   read: 300
   write: 60
+  ttft: 15   # Max seconds to wait for the first token before falling back to
+             # the next provider (streaming only, requires tracking.enabled).
+             # Set to null or omit to disable.
 
 # Provider definitions (referenced by name in models)
 # Each provider needs at least base_url and api_key

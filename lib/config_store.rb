@@ -166,7 +166,8 @@ module ConfigStore
       timeouts: {
         open: raw.dig("timeouts", "open") || 30,
         read: raw.dig("timeouts", "read") || 300,
-        write: raw.dig("timeouts", "write") || 60
+        write: raw.dig("timeouts", "write") || 60,
+        ttft: raw.dig("timeouts", "ttft")
       }.freeze,
       auth_token: raw.dig("auth", "token"),
       metrics_token: raw.dig("auth", "metrics_token"),

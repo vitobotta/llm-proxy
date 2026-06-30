@@ -49,6 +49,10 @@ class TestRequestHandler < Minitest::Test
     assert_equal "rate_limited", RequestHandler.failure_reason({error: "Rate limited"})
   end
 
+  def test_failure_reason_ttft_timeout
+    assert_equal "ttft_timeout", RequestHandler.failure_reason({error: "TTFT timeout after 2 attempts"})
+  end
+
   class FakeHelper
     extend RequestHandler::ClassMethods if defined?(RequestHandler::ClassMethods)
     include RequestHandler
@@ -762,5 +766,145 @@ class RatelimitResetParsingTest < Minitest::Test
 
   def test_parse_duration_from_text_supports_decimals
     assert_in_delta 1.5, HTTPSupport.parse_duration_from_text("resets in 1.5 seconds"), 0.01
+  end
+end
+
+# --- TTFT timeout: try_stream lowers read_timeout and restores after first token ---
+
+class TTFTTimeoutTest < Minitest::Test
+  class TTFTMockHTTP
+    attr_accessor :started, :read_timeout
+    def initialize; @started = false; @read_timeout = 300; end
+    def start; @started = true; end
+    def started?; @started; end
+    def finish; @started = false; end
+    def request(_req); yield @response; end
+    attr_accessor :response
+  end
+
+  class TTFTPingResponse < Net::HTTPSuccess
+    def initialize; super("1.1", "200", "OK"); end
+    def read_body
+      yield ": ping\n\n"
+      yield "data: [DONE]\n\n"
+    end
+    def [](_key); nil; end
+    def body; ""; end
+  end
+
+  class TTFTContentResponse < Net::HTTPSuccess
+    def initialize; super("1.1", "200", "OK"); end
+    def read_body
+      yield "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n"
+      yield "data: [DONE]\n\n"
+    end
+    def [](_key); nil; end
+    def body; ""; end
+  end
+
+  def setup
+    @app = HandlerTestApp.new
+    @app.define_singleton_method(:settings) do
+      logger = Object.new
+      logger.define_singleton_method(:info) { |m| }
+      logger.define_singleton_method(:warn) { |m| }
+      logger.define_singleton_method(:error) { |m| }
+      logger.define_singleton_method(:debug) { |m| }
+      Struct.new(:logger, :max_attempts, :backoff_base, :max_rounds).new(logger, 2, 0, 1)
+    end
+    @app.define_singleton_method(:sleep) { |*| }
+
+    @app.instance_variable_set(:@request_start,
+      Process.clock_gettime(Process::CLOCK_MONOTONIC) - 100)
+
+    ConfigStore.instance_variable_set(:@data, {
+      selectors: {},
+      models: {},
+      probe_interval: 60,
+      timeouts: {open: 5, read: 300, write: 5, ttft: 5},
+      tracking_enabled: true,
+      quota_pause_default_seconds: 60
+    })
+
+    @orig_create_http = HTTPSupport.method(:create_http)
+    @orig_discard_http = HTTPSupport.method(:discard_http)
+    @orig_checkin_http = HTTPSupport.method(:checkin_http)
+    @orig_build_upstream = HTTPSupport.method(:build_upstream_request)
+  end
+
+  def teardown
+    HTTPSupport.define_singleton_method(:create_http, @orig_create_http)
+    HTTPSupport.define_singleton_method(:discard_http, @orig_discard_http)
+    HTTPSupport.define_singleton_method(:checkin_http, @orig_checkin_http)
+    HTTPSupport.define_singleton_method(:build_upstream_request, @orig_build_upstream)
+  end
+
+  def mock_http!(response)
+    mock_http = TTFTMockHTTP.new
+    mock_http.response = response
+    HTTPSupport.define_singleton_method(:create_http) { |*a, **kw| mock_http }
+    HTTPSupport.define_singleton_method(:discard_http) { |*a| }
+    HTTPSupport.define_singleton_method(:checkin_http) { |*a| }
+    HTTPSupport.define_singleton_method(:build_upstream_request) do |*args, **kw|
+      [URI.parse("https://upstream.example.com/v1"), Object.new]
+    end
+    mock_http
+  end
+
+  def test_try_stream_ttft_timeout_returns_failure
+    mock_http!(TTFTPingResponse.new)
+
+    out = []
+    result = @app.try_stream(
+      {"base_url" => "https://upstream.example.com/v1", "api_key" => "k"},
+      "/chat/completions", {}, "m", {},
+      out: out, log_prefix: "[test]", deadline_remaining: 60
+    )
+
+    refute result[:success], "should fail with TTFT timeout"
+    assert result[:error].include?("TTFT"), "error should mention TTFT: #{result[:error]}"
+  end
+
+  def test_try_stream_lowers_read_timeout_during_prefill
+    http = mock_http!(TTFTPingResponse.new)
+
+    assert_equal 5, http.read_timeout, "read_timeout should be lowered to ttft_timeout"
+  end
+
+  def test_try_stream_restores_read_timeout_after_first_chunk
+    http = mock_http!(TTFTContentResponse.new)
+
+    out = []
+    @app.try_stream(
+      {"base_url" => "https://upstream.example.com/v1", "api_key" => "k"},
+      "/chat/completions", {}, "m", {},
+      out: out, log_prefix: "[test]", deadline_remaining: 60
+    )
+
+    assert_equal 300, http.read_timeout, "read_timeout should be restored after first chunk"
+  end
+
+  def test_try_stream_restores_read_timeout_on_non_content_chunk
+    # Ping response (no content), but request_start is now so TTFT check
+    # doesn't fire. read_timeout should still be restored on the first chunk.
+    @app.instance_variable_set(:@request_start, Process.clock_gettime(Process::CLOCK_MONOTONIC))
+    http = mock_http!(TTFTPingResponse.new)
+
+    out = []
+    @app.try_stream(
+      {"base_url" => "https://upstream.example.com/v1", "api_key" => "k"},
+      "/chat/completions", {}, "m", {},
+      out: out, log_prefix: "[test]", deadline_remaining: 60
+    )
+
+    assert_equal 300, http.read_timeout, "read_timeout should be restored on any chunk, not just content"
+  end
+
+  def test_try_stream_no_ttft_when_tracking_disabled
+    ConfigStore.instance_variable_get(:@data)[:timeouts][:ttft] = 5
+    ConfigStore.instance_variable_get(:@data)[:tracking_enabled] = false
+    http = mock_http!(TTFTPingResponse.new)
+
+    assert_equal 300, http.read_timeout, "read_timeout should NOT be lowered when tracking is disabled"
   end
 end

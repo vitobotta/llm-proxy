@@ -136,4 +136,34 @@ class TestConfigValidator < Minitest::Test
     assert(errors.any? { |e| e.include?("timeouts.read") }, errors.inspect)
     assert(errors.any? { |e| e.include?("timeouts.write") }, errors.inspect)
   end
+
+  def test_accepts_valid_ttft
+    cfg = base.merge("timeouts" => {"ttft" => 15})
+    errors, _ = validate(cfg)
+    assert_empty errors, errors.inspect
+  end
+
+  def test_accepts_missing_ttft
+    cfg = base.merge("timeouts" => {"open" => 10, "read" => 300})
+    errors, _ = validate(cfg)
+    assert_empty errors, errors.inspect
+  end
+
+  def test_rejects_zero_ttft
+    cfg = base.merge("timeouts" => {"ttft" => 0})
+    errors, _ = validate(cfg)
+    assert(errors.any? { |e| e.include?("timeouts.ttft") }, errors.inspect)
+  end
+
+  def test_rejects_negative_ttft
+    cfg = base.merge("timeouts" => {"ttft" => -5})
+    errors, _ = validate(cfg)
+    assert(errors.any? { |e| e.include?("timeouts.ttft") }, errors.inspect)
+  end
+
+  def test_rejects_string_ttft
+    cfg = base.merge("timeouts" => {"ttft" => "15"})
+    errors, _ = validate(cfg)
+    assert(errors.any? { |e| e.include?("timeouts.ttft") }, errors.inspect)
+  end
 end
