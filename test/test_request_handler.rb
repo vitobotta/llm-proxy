@@ -865,46 +865,46 @@ class TTFTTimeoutTest < Minitest::Test
     assert result[:error].include?("TTFT"), "error should mention TTFT: #{result[:error]}"
   end
 
-  def test_try_stream_lowers_read_timeout_during_prefill
-    http = mock_http!(TTFTPingResponse.new)
-
-    assert_equal 5, http.read_timeout, "read_timeout should be lowered to ttft_timeout"
-  end
-
-  def test_try_stream_restores_read_timeout_after_first_chunk
-    http = mock_http!(TTFTContentResponse.new)
+  def test_try_stream_succeeds_when_content_arrives_within_deadline
+    mock_http!(TTFTContentResponse.new)
 
     out = []
-    @app.try_stream(
+    result = @app.try_stream(
       {"base_url" => "https://upstream.example.com/v1", "api_key" => "k"},
       "/chat/completions", {}, "m", {},
       out: out, log_prefix: "[test]", deadline_remaining: 60
     )
 
-    assert_equal 300, http.read_timeout, "read_timeout should be restored after first chunk"
+    assert result[:success], "should succeed when content arrives within deadline"
   end
 
-  def test_try_stream_restores_read_timeout_on_non_content_chunk
-    # Ping response (no content), but request_start is now so TTFT check
-    # doesn't fire. read_timeout should still be restored on the first chunk.
+  def test_try_stream_ttft_not_fired_with_current_request_start
+    # request_start is now, so TTFT check doesn't fire on first ping.
     @app.instance_variable_set(:@request_start, Process.clock_gettime(Process::CLOCK_MONOTONIC))
-    http = mock_http!(TTFTPingResponse.new)
+    mock_http!(TTFTPingResponse.new)
 
     out = []
-    @app.try_stream(
+    result = @app.try_stream(
       {"base_url" => "https://upstream.example.com/v1", "api_key" => "k"},
       "/chat/completions", {}, "m", {},
       out: out, log_prefix: "[test]", deadline_remaining: 60
     )
 
-    assert_equal 300, http.read_timeout, "read_timeout should be restored on any chunk, not just content"
+    assert result[:success], "should succeed when deadline not exceeded"
   end
 
   def test_try_stream_no_ttft_when_tracking_disabled
     ConfigStore.instance_variable_get(:@data)[:timeouts][:ttft] = 5
     ConfigStore.instance_variable_get(:@data)[:tracking_enabled] = false
-    http = mock_http!(TTFTPingResponse.new)
+    mock_http!(TTFTPingResponse.new)
 
-    assert_equal 300, http.read_timeout, "read_timeout should NOT be lowered when tracking is disabled"
+    out = []
+    result = @app.try_stream(
+      {"base_url" => "https://upstream.example.com/v1", "api_key" => "k"},
+      "/chat/completions", {}, "m", {},
+      out: out, log_prefix: "[test]", deadline_remaining: 60
+    )
+
+    assert result[:success], "should succeed — TTFT check skipped when tracking disabled"
   end
 end

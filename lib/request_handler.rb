@@ -172,20 +172,17 @@ module RequestHandler
       tracking = ConfigStore.tracking_enabled
       accumulated = tracking ? +"" : nil
 
-      # TTFT timeout: lower read_timeout before the request so a provider
-      # that sends nothing at all is broken out of read_body quickly.
-      # read_timeout is restored to the normal value as soon as ANY data
-      # arrives (first chunk in consume_stream). The application-level check
-      # in consume_stream then catches providers that send keep-alive pings
-      # or empty deltas but no actual content/thinking tokens, using a
-      # total deadline (request_start + ttft_timeout) rather than an idle
-      # timeout. Requires tracking enabled — chunk parsing is needed to
-      # detect the first token. When tracking is off the feature is skipped.
+      # TTFT timeout: the application-level check in consume_stream raises
+      # TTFTTimeoutError when no first token (thinking or content) arrives
+      # within ttft_timeout seconds (total deadline from request_start).
+      # We do NOT lower http.read_timeout — that would convert fast
+      # EOFError retries on stale pooled connections (<1s, free, don't
+      # count against max_attempts) into slow Net::ReadTimeout retries
+      # (ttft_timeout per attempt, consuming the attempt budget). The
+      # normal read_timeout (300s) handles truly dead connections.
+      # Requires tracking enabled — chunk parsing is needed to detect
+      # the first token. When tracking is off the feature is skipped.
       ttft_timeout = tracking && timeouts[:ttft]
-      normal_read_timeout = timeouts[:read]
-      if ttft_timeout && ttft_timeout > 0 && ttft_timeout < normal_read_timeout
-        http.read_timeout = ttft_timeout
-      end
 
       begin
         http.request(request) do |response|
@@ -193,12 +190,6 @@ module RequestHandler
             if tracking
               usage_data, perf_metrics, server_duration = Streaming.consume_stream(response,
                 tracker: timers, ttft_timeout: ttft_timeout, request_start: @request_start) do |chunk, cr, _now|
-                # Restore read_timeout as soon as ANY data arrives from the
-                # upstream. The application-level TTFT check in consume_stream
-                # handles the "pings but no content" case using a total deadline.
-                if http.read_timeout != normal_read_timeout
-                  http.read_timeout = normal_read_timeout
-                end
                 forward_chunk_to_client(out, chunk)
                 streamed_any = true
                 if accumulated
