@@ -473,6 +473,45 @@ class TestStreaming < Minitest::Test
     assert_in_delta 0.25, result[:ttft], 0.001, "ttft should use server-side prompt_time+queue_time"
   end
 
+  def test_build_stream_result_short_generation_nil_tps
+    handler = BuildStreamResultHarness.new(1000.0)
+    tracker = Streaming::TimerTracker.new
+    tracker.record_thinking(1000.1)
+    tracker.record_content(1000.2)
+    tracker.record_content(1000.3)
+
+    usage = {"completion_tokens" => 10, "completion_tokens_details" => {"reasoning_tokens" => 3}}
+    result = handler.build_stream_result("[test]", tracker, usage)
+
+    assert_nil result[:total_tps], "total_tps should be nil for short generations without server-side timing"
+    assert result[:content_tps], "content_tps should still be computed for diagnostics"
+  end
+
+  def test_build_stream_result_short_generation_with_server_tps
+    handler = BuildStreamResultHarness.new(1000.0)
+    tracker = Streaming::TimerTracker.new
+    tracker.record_content(1000.1)
+    tracker.record_content(1000.2)
+
+    usage = {"completion_tokens" => 10, "completion_time" => 0.5}
+    result = handler.build_stream_result("[test]", tracker, usage)
+
+    assert_equal 20.0, result[:total_tps], "server-side TPS should be used even for short generations"
+  end
+
+  def test_build_stream_result_long_generation_arrival_tps
+    handler = BuildStreamResultHarness.new(1000.0)
+    tracker = Streaming::TimerTracker.new
+    tracker.record_content(1000.1)
+    tracker.record_content(1000.5)
+
+    usage = {"completion_tokens" => 60}
+    result = handler.build_stream_result("[test]", tracker, usage)
+
+    assert result[:total_tps], "total_tps should be computed for long generations via arrival window"
+    assert_equal 150.0, result[:total_tps]  # 60 / 0.4s
+  end
+
   def test_parse_chunk_extracts_perf_metrics
     chunk = "data: {\"choices\":[],\"perf_metrics\":{\"generation-duration\":1.5,\"server-time-to-first-token\":0.1}}\n\n"
     cr = Streaming.parse_chunk(chunk)

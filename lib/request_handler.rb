@@ -123,7 +123,14 @@ module RequestHandler
   end
 
   def record_metrics(selector, provider_name, result)
-    tps = result[:total_tps] || result[:content_tps]
+    tps = result[:total_tps]
+    # Only fall back to content_tps when the generation is long enough that
+    # the arrival-window estimate is meaningful. For short generations
+    # (< MIN_ARRIVAL_TPS_TOKENS), total_tps is intentionally nil and
+    # content_tps is equally noisy — don't leak it to the scorer.
+    if tps.nil? && (result[:completion_tokens] || 0) >= Streaming::MIN_ARRIVAL_TPS_TOKENS
+      tps = result[:content_tps]
+    end
     selector.update_metrics(provider_name, result[:ttft], tps,
       tokens: result[:completion_tokens]) if result[:ttft]
   end

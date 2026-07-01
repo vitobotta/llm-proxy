@@ -136,6 +136,22 @@ class TestProviderSelector < Minitest::Test
     assert_in_delta expected, score, 0.001
   end
 
+  def test_average_metrics_token_weighted_tps
+    # 100-token request at 50 tps + 1000-token request at 80 tps
+    # Weighted: (50*100 + 80*1000) / (100+1000) = 85000/1100 = 77.3
+    selector.update_metrics("prov_a", 1.0, 50.0, tokens: 100)
+    selector.update_metrics("prov_a", 1.0, 80.0, tokens: 1000)
+    avg = selector.send(:average_metrics, "prov_a")
+    assert_in_delta 77.3, avg[:avg_tps], 0.1
+  end
+
+  def test_average_metrics_falls_back_to_arithmetic_mean_without_tokens
+    selector.update_metrics("prov_a", 1.0, 50.0)
+    selector.update_metrics("prov_a", 1.0, 80.0)
+    avg = selector.send(:average_metrics, "prov_a")
+    assert_in_delta 65.0, avg[:avg_tps], 0.1
+  end
+
   def test_evaluate_and_select_switches_on_better_provider
     3.times { selector.update_metrics("prov_a", 5.0, 10.0) }
     3.times { selector.update_metrics("prov_b", 0.5, 150.0) }

@@ -519,7 +519,12 @@ class ProviderSelector
     n = samples.length
     avg_ttft = samples.sum { |s| s[:ttft] } / n
     tps_samples = samples.select { |s| s[:tps] }
-    avg_tps = tps_samples.empty? ? 0.0 : tps_samples.sum { |s| s[:tps] } / tps_samples.length
+    if tps_samples.empty?
+      avg_tps = 0.0
+    else
+      weighted = tps_samples.filter_map { |s| s[:tokens] && s[:tokens] > 0 ? [s[:tps], s[:tokens]] : nil }
+      avg_tps = weighted.empty? ? tps_samples.sum { |s| s[:tps] } / tps_samples.length : weighted.sum { |tps, tok| tps * tok } / weighted.sum { |_tps, tok| tok }
+    end
     {avg_ttft: avg_ttft, avg_tps: avg_tps, sample_count: n}
   end
 

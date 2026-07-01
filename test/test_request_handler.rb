@@ -569,8 +569,16 @@ class RecordMetricsTest < Minitest::Test
 
   def test_record_metrics_uses_content_tps_as_fallback
     selector = FakeSelector.new
-    HandlerTestApp.new.record_metrics(selector, "openai", {ttft: 0.3, content_tps: 60.0})
+    HandlerTestApp.new.record_metrics(selector, "openai", {ttft: 0.3, content_tps: 60.0, completion_tokens: 100})
     assert_equal 60.0, selector.metrics_updates.first[:tps]
+  end
+
+  def test_record_metrics_suppresses_content_tps_for_short_generations
+    selector = FakeSelector.new
+    HandlerTestApp.new.record_metrics(selector, "openai", {ttft: 0.3, content_tps: 200.0, completion_tokens: 10})
+    assert_equal 1, selector.metrics_updates.size
+    assert_nil selector.metrics_updates.first[:tps], "content_tps should not leak to scorer for short generations"
+    assert_equal 10, selector.metrics_updates.first[:tokens]
   end
 end
 

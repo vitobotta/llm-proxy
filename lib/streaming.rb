@@ -4,6 +4,11 @@ require "json"
 
 module Streaming
   NEGATIVE_TOKEN_WARNED = {}
+  # Below this completion-token count, the arrival-window TPS fallback
+  # (total tokens / chunk-arrival span) is pure network jitter, not decode
+  # throughput. Suppress it so short requests don't feed noise into the
+  # provider scorer. Server-side timing is always used regardless of count.
+  MIN_ARRIVAL_TPS_TOKENS = 50
   NEGATIVE_TOKEN_LOCK = Mutex.new
 
   def self.reset_negative_token_warnings!
@@ -312,7 +317,13 @@ module Streaming
       thinking_tps = Streaming.compute_tps(tokens[:thinking], tracker.first_thinking, tracker.last_thinking)
       # Prefer server-side generation timing (matches provider dashboards) when
       # the provider reports it; fall back to the arrival-window estimate.
-      total_tps = tokens[:server_tps] || Streaming.compute_tps(tokens[:completion], tracker.first_token, tracker.last_any_token)
+      if tokens[:server_tps]
+        total_tps = tokens[:server_tps]
+      elsif tokens[:completion] && tokens[:completion] >= MIN_ARRIVAL_TPS_TOKENS
+        total_tps = Streaming.compute_tps(tokens[:completion], tracker.first_token, tracker.last_any_token)
+      else
+        total_tps = nil
+      end
       # Same for TTFT: server-side (queue + prefill) over arrival TTFT.
       ttft = tokens[:server_ttft] || ttft
 
