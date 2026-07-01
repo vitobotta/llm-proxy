@@ -774,10 +774,12 @@ end
 class TTFTTimeoutTest < Minitest::Test
   class TTFTMockHTTP
     attr_accessor :started, :read_timeout
-    def initialize; @started = false; @read_timeout = 300; end
+    def initialize; @started = false; @read_timeout = 300; @closed = false; end
     def start; @started = true; end
     def started?; @started; end
     def finish; @started = false; end
+    def close; @closed = true; end
+    def closed?; @closed; end
     def request(_req); yield @response; end
     attr_accessor :response
   end
@@ -797,6 +799,26 @@ class TTFTTimeoutTest < Minitest::Test
       sleep 0.1
       yield ": ping\n\n"
       yield "data: [DONE]\n\n"
+    end
+    def [](_key); nil; end
+    def body; ""; end
+  end
+  class TTFTBlockingResponse < Net::HTTPSuccess
+    attr_reader :interrupted
+    def initialize(http_ref)
+      super("1.1", "200", "OK")
+      @http_ref = http_ref
+      @interrupted = false
+    end
+    def read_body
+      # Simulate a provider that sends nothing — block until the TTFT
+      # timer closes the http connection.
+      loop do
+        sleep 0.01
+        break if @http_ref.closed?
+      end
+      @interrupted = true
+      raise IOError, "closed stream"
     end
     def [](_key); nil; end
     def body; ""; end
@@ -950,5 +972,37 @@ class TTFTTimeoutTest < Minitest::Test
     refute result[:success], "should fail with TTFT timeout on both attempts"
     assert result[:error].include?("TTFT"), "error should mention TTFT: #{result[:error]}"
     assert result[:error].include?("after 2 attempts"), "error should mention 2 attempts: #{result[:error]}"
+  end
+
+  def test_try_stream_ttft_proactive_timer_fires_when_no_data
+    # The core regression test: provider sends NOTHING for the entire
+    # ttft_timeout period. The reactive check never gets a chance to fire
+    # because no chunk arrives. The proactive timer thread closes the
+    # http connection, read_body raises IOError, and consume_stream
+    # converts it to TTFTTimeoutError.
+    #
+    # Each create_http call returns a fresh mock so @closed resets
+    # across retry attempts (in production, discarded connections are
+    # replaced by fresh ones from the pool).
+    HTTPSupport.define_singleton_method(:create_http) do |*a, **kw|
+      mock = TTFTMockHTTP.new
+      mock.response = TTFTBlockingResponse.new(mock)
+      mock
+    end
+    HTTPSupport.define_singleton_method(:discard_http) { |*a| }
+    HTTPSupport.define_singleton_method(:checkin_http) { |*a| }
+    HTTPSupport.define_singleton_method(:build_upstream_request) do |*args, **kw|
+      [URI.parse("https://upstream.example.com/v1"), Object.new]
+    end
+
+    out = []
+    result = @app.try_stream(
+      {"base_url" => "https://upstream.example.com/v1", "api_key" => "k"},
+      "/chat/completions", {}, "m", {},
+      out: out, log_prefix: "[test]", deadline_remaining: 60
+    )
+
+    refute result[:success], "should fail — proactive timer must fire when no data arrives"
+    assert result[:error].include?("TTFT"), "error should mention TTFT: #{result[:error]}"
   end
 end

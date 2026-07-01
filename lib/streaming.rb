@@ -199,30 +199,62 @@ module Streaming
   # block receives (chunk, cr, now) per chunk and may write the chunk to a
   # client, accumulate it, or do nothing.
   #
-  # When ttft_timeout is set and request_start is provided, raises
-  # HTTPSupport::TTFTTimeoutError if no first token (thinking or content)
-  # has arrived within ttft_timeout seconds. This catches providers that
-  # send keep-alive pings or empty deltas during prefill but never start
-  # generating. The check runs BEFORE yielding so the timeout chunk is
-  # not forwarded to the client.
+  # When ttft_timeout is set and http is provided, a background timer thread
+  # closes the http connection after ttft_timeout seconds if no first token
+  # (thinking or content) has arrived. This proactively breaks read_body out
+  # of its blocking wait — the application-level check alone can only fire
+  # when a chunk arrives, which never happens if the provider sends nothing.
+  # The timer is cancelled as soon as first_token is set. Stale connections
+  # still fail fast with EOFError because the timer only fires on genuinely
+  # slow connections (socket alive, no data for ttft_timeout seconds).
   # Returns [usage, perf_metrics, server_duration] — any may be nil.
-  def self.consume_stream(response, tracker:, ttft_timeout: nil, request_start: nil)
+  def self.consume_stream(response, tracker:, ttft_timeout: nil, request_start: nil, http: nil)
     usage = nil
     perf_metrics = nil
     server_duration = nil
-    response.read_body do |chunk|
-      now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-      cr = parse_chunk(chunk)
-      usage = cr.usage if cr.usage
-      perf_metrics = cr.perf_metrics if cr.perf_metrics
-      server_duration = cr.server_duration if cr.server_duration
-      tracker.record_thinking(now) if cr.has_thinking
-      tracker.record_content(now) if cr.has_content
-      if ttft_timeout && tracker.first_token.nil? && request_start && (now - request_start) > ttft_timeout
-        raise HTTPSupport::TTFTTimeoutError, "No first token within #{ttft_timeout}s"
+
+    ttft_timer = nil
+    ttft_fired = false
+    ttft_lock = Mutex.new
+
+    if ttft_timeout && http
+      ttft_timer = Thread.new do
+        sleep(ttft_timeout)
+        ttft_lock.synchronize { ttft_fired = true }
+        http.close
+      rescue => e
+        # Thread killed or http already closed — timer cancelled, no-op
       end
-      yield(chunk, cr, now) if block_given?
     end
+
+    begin
+      response.read_body do |chunk|
+        now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        cr = parse_chunk(chunk)
+        usage = cr.usage if cr.usage
+        perf_metrics = cr.perf_metrics if cr.perf_metrics
+        server_duration = cr.server_duration if cr.server_duration
+        tracker.record_thinking(now) if cr.has_thinking
+        tracker.record_content(now) if cr.has_content
+        if tracker.first_token && ttft_timer
+          ttft_timer.kill
+          ttft_timer = nil
+        end
+        if ttft_timeout && tracker.first_token.nil? && request_start && (now - request_start) > ttft_timeout
+          raise HTTPSupport::TTFTTimeoutError, "No first token within #{ttft_timeout}s"
+        end
+        yield(chunk, cr, now) if block_given?
+      end
+    rescue IOError, EOFError
+      if ttft_lock.synchronize { ttft_fired }
+        raise HTTPSupport::TTFTTimeoutError, "No first token within #{ttft_timeout}s"
+      else
+        raise
+      end
+    ensure
+      ttft_timer&.kill
+    end
+
     [usage, perf_metrics, server_duration]
   end
 

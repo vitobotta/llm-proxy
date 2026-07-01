@@ -591,8 +591,38 @@ class TestStreaming < Minitest::Test
 
     Streaming.consume_stream(response, tracker: tracker, ttft_timeout: 5, request_start: nil)
   end
-end
 
+  def test_consume_stream_proactive_timer_fires_on_no_data
+    # When http is provided and no data arrives within ttft_timeout,
+    # the timer closes the http connection and consume_stream raises
+    # TTFTTimeoutError — even though no chunk ever arrived to trigger
+    # the reactive check.
+    http = SimpleMockHTTP.new
+    blocking_response = MockBlockingResponse.new(http)
+    tracker = Streaming::TimerTracker.new
+    request_start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+    assert_raises(HTTPSupport::TTFTTimeoutError) do
+      Streaming.consume_stream(blocking_response, tracker: tracker,
+        ttft_timeout: 0.05, request_start: request_start, http: http)
+    end
+  end
+
+  def test_consume_stream_proactive_timer_cancelled_on_first_token
+    # Timer is cancelled as soon as first_token is set — no TTFTTimeoutError
+    # even though ttft_timeout is very short.
+    content_chunk = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"
+    done_chunk = "data: [DONE]\n\n"
+    response = MockResponse.new([content_chunk, done_chunk])
+    tracker = Streaming::TimerTracker.new
+    request_start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+    usage, _perf, _sd = Streaming.consume_stream(response, tracker: tracker,
+      ttft_timeout: 0.05, request_start: request_start, http: SimpleMockHTTP.new)
+    assert tracker.first_token, "first_token should be set"
+  end
+
+end
 # --- Mock helpers ---
 
 class MockResponse
@@ -602,6 +632,26 @@ class MockResponse
 
   def read_body
     @chunks.each { |c| yield c }
+  end
+end
+
+class SimpleMockHTTP
+  def initialize; @closed = false; end
+  def close; @closed = true; end
+  def closed?; @closed; end
+end
+
+class MockBlockingResponse
+  def initialize(http)
+    @http = http
+  end
+
+  def read_body
+    loop do
+      sleep 0.01
+      break if @http.closed?
+    end
+    raise IOError, "closed stream"
   end
 end
 

@@ -173,18 +173,28 @@ module RequestHandler
       tracking = ConfigStore.tracking_enabled
       accumulated = tracking ? +"" : nil
 
-      # TTFT timeout: the application-level check in consume_stream raises
-      # TTFTTimeoutError when no first token (thinking or content) arrives
-      # within ttft_timeout seconds (per-attempt deadline from attempt_start).
-      # Measuring from attempt_start — not the overall request start — ensures
-      # prior retries and provider fallbacks don't consume the TTFT budget.
-      # We do NOT lower http.read_timeout — that would convert fast
-      # EOFError retries on stale pooled connections (<1s, free, don't
-      # count against max_attempts) into slow Net::ReadTimeout retries
-      # (ttft_timeout per attempt, consuming the attempt budget). The
-      # normal read_timeout (300s) handles truly dead connections.
-      # Requires tracking enabled — chunk parsing is needed to detect
-      # the first token. When tracking is off the feature is skipped.
+      # TTFT timeout: consume_stream uses a two-layer approach to catch
+      # providers that never start generating within ttft_timeout seconds
+      # (per-attempt deadline from attempt_start). Measuring from
+      # attempt_start — not the overall request start — ensures prior
+      # retries and provider fallbacks don't consume the TTFT budget.
+      #
+      # Layer 1 (proactive): a background timer thread closes the http
+      # connection after ttft_timeout seconds if no first token has arrived.
+      # This breaks read_body out of its blocking wait when the provider
+      # sends nothing at all — the application-level check alone can only
+      # fire when a chunk arrives, which never happens in that case.
+      # The timer is cancelled as soon as first_token is set.
+      #
+      # Layer 2 (reactive): the application-level check inside read_body
+      # catches providers that send keep-alive pings or empty deltas but
+      # no actual content/thinking tokens.
+      #
+      # Stale pooled connections still fail fast with EOFError because the
+      # timer only fires on genuinely slow connections (socket alive, no
+      # data for ttft_timeout seconds). read_timeout is NOT lowered.
+      # Requires tracking enabled — chunk parsing is needed to detect the
+      # first token. When tracking is off the feature is skipped.
       ttft_timeout = tracking && timeouts[:ttft]
 
       begin
@@ -192,7 +202,7 @@ module RequestHandler
           if response.is_a?(Net::HTTPSuccess)
             if tracking
               usage_data, perf_metrics, server_duration = Streaming.consume_stream(response,
-                tracker: timers, ttft_timeout: ttft_timeout, request_start: attempt_start) do |chunk, cr, _now|
+                tracker: timers, ttft_timeout: ttft_timeout, request_start: attempt_start, http: http) do |chunk, cr, _now|
                 forward_chunk_to_client(out, chunk)
                 streamed_any = true
                 if accumulated
