@@ -155,6 +155,7 @@ module RequestHandler
     uri, request = HTTPSupport.build_upstream_request(provider_config, path, body, body_model, incoming_headers, stream: true)
 
     try_with_retries(log_prefix: log_prefix, body_model: body_model) do
+      attempt_start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
       timeouts = ConfigStore.timeouts
       if deadline_remaining
         timeouts = timeouts.merge(read: [timeouts[:read], deadline_remaining].min)
@@ -174,7 +175,9 @@ module RequestHandler
 
       # TTFT timeout: the application-level check in consume_stream raises
       # TTFTTimeoutError when no first token (thinking or content) arrives
-      # within ttft_timeout seconds (total deadline from request_start).
+      # within ttft_timeout seconds (per-attempt deadline from attempt_start).
+      # Measuring from attempt_start — not the overall request start — ensures
+      # prior retries and provider fallbacks don't consume the TTFT budget.
       # We do NOT lower http.read_timeout — that would convert fast
       # EOFError retries on stale pooled connections (<1s, free, don't
       # count against max_attempts) into slow Net::ReadTimeout retries
@@ -189,7 +192,7 @@ module RequestHandler
           if response.is_a?(Net::HTTPSuccess)
             if tracking
               usage_data, perf_metrics, server_duration = Streaming.consume_stream(response,
-                tracker: timers, ttft_timeout: ttft_timeout, request_start: @request_start) do |chunk, cr, _now|
+                tracker: timers, ttft_timeout: ttft_timeout, request_start: attempt_start) do |chunk, cr, _now|
                 forward_chunk_to_client(out, chunk)
                 streamed_any = true
                 if accumulated
@@ -215,7 +218,7 @@ module RequestHandler
                 server_duration = fallback.server_duration if fallback&.server_duration
               end
 
-              stream_result = build_stream_result(log_prefix, timers, usage_data, perf_metrics: perf_metrics, server_duration: server_duration)
+              stream_result = build_stream_result(log_prefix, timers, usage_data, perf_metrics: perf_metrics, server_duration: server_duration, request_start: attempt_start)
             else
               stream_result = {success: true}
             end

@@ -791,6 +791,16 @@ class TTFTTimeoutTest < Minitest::Test
     def [](_key); nil; end
     def body; ""; end
   end
+  class TTFTSlowPingResponse < Net::HTTPSuccess
+    def initialize; super("1.1", "200", "OK"); end
+    def read_body
+      sleep 0.1
+      yield ": ping\n\n"
+      yield "data: [DONE]\n\n"
+    end
+    def [](_key); nil; end
+    def body; ""; end
+  end
 
   class TTFTContentResponse < Net::HTTPSuccess
     def initialize; super("1.1", "200", "OK"); end
@@ -814,14 +824,11 @@ class TTFTTimeoutTest < Minitest::Test
     end
     @app.define_singleton_method(:sleep) { |*| }
 
-    @app.instance_variable_set(:@request_start,
-      Process.clock_gettime(Process::CLOCK_MONOTONIC) - 100)
-
     ConfigStore.instance_variable_set(:@data, {
       selectors: {},
       models: {},
       probe_interval: 60,
-      timeouts: {open: 5, read: 300, write: 5, ttft: 5},
+      timeouts: {open: 5, read: 300, write: 5, ttft: 0.05},
       tracking_enabled: true,
       quota_pause_default_seconds: 60
     })
@@ -852,7 +859,7 @@ class TTFTTimeoutTest < Minitest::Test
   end
 
   def test_try_stream_ttft_timeout_returns_failure
-    mock_http!(TTFTPingResponse.new)
+    mock_http!(TTFTSlowPingResponse.new)
 
     out = []
     result = @app.try_stream(
@@ -878,9 +885,9 @@ class TTFTTimeoutTest < Minitest::Test
     assert result[:success], "should succeed when content arrives within deadline"
   end
 
-  def test_try_stream_ttft_not_fired_with_current_request_start
-    # request_start is now, so TTFT check doesn't fire on first ping.
-    @app.instance_variable_set(:@request_start, Process.clock_gettime(Process::CLOCK_MONOTONIC))
+  def test_try_stream_succeeds_with_immediate_pings
+    # attempt_start is fresh per attempt, so immediate pings with ttft: 0.05
+    # do not trigger the timeout.
     mock_http!(TTFTPingResponse.new)
 
     out = []
@@ -906,5 +913,42 @@ class TTFTTimeoutTest < Minitest::Test
     )
 
     assert result[:success], "should succeed — TTFT check skipped when tracking disabled"
+  end
+
+  def test_try_stream_ttft_not_fired_with_stale_request_start
+    # Simulate prior provider attempts that consumed time: @request_start is
+    # 100s in the past. With the fix, attempt_start is fresh per attempt, so
+    # immediate pings with ttft: 0.05 do NOT trigger the timeout.
+    # Without the fix: (now - @request_start) ~ 100 > 0.05 -> timeout fires.
+    @app.instance_variable_set(:@request_start,
+      Process.clock_gettime(Process::CLOCK_MONOTONIC) - 100)
+    mock_http!(TTFTPingResponse.new)
+
+    out = []
+    result = @app.try_stream(
+      {"base_url" => "https://upstream.example.com/v1", "api_key" => "k"},
+      "/chat/completions", {}, "m", {},
+      out: out, log_prefix: "[test]", deadline_remaining: 60
+    )
+
+    assert result[:success], "stale @request_start should not trigger TTFT timeout — attempt_start is per-attempt"
+  end
+
+  def test_try_stream_ttft_timeout_resets_per_attempt
+    # Both retry attempts get fresh TTFT budgets. TTFTSlowPingResponse sleeps
+    # 0.1s (exceeds ttft: 0.05), so both attempts hit the timeout.
+    # Error should say "after 2 attempts", proving both ran.
+    mock_http!(TTFTSlowPingResponse.new)
+
+    out = []
+    result = @app.try_stream(
+      {"base_url" => "https://upstream.example.com/v1", "api_key" => "k"},
+      "/chat/completions", {}, "m", {},
+      out: out, log_prefix: "[test]", deadline_remaining: 60
+    )
+
+    refute result[:success], "should fail with TTFT timeout on both attempts"
+    assert result[:error].include?("TTFT"), "error should mention TTFT: #{result[:error]}"
+    assert result[:error].include?("after 2 attempts"), "error should mention 2 attempts: #{result[:error]}"
   end
 end

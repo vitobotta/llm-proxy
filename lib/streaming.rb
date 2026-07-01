@@ -267,8 +267,9 @@ module Streaming
     tracker.record_content(now) if chunk_result.has_content
   end
 
-  def build_stream_result(log_prefix, tracker, usage_data, perf_metrics: nil, server_duration: nil)
-    ttft = tracker.first_token ? (tracker.first_token - @request_start).round(3) : nil
+  def build_stream_result(log_prefix, tracker, usage_data, perf_metrics: nil, server_duration: nil, request_start: nil)
+    request_start ||= @request_start
+    ttft = tracker.first_token ? (tracker.first_token - request_start).round(3) : nil
 
     if usage_data
       tokens = Streaming.extract_token_counts(usage_data, perf_metrics: perf_metrics, server_duration: server_duration)
