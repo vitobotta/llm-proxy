@@ -29,6 +29,10 @@ class TestRequestHandler < Minitest::Test
     assert_equal "client_disconnect", RequestHandler.failure_reason({error: "Client disconnected"})
   end
 
+  def test_failure_reason_upstream_disconnect
+    assert_equal "upstream_disconnect", RequestHandler.failure_reason({error: "Upstream disconnect after partial stream"})
+  end
+
   def test_failure_reason_connection_reset
     assert_equal "connection_reset", RequestHandler.failure_reason({error: "Connection reset after 2 attempts"})
   end
@@ -331,6 +335,63 @@ class WithAutoSelectTest < Minitest::Test
 
     refute result[:success]
     assert_equal 503, result[:status]
+  end
+
+  def test_with_auto_select_client_disconnect_does_not_record_failure
+    @selector._providers = [
+      {"provider" => "openai", "model" => "gpt-4", "base_url" => "https://api.openai.com/v1", "api_key" => "k"}
+    ]
+
+    @app.with_auto_select(model: @model_entry, model_name: "test-model", path: "/chat/completions", body: {}, headers: {}) do
+      {success: false, error: "Client disconnected"}
+    end
+
+    assert_empty @selector.failures, "client disconnect must NOT count toward circuit breaker"
+    assert_empty @selector.successes
+  end
+
+  def test_with_auto_select_client_disconnect_breaks_provider_loop
+    @selector._providers = [
+      {"provider" => "openai", "model" => "gpt-4", "base_url" => "https://api.openai.com/v1", "api_key" => "k"},
+      {"provider" => "anthropic", "model" => "claude-3", "base_url" => "https://api.anthropic.com/v1", "api_key" => "k2"}
+    ]
+
+    call_count = 0
+    result = @app.with_auto_select(model: @model_entry, model_name: "test-model", path: "/chat/completions", body: {}, headers: {}) do
+      call_count += 1
+      {success: false, error: "Client disconnected"}
+    end
+
+    refute result[:success]
+    assert_equal 1, call_count, "client disconnect must break provider loop — no cascade to next provider"
+    assert_empty @selector.failures, "no provider should be penalised for client disconnect"
+  end
+
+  def test_with_auto_select_upstream_disconnect_does_record_failure
+    @selector._providers = [
+      {"provider" => "openai", "model" => "gpt-4", "base_url" => "https://api.openai.com/v1", "api_key" => "k"}
+    ]
+
+    @app.with_auto_select(model: @model_entry, model_name: "test-model", path: "/chat/completions", body: {}, headers: {}) do
+      {success: false, error: "Upstream disconnect after partial stream"}
+    end
+
+    refute_empty @selector.failures, "upstream disconnect SHOULD count toward circuit breaker"
+    assert_includes @selector.failures, "openai"
+  end
+
+  def test_with_auto_select_client_disconnect_breaks_rounds_loop
+    @selector._providers = [
+      {"provider" => "openai", "model" => "gpt-4", "base_url" => "https://api.openai.com/v1", "api_key" => "k"}
+    ]
+
+    call_count = 0
+    @app.with_auto_select(model: @model_entry, model_name: "test-model", path: "/chat/completions", body: {}, headers: {}) do
+      call_count += 1
+      {success: false, error: "Client disconnected"}
+    end
+
+    assert_equal 1, call_count, "client disconnect must break rounds loop — no retry across rounds"
   end
 end
 
@@ -641,17 +702,74 @@ class EofRetryBudgetTest < Minitest::Test
   end
 end
 
+# --- StreamPartiallySent: upstream error after partial stream must not retry
+# and must not be classified as client_disconnect ---
+
+class StreamPartiallySentTest < Minitest::Test
+  def make_app(max_attempts: 3)
+    app = HandlerTestApp.new
+    app.define_singleton_method(:settings) do
+      @_logs ||= []
+      logger = Object.new
+      logs_ref = @_logs
+      logger.define_singleton_method(:info) { |m| logs_ref << [:info, m] }
+      logger.define_singleton_method(:warn) { |m| logs_ref << [:warn, m] }
+      logger.define_singleton_method(:error) { |m| logs_ref << [:error, m] }
+      logger.define_singleton_method(:debug) { |m| logs_ref << [:debug, m] }
+      Struct.new(:logger, :max_attempts, :backoff_base, :max_rounds).new(logger, max_attempts, 0, 3)
+    end
+    app.define_singleton_method(:sleep) { |*| }
+    app
+  end
+
+  def test_stream_partially_sent_does_not_retry
+    call_count = 0
+    app = make_app(max_attempts: 3)
+
+    result = app.try_with_retries(log_prefix: "[test]", body_model: "m") do
+      call_count += 1
+      raise HTTPSupport::StreamPartiallySent.new(EOFError.new("connection reset mid-stream"))
+    end
+
+    refute result[:success]
+    assert_equal 1, call_count, "StreamPartiallySent must not retry"
+    assert_equal "Upstream disconnect after partial stream", result[:error]
+  end
+
+  def test_stream_partially_sent_preserves_original_error
+    original = Errno::ECONNRESET.new("connection reset")
+    error = HTTPSupport::StreamPartiallySent.new(original)
+
+    assert_same original, error.original
+    assert_includes error.message, "Errno::ECONNRESET"
+  end
+
+  def test_client_disconnected_does_not_retry
+    call_count = 0
+    app = make_app(max_attempts: 3)
+
+    result = app.try_with_retries(log_prefix: "[test]", body_model: "m") do
+      call_count += 1
+      raise HTTPSupport::ClientDisconnected
+    end
+
+    refute result[:success]
+    assert_equal 1, call_count, "ClientDisconnected must not retry"
+    assert_equal "Client disconnected", result[:error]
+  end
+end
+
 # --- H2: Mid-stream network error after data sent must not retry ---
 
 class StreamCorruptionGuardTest < Minitest::Test
   class MockHTTP
-    attr_accessor :started
+    attr_accessor :started, :response
     def initialize; @started = false; end
     def start; @started = true; end
     def started?; @started; end
     def finish; @started = false; end
     def request(_req)
-      yield MockSuccessResponse.new
+      yield(@response || MockSuccessResponse.new)
     end
   end
 
@@ -724,10 +842,51 @@ class StreamCorruptionGuardTest < Minitest::Test
     )
 
     # The EOFError after data was sent should be converted to
-    # ClientDisconnected, which try_with_retries catches and returns
+    # StreamPartiallySent, which try_with_retries catches and returns
     # without retrying.
     refute result[:success], "should fail"
     assert_equal 1, chunks_sent.size, "one chunk should have been forwarded"
+    assert_equal "Upstream disconnect after partial stream", result[:error],
+      "upstream error after partial stream should not be classified as client disconnect"
+  end
+
+  # Genuine client disconnect (EPIPE from out << chunk) must stay as
+  # ClientDisconnected — NOT be converted to StreamPartiallySent. This is
+  # the key distinction: client-side vs upstream-side errors.
+  class ClientGoneResponse < Net::HTTPSuccess
+    def initialize; super("1.1", "200", "OK"); end
+    def read_body
+      yield "data: hello\n\n"
+      yield "data: more\n\n"
+    end
+    def [](key); nil; end
+    def body; ""; end
+  end
+
+  def test_client_disconnect_stays_client_disconnected_not_upstream
+    mock_http = MockHTTP.new
+    mock_http.response = ClientGoneResponse.new
+
+    HTTPSupport.define_singleton_method(:create_http) { |*a, **kw| mock_http }
+    HTTPSupport.define_singleton_method(:discard_http) { |*a| }
+    HTTPSupport.define_singleton_method(:checkin_http) { |*a| }
+    HTTPSupport.define_singleton_method(:build_upstream_request) do |*args, **kw|
+      [URI.parse("https://upstream.example.com/v1"), Object.new]
+    end
+
+    # out that raises EPIPE on first write — client already gone
+    out = Object.new
+    out.define_singleton_method(:<<) { |_| raise Errno::EPIPE, "broken pipe" }
+
+    result = @app.try_stream(
+      {"base_url" => "https://upstream.example.com/v1", "api_key" => "k"},
+      "/chat/completions", {}, "m", {},
+      out: out, log_prefix: "[test]", deadline_remaining: 60
+    )
+
+    refute result[:success], "should fail"
+    assert_equal "Client disconnected", result[:error],
+      "client EPIPE must be classified as client_disconnect, not upstream_disconnect"
   end
 end
 
