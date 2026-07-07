@@ -17,6 +17,20 @@ module HTTPSupport
   class ClientDisconnected < StandardError; end
   class TTFTTimeoutError < StandardError; end
 
+  # Raised when an upstream error occurs after chunks have already been
+  # forwarded to the client. The stream cannot be retried (the client would
+  # receive a garbled duplicate), but unlike ClientDisconnected this is an
+  # upstream failure, not a client-side disconnect. The original exception
+  # is preserved for logging and diagnostics.
+  class StreamPartiallySent < StandardError
+    attr_reader :original
+
+    def initialize(original)
+      @original = original
+      super("Upstream disconnect after partial stream: #{original.class}")
+    end
+  end
+
   class QuotaExhaustedError < StandardError
     attr_reader :reset_time, :status, :reason
 
@@ -501,6 +515,9 @@ module HTTPSupport
       rescue ClientDisconnected
         settings.logger.info("#{log_prefix} Client disconnected")
         return {success: false, error: "Client disconnected"}
+      rescue StreamPartiallySent => e
+        settings.logger.warn("#{log_prefix} Upstream error after partial stream: #{e.original.class}: #{e.original.message}")
+        return {success: false, error: "Upstream disconnect after partial stream"}
       rescue TTFTTimeoutError => e
         settings.logger.warn("#{log_prefix} TTFT timeout: #{e.message}")
         return retry_or_fail(log_prefix, error_label: "TTFT timeout", detail: e.message) unless maybe_retry(attempts)

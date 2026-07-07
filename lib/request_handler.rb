@@ -78,15 +78,22 @@ module RequestHandler
           if result.is_a?(Hash) && result[:quota_pause_until]
             selector.quota_pause!(p_name, result[:quota_pause_until], reason: result[:quota_pause_reason])
             Metrics.increment(:provider_quota_paused, labels: {provider: p_name, model: model_name, reason: result[:quota_pause_reason] || "unknown"})
-          else
+          elsif reason != "client_disconnect"
             selector.record_failure(p_name)
           end
           Metrics.increment(:provider_failure, labels: {provider: p_name, model: model_name, reason: reason})
+          # Client disconnect: the client is gone — no point trying the
+          # next provider (it will also fail to write). Break out of the
+          # provider loop immediately.
+          break if reason == "client_disconnect"
         end
       end
 
       break if result&.dig(:success)
       break if deadline_hit
+      # Client disconnect also breaks the rounds loop — retrying across
+      # rounds is pointless when the client is already gone.
+      break if result.is_a?(Hash) && result[:error] == "Client disconnected"
     end
 
     if probing && selector.record_and_maybe_probe(probe_interval)
@@ -150,6 +157,7 @@ module RequestHandler
     return "timeout" if err.include?("Timeout")
     return "ttft_timeout" if err.include?("TTFT")
     return "client_disconnect" if err == "Client disconnected"
+    return "upstream_disconnect" if err.include?("Upstream disconnect after partial stream")
     return "rate_limited" if err.include?("Rate limited")
     return "connection_reset" if err.include?("Connection reset")
     "error"
@@ -250,11 +258,20 @@ module RequestHandler
         # to the client. Keep-alive pings may have been forwarded but
         # SSE clients ignore comment lines.
         raise
-      rescue Net::OpenTimeout, Net::ReadTimeout, Net::WriteTimeout, IOError, EOFError, Errno::ECONNRESET, Errno::ECONNREFUSED, SocketError, HTTPSupport::ClientDisconnected
+      rescue HTTPSupport::ClientDisconnected
+        # Client went away (EPIPE/IOError/Puma::ConnectionError from
+        # forward_chunk_to_client or handle_streaming_error). Don't
+        # retry — the client is gone. This is NOT an upstream failure.
         pooled = false
+        raise
+      rescue Net::OpenTimeout, Net::ReadTimeout, Net::WriteTimeout, IOError, EOFError, Errno::ECONNRESET, Errno::ECONNREFUSED, SocketError
+        pooled = false
+        # Upstream error (connection drop, read timeout, etc.).
         # If we've already streamed data to the client, we can't retry —
-        # the client would receive a garbled duplicate stream.
-        raise HTTPSupport::ClientDisconnected if streamed_any
+        # the client would receive a garbled duplicate stream. Wrap in
+        # StreamPartiallySent so it's classified as an upstream failure,
+        # not a client disconnect.
+        raise HTTPSupport::StreamPartiallySent.new($!) if streamed_any
         raise
       ensure
         if pooled
