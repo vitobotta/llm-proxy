@@ -52,7 +52,7 @@ docker compose up -d --build
 
 ### Request lifecycle
 
-- **Streaming is the default** — `stream: false` must be explicit in the request body. The `stream_requested` var is `true` unless body has `"stream": false`.
+- **Non-streaming is the default** — `stream: true` must be explicit in the request body. Omitted or false `stream` values return one complete JSON response.
 - **Provider auto-selection** happens per-request via `ProviderSelector#ordered_providers`. Active provider is first; others sorted by score. Circuit-broken providers are skipped.
 - **Circuit breaker** — 3 consecutive failures opens a provider's circuit for 60s. Success resets it.
 - **`ProviderSelector` mutates `config.yaml`** — when auto-switch fires, it writes `primary: true` back to the file. This is by design, not a side effect to "fix".

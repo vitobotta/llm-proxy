@@ -1,6 +1,6 @@
 # LLM Proxy
 
-Multi-provider LLM proxy that picks the fastest provider, retries on failure, and streams tokens in real time.
+Multi-provider LLM proxy that picks the fastest provider, retries on failure, and optionally streams tokens in real time.
 
 Drop-in OpenAI-compatible API. Configure once, let the proxy handle provider selection, circuit breaking, and fallback.
 
@@ -280,6 +280,8 @@ For high-concurrency I/O-bound workloads, raise `PUMA_MAX_THREADS` to `16–32` 
 | `/health` | GET | Health check — returns `{\"status\":\"ok\"}` |
 | `/v1/health/detail` | GET | Detailed provider stats (requires auth) |
 | `/metrics` | GET | Prometheus-compatible metrics |
+
+Completion requests return one complete JSON response by default. Set `"stream": true` to receive a server-sent event stream instead.
 
 ## Usage
 

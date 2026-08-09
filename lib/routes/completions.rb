@@ -4,11 +4,15 @@
 # Registered via `Sinatra::Base.register Routes::Completions` in proxy.rb.
 module Routes
   module Completions
+    def self.stream_requested?(body)
+      body["stream"] == true
+    end
+
     def self.registered(app)
       %w[chat/completions completions].each do |endpoint|
         app.post "/v1/#{endpoint}" do
           req = parse_request
-          stream_requested = req[:body].key?("stream") ? req[:body]["stream"] != false : true
+          stream_requested = Routes::Completions.stream_requested?(req[:body])
 
           if stream_requested
             HTTPSupport::SSE_HEADERS.each { |k, v| headers[k] = v }

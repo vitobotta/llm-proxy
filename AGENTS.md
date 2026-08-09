@@ -58,7 +58,7 @@ curl -s http://localhost:9234/v1/models | python3 -m json.tool
 
 ## Architecture notes
 
-- **Streaming is the default** — `stream: false` must be explicit in the request body. The `stream_requested` var is `true` unless body has `"stream": false`.
+- **Non-streaming is the default** — `stream: true` must be explicit in the request body. Omitted or false `stream` values return one complete JSON response.
 - **Provider auto-selection** happens per-request via `ProviderSelector#ordered_providers`. Active provider is first; others follow config order (when `auto_switch: false`) or are sorted by score (when `auto_switch: true`). Circuit-broken and quota-paused providers are skipped.
 - **Circuit breaker** — 3 consecutive failures opens a provider's circuit for 60s. Success resets it. Client disconnects (`client_disconnect` failure reason) do NOT count toward the circuit breaker — the provider didn't fail, the client just went away.
 - **Quota pause** — 429, 402, and 403 (with quota body patterns like `insufficient_quota`, `billing limit`, `credit`, etc.) responses immediately pause the provider and fall through to the next one. The pause duration is extracted from `Retry-After`, `x-ratelimit-reset-requests/tokens` headers, or the response body. If none are available, `quota_pause_default_seconds` (default 60s) is used. Paused providers are skipped by requests and probes until the pause expires. `QuotaExhaustedError` is raised in `handle_upstream_error` and caught in `try_with_retries` which returns immediately (no retry on same provider). `with_auto_select` registers the pause via `selector.quota_pause!`. `quota_pause!` takes the `max` of the current and new `paused_until` so repeated requests can't extend a pause beyond the server-stated reset time.
