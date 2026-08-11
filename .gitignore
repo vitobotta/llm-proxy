@@ -32,3 +32,6 @@ data/provider_state.json
 .DS_Store
 .opencode
 .lcm
+
+# Misc
+.learnings
