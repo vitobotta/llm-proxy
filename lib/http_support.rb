@@ -290,7 +290,7 @@ module HTTPSupport
     URI_CACHE_LOCK.synchronize { URI_CACHE.clear }
   end
 
-  def self.build_upstream_request(provider_config, path, body, body_model, incoming_headers, stream: true)
+  def self.build_upstream_request(provider_config, path, body, body_model, incoming_headers, stream: true, responses_api: false)
     uri = cached_uri(provider_config["base_url"], path)
 
     request = Net::HTTP::Post.new(uri.request_uri)
@@ -313,8 +313,10 @@ module HTTPSupport
     request_body = body.dup
     request_body["model"] = body_model if body_model
     request_body["stream"] = stream
-    request_body["stream_options"] = {"include_usage" => true} if stream
-    request_body["perf_metrics_in_response"] = true if stream && provider_config["provider"] == "fireworks"
+    unless responses_api
+      request_body["stream_options"] = {"include_usage" => true} if stream
+      request_body["perf_metrics_in_response"] = true if stream && provider_config["provider"] == "fireworks"
+    end
     request.body = request_body.to_json
 
     [uri, request]

@@ -661,6 +661,167 @@ class TestStreaming < Minitest::Test
     assert tracker.first_token, "first_token should be set"
   end
 
+  def test_parse_chunk_detects_responses_output_text_delta
+    chunk = %q(data: {"type":"response.output_text.delta","delta":"Hello"}) + "\n\n"
+    cr = Streaming.parse_chunk(chunk)
+    assert cr.has_responses_delta
+    assert cr.has_content
+    refute cr.is_responses
+  end
+
+  def test_parse_chunk_reasoning_delta_not_thinking_without_env
+    chunk = %q(data: {"type":"response.reasoning_text.delta","delta":"Hmm..."}) + "\n\n"
+    cr = Streaming.parse_chunk(chunk)
+    refute cr.has_thinking
+    assert cr.has_responses_delta
+  end
+
+  def test_parse_chunk_reasoning_delta_thinking_with_env
+    old = ENV["RESPONSES_ENABLE_THINKING_TRACKING"]
+    ENV["RESPONSES_ENABLE_THINKING_TRACKING"] = "1"
+    chunk = %q(data: {"type":"response.reasoning_text.delta","delta":"Hmm..."}) + "\n\n"
+    cr = Streaming.parse_chunk(chunk)
+    assert cr.has_thinking
+  ensure
+    if old.nil?
+      ENV.delete("RESPONSES_ENABLE_THINKING_TRACKING")
+    else
+      ENV["RESPONSES_ENABLE_THINKING_TRACKING"] = old
+    end
+  end
+
+  def test_parse_chunk_responses_completed_nested_usage
+    usage = {"output_tokens" => 7, "input_tokens" => 3}
+    chunk = 'data: {"type":"response.completed","response":{"usage":' + usage.to_json + '}}' + "\n\n"
+    cr = Streaming.parse_chunk(chunk)
+    assert cr.is_responses
+    assert_equal usage, cr.usage
+  end
+
+  def test_parse_chunk_responses_completed_top_level_usage
+    usage = {"output_tokens" => 5, "input_tokens" => 2}
+    chunk = 'data: {"type":"response.completed","usage":' + usage.to_json + '}' + "\n\n"
+    cr = Streaming.parse_chunk(chunk)
+    assert cr.is_responses
+    assert_equal usage, cr.usage
+  end
+
+  def test_parse_chunk_responses_completed_null_usage_not_responses
+    chunk = %q(data: {"type":"response.completed","response":{"usage":null}}) + "\n\n"
+    cr = Streaming.parse_chunk(chunk)
+    refute cr.is_responses
+    assert_nil cr.usage
+  end
+
+  def test_parse_chunk_responses_output_item_done_sets_delta
+    chunk = %q(data: {"type":"response.output_item.done","output_index":0,"item":{"type":"message"}}) + "\n\n"
+    cr = Streaming.parse_chunk(chunk)
+    assert cr.has_responses_delta
+  end
+
+  def test_parse_chunk_chat_chunk_no_responses_flags
+    chunk = "data: {\"choices\":[{\"delta\":{\"content\":\"world\"}}]}\n\n"
+    cr = Streaming.parse_chunk(chunk)
+    refute cr.is_responses
+    refute cr.has_responses_delta
+  end
+
+  def test_parse_chunk_responses_failed_is_responses_with_top_level_usage
+    chunk = 'data: {"type":"response.failed","usage":{"output_tokens":1}}' + "\n\n"
+    cr = Streaming.parse_chunk(chunk)
+    assert cr.is_responses
+    assert_equal({"output_tokens" => 1}, cr.usage)
+  end
+
+  def test_parse_chunk_event_line_semantics_event_types_detected
+    chunk = "event: response.created\ndata: {\"type\":\"response.created\"}\n\n" \
+            "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}\n\n" \
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"output_tokens\":2}}}\n\n"
+    cr = Streaming.parse_chunk(chunk)
+    assert cr.is_responses
+    assert cr.has_responses_delta
+    assert cr.has_content
+    assert_equal({"output_tokens" => 2}, cr.usage)
+  end
+
+  def test_parse_chunk_event_line_semantics_detects_delta_on_event_line_only
+    chunk = "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"Bo\"}\n\n"
+    cr = Streaming.parse_chunk(chunk)
+    assert cr.has_responses_delta
+    assert cr.has_content
+  end
+
+  def test_parse_chunk_event_line_requires_data_type_to_match
+    chunk = "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{}}\n\n"
+    cr = Streaming.parse_chunk(chunk)
+    refute cr.is_responses, "event-line-only terminal events without usage are not Responses-evidence"
+  end
+
+  def test_parse_chunk_output_text_done_counts_as_delta
+    chunk = "event: response.output_text.done\ndata: {\"type\":\"response.output_text.done\",\"text\":\"Hi\"}\n\n"
+    cr = Streaming.parse_chunk(chunk)
+    assert cr.has_responses_delta
+    assert cr.has_content
+  end
+
+  def test_parse_chunk_completed_with_crlf
+    chunk = "event: response.completed\r\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"output_tokens\":9}}}\r\n\r\n"
+    cr = Streaming.parse_chunk(chunk)
+    assert cr.is_responses
+    assert_equal({"output_tokens" => 9}, cr.usage)
+  end
+
+  def test_parse_chunk_completed_with_nulls_has_no_responses_flags
+    chunk = "\u0000data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"output_tokens\":3}}}"
+    cr = Streaming.parse_chunk(chunk)
+    refute cr.is_responses
+    refute cr.has_responses_delta
+  end
+
+  def test_parse_chunk_with_only_containers_has_no_response_state
+    chunk = "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\"}}\n\n"
+    cr = Streaming.parse_chunk(chunk)
+    refute cr.is_responses
+    refute cr.has_responses_delta
+  end
+
+  def test_parse_chunk_output_item_added_does_not_overwrite_delta_flags
+    chunk = "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hello\"}]}}\n\n"
+    cr = Streaming.parse_chunk(chunk)
+    refute cr.has_responses_delta
+    refute cr.has_content, "container-embedded text is not token output"
+  end
+
+  def test_parse_chunk_alias_style_chat_type_ignored_without_rewrite_flag
+    chunk = "data: {\"id\":\"c1\",\"type\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{}}]}\n\n"
+    cr = Streaming.parse_chunk(chunk)
+    refute cr.is_responses
+    refute cr.has_responses_delta
+    refute cr.has_content
+  end
+
+  def test_parse_chunk_responses_evidence_on_containers
+    created = "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\"}}\n\n"
+    cr = Streaming.parse_chunk(created)
+    assert cr.responses_evidence
+    refute cr.has_responses_delta
+    refute cr.is_responses
+  end
+
+  def test_parse_chunk_responses_evidence_on_event_line
+    chunk = "event: response.created\ndata: {\"type\":\"response.created\"}\n\n"
+    cr = Streaming.parse_chunk(chunk)
+    assert cr.responses_evidence
+  end
+
+  def test_parse_chunk_usage_wins_over_no_usage_terminal
+    completed_with = 'data: {"type":"response.completed","response":{"usage":{"output_tokens":3}}}' + "\n\n"
+    later_no_usage = 'data: {"type":"response.completed","response":{"usage":null}}' + "\n\n"
+    cr = Streaming.parse_chunk(completed_with + later_no_usage)
+    assert cr.is_responses
+    assert_equal({"output_tokens" => 3}, cr.usage, "null usage later in the chunk must not clobber a parsed hash")
+  end
+
 end
 # --- Mock helpers ---
 

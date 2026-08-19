@@ -97,7 +97,9 @@ module RequestHandler
     end
 
     if probing && selector.record_and_maybe_probe(probe_interval)
-      ProbeManager.launch(selector, model_name, path, headers,
+      # Probes always measure chat/completions — probe latency ranks providers
+      # model-wide, independent of the request's API format.
+      ProbeManager.launch(selector, model_name, "chat/completions", headers,
         timeouts: ConfigStore.timeouts, auto_switch: auto_switch, logger: settings.logger,
         max_per_minute: ConfigStore.probe_max_per_minute)
     end
@@ -119,7 +121,6 @@ module RequestHandler
     summary_lines = attempts.map { |a| "#{a[:provider]}: #{a[:reason]}#{" (status=#{a[:status]})" if a[:status]}" }
     last_status = attempts.last[:status]
     fallback_status = (last_status && last_status >= 400 && last_status < 600) ? last_status : 502
-
     msg = deadline_hit ? "All providers failed (request deadline exceeded)" : "All providers failed"
     {
       success: false,
@@ -166,8 +167,8 @@ module RequestHandler
   MAX_ACCUMULATED_SIZE = 512 * 1024
   ACCUMULATED_TAIL_SIZE = 64 * 1024
   REQUEST_DEADLINE = 600
-  def try_stream(provider_config, path, body, body_model, incoming_headers, out:, log_prefix:, deadline_remaining: nil)
-    uri, request = HTTPSupport.build_upstream_request(provider_config, path, body, body_model, incoming_headers, stream: true)
+  def try_stream(provider_config, path, body, body_model, incoming_headers, out:, log_prefix:, deadline_remaining: nil, responses_api: false)
+    uri, request = HTTPSupport.build_upstream_request(provider_config, path, body, body_model, incoming_headers, stream: true, responses_api: responses_api)
 
     try_with_retries(log_prefix: log_prefix, body_model: body_model) do
       attempt_start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
@@ -186,8 +187,32 @@ module RequestHandler
       server_duration = nil
       stream_result = nil
       tracking = ConfigStore.tracking_enabled
-      accumulated = tracking ? +"" : nil
+      # Responses-mode latch flags re-parse the accumulated tail at stream
+      # end, so a bounded buffer is kept even when metrics tracking is off.
+      accumulated = (tracking || responses_api) ? +"" : nil
 
+      is_responses = false
+      always_responses_delta = false
+      responses_evidence = false
+      pending_chunk = nil
+      pending_cr = nil
+      out_chunk = lambda do |chunk, cr|
+        forward_chunk_to_client(out, chunk)
+        streamed_any = true
+        is_responses ||= cr.is_responses
+        always_responses_delta ||= cr.has_responses_delta
+        responses_evidence ||= cr.responses_evidence
+        if accumulated
+          accumulated << chunk
+          if accumulated.bytesize > MAX_ACCUMULATED_SIZE
+            accumulated = accumulated.byteslice(-ACCUMULATED_TAIL_SIZE, ACCUMULATED_TAIL_SIZE)
+          end
+        end
+        # The accumulated tail doubles as the split-event recovery buffer in
+        # Responses mode, so it must survive until the stream-end re-parse.
+        # Chat mode keeps the pre-existing early-nil optimisation.
+        accumulated = nil if cr.usage && !responses_api
+      end
       # TTFT timeout: consume_stream uses a two-layer approach to catch
       # providers that never start generating within ttft_timeout seconds
       # (per-attempt deadline from attempt_start). Measuring from
@@ -211,33 +236,91 @@ module RequestHandler
       # Requires tracking enabled — chunk parsing is needed to detect the
       # first token. When tracking is off the feature is skipped.
       ttft_timeout = tracking && timeouts[:ttft]
-
+      # In Responses mode the first-token gate only sees reasoning deltas
+      # when RESPONSES_ENABLE_THINKING_TRACKING is enabled; without it the
+      # TTFT timer would kill healthy long-reasoning streams whose content
+      # deltas arrive after the timeout.
+      ttft_timeout = nil if responses_api && ENV["RESPONSES_ENABLE_THINKING_TRACKING"] != "1"
       begin
         http.request(request) do |response|
           if response.is_a?(Net::HTTPSuccess)
             if tracking
               usage_data, perf_metrics, server_duration = Streaming.consume_stream(response,
                 tracker: timers, ttft_timeout: ttft_timeout, request_start: attempt_start, http: http) do |chunk, cr, _now|
-                forward_chunk_to_client(out, chunk)
-                streamed_any = true
-                if accumulated
-                  accumulated << chunk
-                  if accumulated.bytesize > MAX_ACCUMULATED_SIZE
-                    accumulated = accumulated.byteslice(-ACCUMULATED_TAIL_SIZE, ACCUMULATED_TAIL_SIZE)
+                if responses_api
+                  if pending_chunk
+                    out_chunk.call(pending_chunk, pending_cr)
                   end
+                  pending_chunk = chunk
+                  pending_cr = cr
+                else
+                  out_chunk.call(chunk, cr)
                 end
-                accumulated = nil if cr.usage
               end
             else
               response.read_body do |chunk|
-                forward_chunk_to_client(out, chunk)
-                streamed_any = true
+                if responses_api
+                  cr = Streaming.parse_chunk(chunk)
+                  if pending_chunk
+                    out_chunk.call(pending_chunk, pending_cr)
+                  end
+                  pending_chunk = chunk
+                  pending_cr = cr
+                else
+                  forward_chunk_to_client(out, chunk)
+                  streamed_any = true
+                end
               end
             end
 
+            if responses_api && pending_chunk
+              is_responses ||= pending_cr.is_responses
+              always_responses_delta ||= pending_cr.has_responses_delta
+              responses_evidence ||= pending_cr.responses_evidence
+              # Strip a trailing `data: [DONE]` line (LF or CRLF — SSE
+              # permits both) so synthetic events always precede it and the
+              # stream ends with exactly one [DONE], regardless of the
+              # provider's own termination.
+              non_done = pending_chunk.sub(/data: \[DONE\][\r\n]*\z/, "")
+              out_chunk.call(non_done, pending_cr) unless non_done.empty?
+              # Some providers split single SSE events (notably the big
+              # terminal payloads) across network chunks. Re-parse the
+              # concatenated tail — bounded to the window where stray
+              # events can actually hide — so split deltas, split usage
+              # blocks, and perf fields feed the classification and the
+              # metrics harvest below.
+              tail_cr = nil
+              if accumulated && !accumulated.empty?
+                tail = accumulated.end_with?("\n\n") ? accumulated : accumulated + "\n\n"
+                if tail.bytesize > ACCUMULATED_TAIL_SIZE
+                  tail = tail.byteslice(-ACCUMULATED_TAIL_SIZE, ACCUMULATED_TAIL_SIZE)
+                end
+                tail_cr = Streaming.parse_chunk(tail)
+                is_responses ||= tail_cr.is_responses
+                always_responses_delta ||= tail_cr.has_responses_delta
+                responses_evidence ||= tail_cr.responses_evidence
+              end
+              # Synthetic termination: something was streamed but the
+              # provider gave no terminal/delta evidence — or gave only
+              # announce-y container events before stopping — so give the
+              # client a definitive end event instead of a silent stop.
+              if streamed_any && ((is_responses != always_responses_delta) ||
+                 (responses_evidence && !always_responses_delta))
+                if is_responses
+                  synthetic = "data: " + {"type" => "response.failed", "response" => {}, "error" => {"code" => "upstream_stopped", "message" => "The upstream provider ended the stream before responding. No retries are possible on a partially-streamed response."}}.to_json + "\n\n"
+                else
+                  synthetic = "data: " + {"type" => "response.not_found", "code" => "upstream_stopped", "message" => "The upstream provider ended the stream before responding. No retries are possible on a partially-streamed response."}.to_json + "\n\n"
+                end
+                forward_chunk_to_client(out, synthetic)
+              end
+              forward_chunk_to_client(out, "data: [DONE]\n\n")
+            end
+
             if tracking
+              # Responses mode reuses the tail parse already done for the
+              # latch flags; chat mode parses the fresh accumulated tail.
               unless usage_data
-                fallback = Streaming.parse_chunk(accumulated.to_s) if accumulated
+                fallback = tail_cr || (Streaming.parse_chunk(accumulated.to_s) if accumulated)
                 usage_data = fallback.usage if fallback&.usage
                 perf_metrics = fallback.perf_metrics if fallback&.perf_metrics
                 server_duration = fallback.server_duration if fallback&.server_duration
@@ -284,8 +367,8 @@ module RequestHandler
     end
   end
 
-  def try_single_request(provider_config, path, body, body_model, incoming_headers, log_prefix:, deadline_remaining: nil)
-    uri, request = HTTPSupport.build_upstream_request(provider_config, path, body, body_model, incoming_headers, stream: false)
+  def try_single_request(provider_config, path, body, body_model, incoming_headers, log_prefix:, deadline_remaining: nil, responses_api: false)
+    uri, request = HTTPSupport.build_upstream_request(provider_config, path, body, body_model, incoming_headers, stream: false, responses_api: responses_api)
 
     try_with_retries(log_prefix: log_prefix, body_model: body_model) do
       timeouts = ConfigStore.timeouts
@@ -329,9 +412,13 @@ module RequestHandler
     end
   end
 
-  def handle_streaming_error(result, out)
+  def handle_streaming_error(result, out, is_responses: false)
     return if result[:success]
-    out << streaming_error(result[:error], detail: result[:detail])
+    if is_responses
+      out << streaming_responses_error(result[:error], detail: result[:detail])
+    else
+      out << streaming_error(result[:error], detail: result[:detail])
+    end
     out << "data: [DONE]\n\n"
   rescue Errno::EPIPE, IOError, Puma::ConnectionError
     raise HTTPSupport::ClientDisconnected

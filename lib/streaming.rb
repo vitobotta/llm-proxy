@@ -34,8 +34,48 @@ module Streaming
   ].freeze
   TOOL_CALL_PATTERN = /(?:^|[^a-zA-Z_])"tool_calls"\s*:\s*\[/
   USAGE_STRING = '"usage"'
+  RESPONSES_PREFIX_STRING = '"response.'
+  RESPONSES_EVENT_LINE_STRING = "event: response."
+  RESPONSES_RESPONSE_EVENT_TYPES = %w[response.failed response.incomplete response.completed].freeze
+  RESPONSES_NOTIFY_EVENT_TYPES = %w[response.output_text.delta response.reasoning_text.delta response.output_item.done].freeze
+  # With event: line semantics (optional under the SSE spec; OpenAI sends
+  # both `event:` and data `type`), event-shaped providers may replace a
+  # `response.reasoning_text.delta` or `response.output_text.delta` with a
+  # lone `*_text.done` event when the delta is empty or for the final
+  # flush. Treat them as content/thinking deltas so a stream that only
+  # emits them is not misdetected as empty.
+  RESPONSES_DELTA_EVENT_TYPES = %w[response.output_text.done response.reasoning_text.done].freeze
+  # Containers whose `data:` payloads embed nested `content`/`text` fields
+  # that the flat-line CONTENT_PATTERNS heuristics below would otherwise
+  # misread as token output. When a chunk holds only containers (no real
+  # delta event), classification is rolled back so terminal/announce
+  # chunks don't pollute the tracker or the synthetic-termination logic.
+  RESPONSES_CONTAINER_EVENT_TYPES = %w[
+    response.created response.in_progress response.completed response.failed
+    response.output_item.added response.output_item.done response.content_part.added
+  ].freeze
 
-  ChunkResult = Struct.new(:usage, :has_thinking, :has_content, :has_tool_call, :perf_metrics, :server_duration)
+  ChunkResult = Struct.new(:usage, :has_thinking, :has_content, :has_tool_call, :perf_metrics, :server_duration, :is_responses, :has_responses_delta, :responses_evidence)
+
+  # Single classifier shared by the event:-line scan and the data:-payload
+  # scan so both agree on delta/content/thinking semantics. Returns :delta
+  # for output-bearing events, :terminal for response-lifecycle events, nil
+  # otherwise. Any `response.*` type sets responses_evidence (the stream is
+  # definitively a Responses stream, delta or not).
+  def self.classify_responses_type!(result, type)
+    return unless type.is_a?(String) && type.start_with?("response.")
+    result.responses_evidence = true
+    return :terminal if RESPONSES_RESPONSE_EVENT_TYPES.include?(type)
+    return unless RESPONSES_NOTIFY_EVENT_TYPES.include?(type) || RESPONSES_DELTA_EVENT_TYPES.include?(type)
+    case type
+    when "response.output_text.delta", "response.output_text.done"
+      result.has_content = true
+    when "response.reasoning_text.delta", "response.reasoning_text.done"
+      result.has_thinking = true if ENV["RESPONSES_ENABLE_THINKING_TRACKING"] == "1"
+    end
+    result.has_responses_delta = true
+    :delta
+  end
 
   class TimerTracker
     attr_reader :first_token, :first_thinking, :last_thinking,
@@ -78,7 +118,7 @@ module Streaming
   ENERGY_COMMENT_PREFIX = ": energy"
 
   def self.parse_chunk(chunk)
-    result = ChunkResult.new(nil, false, false, false, nil, nil)
+    result = ChunkResult.new(nil, false, false, false, nil, nil, false, false, nil)
 
     # vLLM energy comment line: ": energy {"duration_seconds": 1.234, ...}"
     # This is an SSE comment line (not a data: line) that contains the
@@ -98,13 +138,39 @@ module Streaming
       end
     end
 
-    if chunk.include?(USAGE_STRING) || chunk.include?(PERF_METRICS_STRING)
-      chunk.scan(/^data:\s*(.+)$/).each do |raw|
+    if chunk.include?(USAGE_STRING) || chunk.include?(PERF_METRICS_STRING) || chunk.include?(RESPONSES_PREFIX_STRING) || chunk.include?(RESPONSES_EVENT_LINE_STRING)
+      chunk.scan(/^event:\s*([^\r\n]+)/).each do |e|
+        classify_responses_type!(result, e.first.strip)
+      end
+
+      notify_seen = false
+      container_payload = false
+      chunk.scan(/^(?:event:\s*|data:\s*)(?:data:\s+)?([^\r\n]+)/).each do |raw|
         line = raw.first.strip
         next if line == "[DONE]" || line.empty?
+        next unless line.start_with?("{")
         begin
           data = JSON.parse(line)
-          if data.key?("usage")
+          type = data.is_a?(Hash) ? data["type"] : nil
+          container_payload = true if type.is_a?(String) && RESPONSES_CONTAINER_EVENT_TYPES.include?(type)
+          case classify_responses_type!(result, type)
+          when :terminal
+            # Real OpenAI nests usage under the event's `response` field
+            # ({"type":"response.completed","response":{"usage":{...}}}); some
+            # providers place it top-level. Accept both. `is_responses` is
+            # usage-tied: a terminal event without a usage block is not
+            # treated as Responses-evidence by the synthetic-event logic.
+            usage = data["usage"].is_a?(Hash) ? data["usage"] : (data["response"].is_a?(Hash) ? data["response"]["usage"] : nil)
+            if usage.is_a?(Hash)
+              result.usage = usage
+              result.is_responses = true
+            end
+          when :delta
+            notify_seen = true
+          end
+          # Last-seen-wins, but never clobber an already-parsed hash with
+          # the null you get from a terminal event that carried no usage.
+          if data.key?("usage") && (data["usage"].is_a?(Hash) || result.usage.nil?)
             result.usage = data["usage"]
           end
           if data.key?("perf_metrics")
@@ -115,16 +181,30 @@ module Streaming
           next
         end
       end
+
+      container_only = container_payload && !notify_seen
+      if container_only
+        # Container events in `data:` payloads (some providers embed their
+        # `event:` types into `data:` instead) carry nested content fields
+        # that the pattern heuristics below would otherwise misinterpret
+        # as token output. Only flat-line classification is adjusted here —
+        # actual delta events are announce-y and set their own flags.
+        result.has_responses_delta = false
+        result.has_content = false
+        result.has_tool_call = false
+      end
+    end
+    unless container_only
+      result.has_thinking ||= THINKING_PATTERNS.any? { |r| chunk.match?(r) }
+
+      if chunk.match?(TOOL_CALL_PATTERN)
+        result.has_tool_call = true
+        result.has_content = true
+      else
+        result.has_content ||= CONTENT_PATTERNS.any? { |r| chunk.match?(r) }
+      end
     end
 
-    result.has_thinking = THINKING_PATTERNS.any? { |r| chunk.match?(r) }
-
-    if chunk.match?(TOOL_CALL_PATTERN)
-      result.has_tool_call = true
-      result.has_content = true
-    else
-      result.has_content = CONTENT_PATTERNS.any? { |r| chunk.match?(r) }
-    end
 
     result
   end
@@ -345,5 +425,15 @@ module Streaming
 
   def streaming_error(message, detail: nil)
     "data: #{{error: {message: message, detail: detail}}.to_json}\n\n"
+  end
+
+  # Responses-API-shaped error event. Used by the stream-end error path
+  # and the generic rescue in the /v1/responses route, so every error a
+  # client can observe in Responses mode is a `response.failed` event —
+  # never a chat-style `{"error": ...}` payload.
+  def streaming_responses_error(message, detail: nil)
+    payload = {"type" => "response.failed", "response" => {}, "error" => {"code" => "proxy_error", "message" => message}}
+    payload["error"]["detail"] = detail if detail
+    "data: #{payload.to_json}\n\n"
   end
 end

@@ -656,4 +656,36 @@ class TestHTTPSupport < Minitest::Test
     end
     assert_equal future.to_f, err.reset_time
   end
+
+  def test_build_upstream_request_responses_api_skips_chat_injection
+    provider_config = {
+      "provider" => "fireworks",
+      "base_url" => "https://api.fireworks.ai/v1",
+      "api_key" => "fw-key",
+      "model" => "mock-resp"
+    }
+    body = {"model" => "resp-model", "input" => "Hi", "stream" => true}
+    _uri, request = HTTPSupport.build_upstream_request(
+      provider_config, "responses", body, "mock-resp", nil, stream: true, responses_api: true
+    )
+    parsed = JSON.parse(request.body)
+    assert_equal true, parsed["stream"]
+    assert_equal "mock-resp", parsed["model"]
+    refute parsed.key?("stream_options")
+    refute parsed.key?("perf_metrics_in_response")
+  end
+
+  def test_build_upstream_request_chat_stream_injects_usage
+    provider_config = {
+      "provider" => "openai",
+      "base_url" => "https://api.openai.com/v1",
+      "api_key" => "k",
+      "model" => "gpt-4"
+    }
+    _uri, request = HTTPSupport.build_upstream_request(
+      provider_config, "chat/completions", {"model" => "gpt-4"}, "gpt-4", nil, stream: true
+    )
+    parsed = JSON.parse(request.body)
+    assert_equal({"include_usage" => true}, parsed["stream_options"])
+  end
 end
