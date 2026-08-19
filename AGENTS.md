@@ -109,6 +109,6 @@ Anything end users will read — GitHub release notes, CHANGELOG entries, README
 - **Breaking changes lead with the operator action.** "Update Prometheus configs that reference the old name", "Ensure every provider has a non-empty `api_key`", "Set `user:` in compose if your host UID isn't 1000". Action first; explanation second.
 - **No dev-process metadata.** Don't mention phases, commit counts, audit numbering, which tool surfaced a bug, or how work was batched. The reader doesn't care that something was "P0.4" or that "standardrb caught it".
 - **No reader-direct framing.** Avoid "read these first", "for context", "as you'll see", "happy to …". These read like agent-to-maintainer chat, not a public artifact.
-- **Section the notes** — `⚠️ Breaking changes`, `What's Fixed`, `What's New` (subgrouped if long: Observability / Configuration / Security), `Performance`, then `Code organisation` / `Tooling` / `Tests` for the contributor-facing tail. Skip empty sections.
+- **Section the notes** — `⚠️ Breaking changes`, `What's Fixed`, `What's New`, then `Code organisation` / `Tooling` / `Tests` for the contributor-facing tail. Skip empty sections. GitHub release notes never include a `Tests` section.
 
 Internal artifacts — commit messages, plan files, conversations — are exempt and may stay in working-notes voice.

@@ -18,7 +18,7 @@ Every incoming request follows this path:
 
 1. **Route** — the proxy matches the requested model name to your config
 2. **Select** — `ProviderSelector` picks the best provider: the active primary, or the highest-scoring alternative if the primary's circuit breaker is open or quota-paused
-3. **Stream** — the request is forwarded to the chosen provider; the response streams back to the client in real time (SSE)
+3. **Forward** — the request is sent to the chosen provider; the response returns either as one complete JSON document or as a real-time server-sent event (SSE) stream when `stream: true` is set
 4. **Measure** — TTFT, token counts, and tokens-per-second are recorded per-request
 5. **Auto-switch** — a background probe periodically compares providers on real TTFT/TPS data; if a non-primary provider consistently outperforms the active one, the proxy switches and persists the change to your config
 6. **Fallback** — if the chosen provider fails, the proxy retries it up to `max_attempts` times, then falls through to the next provider. After all providers in a round fail, the proxy starts a new round (up to `max_rounds`) with a backoff delay between rounds, re-walking the provider list. Circuit-broken and quota-paused providers are excluded from subsequent rounds.
@@ -265,6 +265,7 @@ auth:
 | `RACK_ENV` | `production` | Rack environment |
 | `CONFIG_FILE` | `config/config.yaml` | Absolute path to the config file |
 | `STATE_DIR` | `data/` | Directory for persisted provider state |
+| `RESPONSES_ENABLE_THINKING_TRACKING` | unset | Track Responses API streams for metrics and enable the TTFT gate (`1` to enable) |
 
 For high-concurrency I/O-bound workloads, raise `PUMA_MAX_THREADS` to `16–32` since most time is waiting on upstream providers.
 
@@ -274,6 +275,7 @@ For high-concurrency I/O-bound workloads, raise `PUMA_MAX_THREADS` to `16–32` 
 |---|---|---|
 | `/v1/chat/completions` | POST | Chat completions (streaming or single) |
 | `/v1/completions` | POST | Legacy completions (streaming or single) |
+| `/v1/responses` | POST | OpenAI Responses API (streaming or single) |
 | `/v1/embeddings` | POST | Embeddings (non-streaming) |
 | `/v1/models` | GET | List configured models |
 | `/v1/models/:name` | GET | Model details with provider routing |
@@ -282,6 +284,8 @@ For high-concurrency I/O-bound workloads, raise `PUMA_MAX_THREADS` to `16–32` 
 | `/metrics` | GET | Prometheus-compatible metrics |
 
 Completion requests return one complete JSON response by default. Set `"stream": true` to receive a server-sent event stream instead.
+
+Requests to `/v1/responses` mirror the OpenAI Responses API: they are forwarded to the upstream `/responses` endpoint verbatim — only `model` and `stream` are rewritten — and are never translated to or from chat format. Chat-only injections like `stream_options.include_usage` are not sent. If a Responses stream ends without any output events, the proxy injects a `response.failed` (or `response.not_found`) event with `code: upstream_stopped` before `data: [DONE]`, so clients fail fast instead of hanging. Providers that do not serve `/responses` answer with their own upstream error, which the fallback loop surfaces.
 
 ## Usage
 
@@ -299,7 +303,7 @@ The proxy passes `Authorization`, `OpenAI-Organization`, and `OpenAI-Beta` heade
 
 ## Streaming Stats
 
-Every streaming request logs token statistics:
+Every streaming chat completion request logs token statistics:
 
 ```
 [glm-5/wafer] Success | content=187 thinking=42 ttft=0.342s content_tps=54.3 thinking_tps=18.7 total_tps=48.9
@@ -311,6 +315,8 @@ Every streaming request logs token statistics:
 - **content_tps** — content tokens per second (measured from first content token to last content token)
 - **thinking_tps** — thinking tokens per second (measured from first thinking token to last thinking token)
 - **total_tps** — completion tokens per second. Uses server-side timing when reported by the provider (in priority order: `usage.tokens_per_second`, Groq's `usage.completion_time`, Fireworks' `perf_metrics.generation-duration`, or the vLLM `: energy` comment's `duration_seconds`); falls back to the arrival-window estimate (first token to last of any kind) when no server timing is available
+
+Responses API streams are not token-tracked by default — only chat completions feed these stats. Set `RESPONSES_ENABLE_THINKING_TRACKING=1` to also track Responses streams; without it, reasoning-delta detection and the TTFT timeout gate stay off (they are enabled only under that flag), so long reasoning-only Responses streams are not cut off by the first-token timeout.
 
 In addition to per-request stats, a periodic TPS summary is logged every 5 seconds for each provider with recent activity:
 
