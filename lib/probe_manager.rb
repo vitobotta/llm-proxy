@@ -44,11 +44,11 @@ module ProbeManager
     Thread.new do
       named_threads = selector.other_providers.filter_map do |provider_config|
         p_name = provider_config["provider"]
-        if selector.quota_paused?(p_name)
+        if selector.quota_paused?(provider_config)
           logger.debug("[probe:#{probe_id}] Skipping quota-paused provider #{p_name}")
           next
         end
-        if selector.circuit_open?(p_name)
+        if selector.circuit_open?(provider_config)
           logger.debug("[probe:#{probe_id}] Skipping circuit-broken provider #{p_name}")
           next
         end
@@ -57,25 +57,25 @@ module ProbeManager
           begin
             Timeout.timeout(deadline_seconds) do
               metrics = probe_provider(provider_config, path, PROBE_BODY, provider_config["model"], headers, timeouts: timeouts, logger: logger, selector: selector)
-              [p_name, metrics]
+              [provider_config, metrics]
             end
           rescue Timeout::Error
             logger.warn("[probe:#{probe_id}] #{p_name} exceeded #{deadline_seconds}s deadline")
-            [p_name, {ttft: Float::INFINITY, tps: nil}]
+            [provider_config, {ttft: Float::INFINITY, tps: nil}]
           rescue => e
             logger.error("[probe:#{probe_id}] #{p_name} thread error: #{e.class}: #{e.message}")
-            [p_name, {ttft: Float::INFINITY, tps: nil}]
+            [provider_config, {ttft: Float::INFINITY, tps: nil}]
           end
         end
-        [p_name, thread]
+        [p_name, provider_config, thread]
       end
 
-      results = named_threads.map { |p_name, t| t.value }
+      results = named_threads.map { |_p_name, provider_config, t| [provider_config, t.value[1]] }
 
-      results.each do |p_name, m|
-        selector.update_metrics(p_name, m[:ttft], m[:tps])
+      results.each do |provider_config, m|
+        selector.update_metrics(provider_config, m[:ttft], m[:tps])
         tps_str = m[:tps] ? m[:tps].to_s : "N/A"
-        logger.info("[probe:#{probe_id}] #{model_name}/#{p_name}: ttft=#{m[:ttft]}s tps=#{tps_str}")
+        logger.info("[probe:#{probe_id}] #{model_name}/#{provider_config["provider"]}: ttft=#{m[:ttft]}s tps=#{tps_str}")
       end
 
       selector.evaluate_and_select(logger, auto_switch: auto_switch)
@@ -113,7 +113,7 @@ module ProbeManager
             default_seconds: default_secs)
           logger.warn("[probe] #{pname}: Quota exhausted (#{reason}), pausing until #{Time.at(reset_time).utc.iso8601}")
           if selector
-            selector.quota_pause!(pname, reset_time, reason: reason)
+            selector.quota_pause!(provider_config, reset_time, reason: reason)
             Metrics.increment(:provider_quota_paused, labels: {provider: pname, model: provider_config["model"], reason: reason})
           end
         end

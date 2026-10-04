@@ -5,6 +5,7 @@ require "json"
 require "uri"
 require "time"
 require "securerandom"
+require "English"
 
 module HTTPSupport
   class RetryableError < StandardError
@@ -64,6 +65,16 @@ module HTTPSupport
   MAX_RETRY_AFTER = 86400
   KEEP_ALIVE_TIMEOUT = 30
   MAX_UPSTREAM_BODY_SIZE = 5 * 1024 * 1024
+  # Hard cap for successful (non-error) upstream response bodies. Generous
+  # enough for long generations and base64 payloads; exceeding it fails the
+  # attempt instead of OOMing the proxy or forwarding truncated JSON.
+  MAX_UPSTREAM_RESPONSE_BODY = 64 * 1024 * 1024
+  # Hop-by-hop/framing headers that must not be relayed to the client;
+  # Content-Length is recomputed by the server for the body we return.
+  NON_FORWARDABLE_RESPONSE_HEADERS = %w[
+    content-length transfer-encoding connection keep-alive upgrade trailer te
+    proxy-authenticate proxy-authorization set-cookie
+  ].freeze
   JITTER_FACTOR = 0.5
 
   SSE_HEADERS = {
@@ -90,6 +101,48 @@ module HTTPSupport
   }.freeze
   DEFAULT_AUTH = ->(req, key) { req["Authorization"] = "Bearer #{key}" }
 
+  # Reads a response body with a hard memory cap. Chunks past the cap are
+  # still drained from the socket (so the connection stays reusable) but
+  # discarded. Returns [body_string, truncated?].
+  #
+  # Falls back to `response.body` for already-buffered responses and for
+  # simple test doubles that don't implement read_body.
+  def self.read_body_capped(response, max)
+    body = +""
+    truncated = false
+    consume = lambda do |chunk|
+      next if truncated
+      if body.bytesize + chunk.bytesize > max
+        body << chunk.byteslice(0, [max - body.bytesize, 0].max).to_s
+        truncated = true
+      else
+        body << chunk
+      end
+    end
+
+    if response.respond_to?(:read_body)
+      streamed = false
+      begin
+        response.read_body do |chunk|
+          streamed = true
+          consume.call(chunk)
+        end
+      rescue IOError => e
+        # Net::HTTP raises IOError when read_body is called on an
+        # already-consumed response ("read_body called twice"). Use the
+        # buffered copy in that case; anything else is a genuine read
+        # failure and must propagate to the caller's error formatting.
+        raise if streamed
+        raise unless e.message.include?("twice")
+        consume.call(response.body.to_s)
+      end
+    else
+      consume.call(response.body.to_s)
+    end
+
+    [body, truncated]
+  end
+
   # Reads an upstream error response body, capping memory use.
   # If Content-Length advertises an oversized body, we skip the read
   # entirely so a buggy or hostile upstream can't force a multi-GB allocation.
@@ -99,14 +152,27 @@ module HTTPSupport
       return "[upstream error body of #{cl} bytes exceeds #{MAX_UPSTREAM_BODY_SIZE}-byte cap, suppressed]"
     end
 
-    body = begin
-      response.body
+    begin
+      body, truncated = read_body_capped(response, MAX_UPSTREAM_BODY_SIZE)
+      truncated ? body + "... (truncated)" : body
     rescue => e
       "[failed to read upstream body: #{e.class}: #{e.message}]"
     end
+  end
 
-    return body if body.nil? || body.bytesize <= MAX_UPSTREAM_BODY_SIZE
-    body.byteslice(0, MAX_UPSTREAM_BODY_SIZE) + "... (truncated)"
+  # Upstream response headers to relay to the client on non-streaming
+  # passthrough. Defaults Content-Type to application/json when upstream
+  # didn't send one.
+  def self.forwardable_response_headers(response)
+    headers = {}
+    if response.respond_to?(:each_header)
+      response.each_header do |name, value|
+        next if NON_FORWARDABLE_RESPONSE_HEADERS.include?(name.downcase)
+        headers[name.split("-").map(&:capitalize).join("-")] = value
+      end
+    end
+    headers["Content-Type"] ||= "application/json"
+    headers
   end
 
   # Parses an RFC 7231 Retry-After value (either a delta-seconds integer
@@ -335,6 +401,11 @@ module HTTPSupport
     http.read_timeout = timeouts[:read]
     http.write_timeout = timeouts[:write]
     http.keep_alive_timeout = KEEP_ALIVE_TIMEOUT
+    # Track the connection's true creation time so POOL_MAX_AGE (max socket
+    # lifetime) eviction works. checkin must NOT re-stamp this — tagging
+    # created: now on every check-in made "age" equal "time since last use"
+    # and kept long-lived sockets in the pool forever.
+    http.instance_variable_set(:@llm_proxy_created_at, Time.now.to_f)
     http
   end
 
@@ -365,7 +436,8 @@ module HTTPSupport
       entries = (CONNECTION_POOL[key] ||= [])
       # Evict stale entries
       entries.reject! { |e| now - e[:created] > POOL_MAX_AGE || now - e[:last_used] > POOL_MAX_IDLE }
-      entries << {http: http, created: now, last_used: now} if entries.size < MAX_POOL_SIZE
+      created = http.instance_variable_get(:@llm_proxy_created_at) || now
+      entries << {http: http, created: created, last_used: now} if entries.size < MAX_POOL_SIZE
     end
   rescue
     # If checkin fails, just let http get GC'd

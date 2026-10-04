@@ -65,9 +65,9 @@ module TpsReporter
 
     selector.providers.each do |provider_config|
       p_name = provider_config["provider"]
-      next unless selector.tps_active?(p_name, window: activity_window)
+      next unless selector.tps_active?(provider_config, window: activity_window)
 
-      m = selector.rolling_tps(p_name, window: eval_window)
+      m = selector.rolling_tps(provider_config, window: eval_window)
       next unless m && m[:n].positive?
       # Suppress log lines until enough tokens have accumulated that the
       # TPS values reflect real generation throughput, not TTFT noise from

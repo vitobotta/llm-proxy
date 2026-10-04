@@ -19,6 +19,11 @@ module Routes
           if stream_requested
             HTTPSupport::SSE_HEADERS.each { |k, v| headers[k] = v }
 
+            # The stream block runs lazily during response-body iteration,
+            # after the `after` filters. Deferring request accounting to the
+            # block keeps in_flight covering the whole stream (so graceful
+            # shutdown drains properly) and the duration metric honest.
+            @stream_deferred = true
             stream do |out|
               result = with_auto_select(
                 model: req[:model], model_name: req[:model_name],
@@ -40,6 +45,8 @@ module Routes
               rescue
                 nil
               end
+            ensure
+              finalize_request!
             end
           else
             result = with_auto_select(

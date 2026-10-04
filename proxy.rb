@@ -111,6 +111,7 @@ class LLMProxy < Sinatra::Base
       halt json_error(status: 503, message: "Server is shutting down", type: "server_error")
     end
     HTTPSupport.in_flight_increment!
+    @in_flight_counted = true
 
     auth_token = ConfigStore.auth_token
     if auth_token && requires_auth?(request.path)
@@ -161,13 +162,29 @@ class LLMProxy < Sinatra::Base
     end
   end
 
-  after do
+  # Finalises request accounting exactly once. Called from the `after`
+  # filter for normal requests, and from the stream block's ensure for
+  # streaming ones — Sinatra's stream block runs lazily during response-body
+  # iteration, i.e. AFTER the after-filters, so accounting it there keeps
+  # in_flight covering the whole stream and the duration metric honest.
+  def finalize_request!
+    return if @finalized
+    @finalized = true
     elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - @request_start
     settings.logger.info("[#{@request_id}] Completed #{response.status} in #{elapsed.round(3)}s")
     Metrics.increment(:requests_total, labels: {status: response.status})
     Metrics.observe(:request_duration_seconds, elapsed)
     Thread.current[:request_id] = nil
-    HTTPSupport.in_flight_decrement!
+    # Only decrement what was incremented: requests halted before the
+    # in-flight increment (shutdown 503s) must not drive the counter below
+    # zero, which would stall the graceful-shutdown drain loop past its
+    # deadline (it only breaks on exactly 0).
+    HTTPSupport.in_flight_decrement! if @in_flight_counted
+    @in_flight_counted = false
+  end
+
+  after do
+    finalize_request! unless @stream_deferred
   end
 
   def json_error(status:, message:, detail: nil, type: "proxy_error")

@@ -205,25 +205,32 @@ class FakeSelector
     @paused_names = []
   end
 
+  # Selector APIs receive the provider config hash (per-entry state keys);
+  # the fake records bare provider names so assertions stay readable.
+  def name_of(provider)
+    provider.is_a?(Hash) ? provider["provider"] : provider
+  end
+
   def ordered_providers(auto_switch: false)
     @_providers.reject { |p| @paused_names.include?(p["provider"]) }
   end
 
-  def record_success(name)
-    @successes << name
+  def record_success(provider)
+    @successes << name_of(provider)
   end
 
-  def record_failure(name)
-    @failures << name
+  def record_failure(provider)
+    @failures << name_of(provider)
   end
 
-  def quota_pause!(name, time, reason: nil)
+  def quota_pause!(provider, time, reason: nil)
+    name = name_of(provider)
     @pauses << {name: name, time: time, reason: reason}
     @paused_names << name unless @paused_names.include?(name)
   end
 
-  def update_metrics(name, ttft, tps, tokens: nil)
-    @metrics_updates << {name: name, ttft: ttft, tps: tps, tokens: tokens}
+  def update_metrics(provider, ttft, tps, tokens: nil)
+    @metrics_updates << {name: name_of(provider), ttft: ttft, tps: tps, tokens: tokens}
   end
 
   def record_and_maybe_probe(_interval)

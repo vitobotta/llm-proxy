@@ -1,10 +1,24 @@
 # frozen_string_literal: true
 
 module RequestHandler
+  # Failure reasons after which the provider/round walk must stop instead of
+  # falling back: the client is gone (client_disconnect), or chunks have
+  # already been forwarded to the client so any further provider would
+  # concatenate a garbled duplicate stream onto the output
+  # (upstream_disconnect / StreamPartiallySent).
+  TERMINAL_FALLBACK_REASONS = %w[client_disconnect upstream_disconnect].freeze
+
   def with_auto_select(model:, model_name:, path:, body:, headers:)
     snap = ConfigStore.snapshot
     selector = snap[:selectors][model_name]
-    model_entry = snap[:models][model_name]
+    model_entry = snap[:models][model_name] || model
+
+    unless selector
+      # The model vanished between parse_request and here (a config reload
+      # raced the request) — fail cleanly instead of NoMethodError → 500.
+      settings.logger.warn("[#{@request_id}/#{model_name}] Model no longer configured (config reload mid-request), aborting")
+      return {success: false, error: "Model '#{model_name}' is no longer configured", status: 503}
+    end
 
     probing = model_entry&.dig("probing_enabled") != false
     auto_switch = model_entry&.dig("auto_switch") == true
@@ -65,8 +79,8 @@ module RequestHandler
         remaining = [deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC), 1].max
         result = yield(provider_config, path, body, p_model, headers, log_prefix, remaining)
         if result&.dig(:success)
-          record_metrics(selector, p_name, result)
-          selector.record_success(p_name)
+          record_metrics(selector, provider_config, result)
+          selector.record_success(provider_config)
           Metrics.increment(:provider_success, labels: {provider: p_name, model: model_name})
           if result[:ttft]
             Metrics.observe(:upstream_ttft_seconds, result[:ttft], labels: {provider: p_name, model: model_name})
@@ -76,24 +90,30 @@ module RequestHandler
           reason = RequestHandler.failure_reason(result)
           attempts << {provider: p_name, status: result.is_a?(Hash) ? result[:status] : nil, error: result.is_a?(Hash) ? result[:error] : nil, reason: reason}
           if result.is_a?(Hash) && result[:quota_pause_until]
-            selector.quota_pause!(p_name, result[:quota_pause_until], reason: result[:quota_pause_reason])
+            selector.quota_pause!(provider_config, result[:quota_pause_until], reason: result[:quota_pause_reason])
             Metrics.increment(:provider_quota_paused, labels: {provider: p_name, model: model_name, reason: result[:quota_pause_reason] || "unknown"})
-          elsif reason != "client_disconnect"
-            selector.record_failure(p_name)
+          elsif reason != "client_disconnect" && reason != "client_error"
+            # Client-shape 4xx (bad request, not found, ...) is the caller's
+            # fault — counting it toward the circuit breaker lets a stream of
+            # bad client requests evict a healthy provider. Auth errors
+            # (401/403) and everything upstream-side still count.
+            selector.record_failure(provider_config)
           end
           Metrics.increment(:provider_failure, labels: {provider: p_name, model: model_name, reason: reason})
-          # Client disconnect: the client is gone — no point trying the
-          # next provider (it will also fail to write). Break out of the
-          # provider loop immediately.
-          break if reason == "client_disconnect"
+          # client_disconnect: the client is gone — no point trying the next
+          # provider (it will also fail to write).
+          # upstream_disconnect: chunks were already forwarded — the next
+          # provider would concatenate a garbled duplicate stream.
+          break if TERMINAL_FALLBACK_REASONS.include?(reason)
         end
       end
 
       break if result&.dig(:success)
       break if deadline_hit
-      # Client disconnect also breaks the rounds loop — retrying across
-      # rounds is pointless when the client is already gone.
-      break if result.is_a?(Hash) && result[:error] == "Client disconnected"
+      # client_disconnect / upstream_disconnect also break the rounds loop —
+      # retrying across rounds is pointless when the client is already gone
+      # or the client already holds a partial stream.
+      break if result.is_a?(Hash) && TERMINAL_FALLBACK_REASONS.include?(RequestHandler.failure_reason(result))
     end
 
     if probing && selector.record_and_maybe_probe(probe_interval)
@@ -130,7 +150,7 @@ module RequestHandler
     }
   end
 
-  def record_metrics(selector, provider_name, result)
+  def record_metrics(selector, provider, result)
     tps = result[:total_tps]
     # Only fall back to content_tps when the generation is long enough that
     # the arrival-window estimate is meaningful. For short generations
@@ -139,7 +159,7 @@ module RequestHandler
     if tps.nil? && (result[:completion_tokens] || 0) >= Streaming::MIN_ARRIVAL_TPS_TOKENS
       tps = result[:content_tps]
     end
-    selector.update_metrics(provider_name, result[:ttft], tps,
+    selector.update_metrics(provider, result[:ttft], tps,
       tokens: result[:completion_tokens]) if result[:ttft]
   end
 
@@ -152,6 +172,10 @@ module RequestHandler
     return "quota_exhausted" if result[:quota_pause_until]
     if status
       return "rate_limited" if status == 429
+      # 401/403 (non-quota) = misconfigured credentials or refused access at
+      # the provider — a provider-side fault worth circuit-breaking. Other
+      # 4xx are client-shape errors and must not penalise the provider.
+      return "auth_error" if status == 401 || status == 403
       return "client_error" if status >= 400 && status < 500
       return "server_error" if status >= 500
     end
@@ -194,6 +218,7 @@ module RequestHandler
       is_responses = false
       always_responses_delta = false
       responses_evidence = false
+      responses_terminal = false
       pending_chunk = nil
       pending_cr = nil
       out_chunk = lambda do |chunk, cr|
@@ -202,6 +227,7 @@ module RequestHandler
         is_responses ||= cr.is_responses
         always_responses_delta ||= cr.has_responses_delta
         responses_evidence ||= cr.responses_evidence
+        responses_terminal ||= cr.has_responses_terminal
         if accumulated
           accumulated << chunk
           if accumulated.bytesize > MAX_ACCUMULATED_SIZE
@@ -277,6 +303,7 @@ module RequestHandler
               is_responses ||= pending_cr.is_responses
               always_responses_delta ||= pending_cr.has_responses_delta
               responses_evidence ||= pending_cr.responses_evidence
+              responses_terminal ||= pending_cr.has_responses_terminal
               # Strip a trailing `data: [DONE]` line (LF or CRLF — SSE
               # permits both) so synthetic events always precede it and the
               # stream ends with exactly one [DONE], regardless of the
@@ -299,13 +326,19 @@ module RequestHandler
                 is_responses ||= tail_cr.is_responses
                 always_responses_delta ||= tail_cr.has_responses_delta
                 responses_evidence ||= tail_cr.responses_evidence
+                responses_terminal ||= tail_cr.has_responses_terminal
               end
-              # Synthetic termination: something was streamed but the
-              # provider gave no terminal/delta evidence — or gave only
-              # announce-y container events before stopping — so give the
-              # client a definitive end event instead of a silent stop.
-              if streamed_any && ((is_responses != always_responses_delta) ||
-                 (responses_evidence && !always_responses_delta))
+              # Synthetic termination: something was streamed but the stream
+              # never produced a complete output exchange — no deltas at all
+              # (containers/announce events only, or an empty terminal), or
+              # deltas cut off before any terminal event. A stream carrying
+              # BOTH delta evidence and a terminal event (response.completed /
+              # failed / incomplete — with or without a usage block) is
+              # considered complete and is left untouched, so providers that
+              # omit usage don't get a spurious failure appended to every
+              # otherwise healthy stream.
+              if streamed_any && (responses_evidence || always_responses_delta || is_responses) &&
+                 !(always_responses_delta && responses_terminal)
                 if is_responses
                   synthetic = "data: " + {"type" => "response.failed", "response" => {}, "error" => {"code" => "upstream_stopped", "message" => "The upstream provider ended the stream before responding. No retries are possible on a partially-streamed response."}}.to_json + "\n\n"
                 else
@@ -379,14 +412,26 @@ module RequestHandler
       http.start unless http.started?
       pooled = true
       begin
-        response = http.request(request)
-
-        if response.is_a?(Net::HTTPSuccess)
-          settings.logger.info("#{log_prefix} Success")
-          {success: true, response: [response.code.to_i, {"Content-Type" => "application/json"}, [response.body]]}
-        else
-          handle_upstream_error(response, log_prefix)
+        result = nil
+        # Block form: the body is streamed through a bounded reader instead
+        # of being buffered unbounded by Net::HTTP#body, and upstream
+        # response headers can be forwarded to the client.
+        http.request(request) do |response|
+          if response.is_a?(Net::HTTPSuccess)
+            body_str, truncated = HTTPSupport.read_body_capped(response, HTTPSupport::MAX_UPSTREAM_RESPONSE_BODY)
+            if truncated
+              # Never forward a truncated body — the client would receive
+              # invalid JSON. Fail the attempt so fallback/retry applies.
+              result = {success: false, error: "Upstream response body exceeded #{HTTPSupport::MAX_UPSTREAM_RESPONSE_BODY} bytes", status: 502}
+            else
+              settings.logger.info("#{log_prefix} Success")
+              result = {success: true, response: [response.code.to_i, HTTPSupport.forwardable_response_headers(response), [body_str]]}
+            end
+          else
+            result = handle_upstream_error(response, log_prefix)
+          end
         end
+        result
       rescue Net::OpenTimeout, Net::ReadTimeout, Net::WriteTimeout, IOError, EOFError, Errno::ECONNRESET, Errno::ECONNREFUSED, SocketError, HTTPSupport::ClientDisconnected
         pooled = false
         raise

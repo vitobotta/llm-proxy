@@ -19,11 +19,19 @@ class ProviderSelector
   CIRCUIT_FAILURE_THRESHOLD = 3
   CIRCUIT_COOLDOWN = 60
 
+  # Finite stand-in for non-finite TTFT samples. Probe timeout/error paths
+  # report Float::INFINITY as a "very bad" TTFT; stashing that into the
+  # sample pool poisons the rolling average (Infinity/10 == Infinity),
+  # breaks JSON serialization in /v1/health/detail and StatePersistence.save
+  # (JSON::GeneratorError: Infinity not allowed in JSON), and scores 0
+  # anyway. A large finite penalty keeps the "this provider is currently
+  # terrible" signal without the collateral damage.
+  FAILED_PROBE_TTFT = 30.0
+
   CircuitState = Struct.new(:failures, :opened_at, keyword_init: true)
   QuotaPause = Struct.new(:paused_until, :reason, keyword_init: true)
 
   attr_reader :providers
-
   CONFIG_LOCK = Mutex.new
 
   def self.config_path
@@ -63,6 +71,16 @@ class ProviderSelector
     circuit_failure_threshold: CIRCUIT_FAILURE_THRESHOLD, circuit_cooldown: CIRCUIT_COOLDOWN)
     @model_name = model_name
     @providers = providers
+    # State maps are keyed per provider ENTRY. When a model lists the same
+    # provider name twice (e.g. two upstream model IDs behind one account),
+    # a bare name would conflate their samples, circuits and quota pauses,
+    # so duplicate names get a name+model key. Unique names keep the plain
+    # provider-name key so state files, logs and tests stay stable.
+    name_counts = Hash.new(0)
+    providers.each { |p| name_counts[p["provider"]] += 1 }
+    @keys = providers.map { |p| name_counts[p["provider"]] > 1 ? "#{p["provider"]}\u0000#{p["model"]}" : p["provider"] }
+    @key_by_pair = {}
+    providers.each_with_index { |p, i| @key_by_pair[[p["provider"], p["model"]]] = @keys[i] }
     @active_index = find_initial_active_index(model_config)
     @request_count = 0
     @samples = {}
@@ -72,12 +90,25 @@ class ProviderSelector
     @sample_window = sample_window
     @circuit_failure_threshold = circuit_failure_threshold
     @circuit_cooldown = circuit_cooldown
-    @circuits = providers.each_with_object({}) { |p, h| h[p["provider"]] = CircuitState.new(failures: 0, opened_at: nil) }
-    @quota_pauses = providers.each_with_object({}) { |p, h| h[p["provider"]] = QuotaPause.new(paused_until: nil, reason: nil) }
-    @error_counts = providers.each_with_object({}) { |p, h| h[p["provider"]] = 0 }
-    @total_requests = providers.each_with_object({}) { |p, h| h[p["provider"]] = 0 }
-    @last_success_at = providers.each_with_object({}) { |p, h| h[p["provider"]] = nil }
+    @circuits = @keys.each_with_object({}) { |k, h| h[k] = CircuitState.new(failures: 0, opened_at: nil) }
+    @quota_pauses = @keys.each_with_object({}) { |k, h| h[k] = QuotaPause.new(paused_until: nil, reason: nil) }
+    @error_counts = @keys.each_with_object({}) { |k, h| h[k] = 0 }
+    @total_requests = @keys.each_with_object({}) { |k, h| h[k] = 0 }
+    @last_success_at = @keys.each_with_object({}) { |k, h| h[k] = nil }
     @model_config = model_config
+  end
+
+  # Resolves a provider entry (its config hash) or a bare provider name to
+  # the entry's state key. Prefer passing the provider config hash — a bare
+  # name resolves to the first matching entry when a model lists the same
+  # provider twice.
+  def state_key(provider_or_name)
+    if provider_or_name.is_a?(Hash)
+      return @key_by_pair[[provider_or_name["provider"], provider_or_name["model"]]] || provider_or_name["provider"]
+    end
+    return provider_or_name if @circuits.key?(provider_or_name)
+    idx = @providers.index { |p| p["provider"] == provider_or_name }
+    idx ? @keys[idx] : provider_or_name
   end
 
   def active_provider_name
@@ -96,26 +127,27 @@ class ProviderSelector
         @cached_ordered = nil if expired
       end
       @cached_ordered ||= begin
-        active = @providers[@active_index]
-        if check_circuit_open(active["provider"]) || check_quota_paused(active["provider"])
-          available = @providers.reject { |p| check_circuit_open(p["provider"]) || check_quota_paused(p["provider"]) }
-          available = available.sort_by { |p| -score_provider(p["provider"]) } if auto_switch && available.length > 1
+        entries = @providers.each_with_index.map { |p, i| [p, @keys[i]] }
+        active = entries[@active_index]
+        if check_circuit_open(active[1]) || check_quota_paused(active[1])
+          available = entries.reject { |_, k| check_circuit_open(k) || check_quota_paused(k) }
+          available = available.sort_by { |_, k| -score_provider(k) } if auto_switch && available.length > 1
           if available.empty?
             # Last resort: every provider is circuit-broken or quota-paused, but
             # there is no alternative. Return all providers (active first) so the
             # request loop keeps retrying instead of aborting with "No providers
             # available". Circuit/quota state is still tracked; this only avoids a
             # hard stop when there is nothing to fall back to.
-            @providers.rotate(@active_index)
+            entries.rotate(@active_index).map(&:first)
           else
-            available
+            available.map(&:first)
           end
         else
-          others = @providers.reject.with_index { |_, i| i == @active_index }
-            .reject { |p| check_circuit_open(p["provider"]) }
-            .reject { |p| check_quota_paused(p["provider"]) }
-          others = others.sort_by { |p| -score_provider(p["provider"]) } if auto_switch && others.length > 1
-          [active, *others]
+          others = entries.reject.with_index { |_, i| i == @active_index }
+            .reject { |_, k| check_circuit_open(k) }
+            .reject { |_, k| check_quota_paused(k) }
+          others = others.sort_by { |_, k| -score_provider(k) } if auto_switch && others.length > 1
+          [active.first, *others.map(&:first)]
         end
       end
     end
@@ -143,12 +175,19 @@ class ProviderSelector
 
   def update_metrics(provider_name, ttft, tps, tokens: nil)
     return unless ttft
+    key = state_key(provider_name)
+    # Non-finite values (probe timeout/error reports Float::INFINITY) are
+    # clamped to a finite penalty — see FAILED_PROBE_TTFT.
+    ttft_v = ttft.to_f
+    ttft_v = FAILED_PROBE_TTFT unless ttft_v.finite?
+    tps_v = tps ? tps.to_f : nil
+    tps_v = nil unless tps_v.nil? || tps_v.finite?
     @lock.synchronize do
       now = Time.now.to_f
-      samples = (@samples[provider_name] ||= [])
+      samples = (@samples[key] ||= [])
       prune_stale_samples!(samples, now)
-      sample = {ttft: ttft.to_f, timestamp: now}
-      sample[:tps] = tps.to_f if tps
+      sample = {ttft: ttft_v, timestamp: now}
+      sample[:tps] = tps_v if tps_v
       sample[:tokens] = tokens.to_i if tokens && tokens.to_i > 0
       samples << sample
       samples.shift if samples.length > MAX_SAMPLES
@@ -161,8 +200,12 @@ class ProviderSelector
 
     @lock.synchronize do
       scored = @providers.each_with_index.map do |p, i|
-        next nil if check_quota_paused(p["provider"])
-        avg = average_metrics(p["provider"])
+        key = @keys[i]
+        next nil if check_quota_paused(key)
+        # Never switch active to a circuit-broken provider — it is failing
+        # right now regardless of how good its historical samples look.
+        next nil if check_circuit_open(key)
+        avg = average_metrics(key)
         next nil unless avg && avg[:sample_count] >= MIN_SAMPLES
         [i, avg]
       end.compact
@@ -170,7 +213,7 @@ class ProviderSelector
       return if scored.empty?
 
       best_index, best_avg = scored.max_by { |_, avg| score_from_avg(avg) }
-      active_avg = average_metrics(@providers[@active_index]["provider"])
+      active_avg = average_metrics(@keys[@active_index])
 
       if best_index != @active_index
         if active_avg && active_avg[:sample_count] >= MIN_SAMPLES
@@ -206,14 +249,14 @@ class ProviderSelector
       [@model_config&.dig("auto_switch") == true, @active_index]
     end
     return unless auto_switch
-
     self.class.persist_active_provider(@model_name, idx, logger: logger)
   end
 
   def record_failure(provider_name)
+    key = state_key(provider_name)
     @lock.synchronize do
-      @error_counts[provider_name] = (@error_counts[provider_name] || 0) + 1
-      circuit = @circuits[provider_name]
+      @error_counts[key] = (@error_counts[key] || 0) + 1
+      circuit = @circuits[key]
       return unless circuit
       circuit.failures += 1
       # Only open the circuit (and stamp opened_at) on the first crossing of
@@ -228,8 +271,9 @@ class ProviderSelector
   end
 
   def quota_pause!(provider_name, paused_until, reason: nil)
+    key = state_key(provider_name)
     @lock.synchronize do
-      qp = @quota_pauses[provider_name]
+      qp = @quota_pauses[key]
       return unless qp
       # Only update the reason if the new pause extends the existing one —
       # a shorter pause shouldn't overwrite the reason from a longer pause.
@@ -242,12 +286,21 @@ class ProviderSelector
   end
 
   def quota_paused?(provider_name)
-    @lock.synchronize { check_quota_paused(provider_name) }
+    key = state_key(provider_name)
+    @lock.synchronize { check_quota_paused(key) }
+  end
+
+  # Public: ProbeManager checks this before launching probe threads.
+  # Mutates circuit state (auto-closes after cooldown) — the lock is taken here.
+  def circuit_open?(provider_name)
+    key = state_key(provider_name)
+    @lock.synchronize { check_circuit_open(key) }
   end
 
   def clear_quota_pause(provider_name)
+    key = state_key(provider_name)
     @lock.synchronize do
-      qp = @quota_pauses[provider_name]
+      qp = @quota_pauses[key]
       return unless qp
       qp.paused_until = nil
       qp.reason = nil
@@ -256,10 +309,11 @@ class ProviderSelector
   end
 
   def record_success(provider_name)
+    key = state_key(provider_name)
     @lock.synchronize do
-      @total_requests[provider_name] = (@total_requests[provider_name] || 0) + 1
-      @last_success_at[provider_name] = Time.now.to_f
-      circuit = @circuits[provider_name]
+      @total_requests[key] = (@total_requests[key] || 0) + 1
+      @last_success_at[key] = Time.now.to_f
+      circuit = @circuits[key]
       return unless circuit
       # Invalidate cache if the circuit was open — it's now closed.
       if circuit.opened_at
@@ -273,6 +327,9 @@ class ProviderSelector
   def realign_active_index!(model_config)
     new_idx = find_initial_active_index(model_config)
     @lock.synchronize do
+      # Track the latest model config so persist_active_index sees current
+      # auto_switch settings after a hot-reload, not boot-time values.
+      @model_config = model_config
       if new_idx != @active_index
         @active_index = new_idx
         @cached_ordered = nil
@@ -286,7 +343,7 @@ class ProviderSelector
 
   def active_metrics
     @lock.synchronize do
-      avg = average_metrics(@providers[@active_index]["provider"])
+      avg = average_metrics(@keys[@active_index])
       return nil unless avg
       {ttft: avg[:avg_ttft], tps: avg[:avg_tps], sample_count: avg[:sample_count]}
     end
@@ -305,10 +362,11 @@ class ProviderSelector
   # The token-weighted aggregate already downweights them naturally.
   # Returns nil when there are no usable samples.
   def rolling_tps(provider_name, window: 60)
+    key = state_key(provider_name)
     @lock.synchronize do
       now = Time.now.to_f
       cutoff = now - window
-      samples = (@samples[provider_name] || []).select { |s| s[:timestamp] >= cutoff }
+      samples = (@samples[key] || []).select { |s| s[:timestamp] >= cutoff }
       next nil if samples.empty?
 
       # Percentiles computed only from samples with enough tokens that
@@ -331,9 +389,10 @@ class ProviderSelector
   # `window` seconds. Used by the periodic TPS logger to suppress idle
   # providers so the log isn't flooded with no-op lines.
   def tps_active?(provider_name, window: 10)
+    key = state_key(provider_name)
     @lock.synchronize do
       cutoff = Time.now.to_f - window
-      (@samples[provider_name] || []).any? { |s| s[:timestamp] >= cutoff }
+      (@samples[key] || []).any? { |s| s[:timestamp] >= cutoff }
     end
   end
 
@@ -348,14 +407,15 @@ class ProviderSelector
   def provider_stats
     @lock.synchronize do
       now = Time.now.to_f
-      @providers.each_with_object({}) do |p, h|
+      @providers.each_with_index.each_with_object({}) do |(p, i), h|
+        key = @keys[i]
         name = p["provider"]
-        last = @last_success_at[name]
-        qp = @quota_pauses[name]
+        last = @last_success_at[key]
+        qp = @quota_pauses[key]
         h[name] = {
-          errors: @error_counts[name] || 0,
-          successes: @total_requests[name] || 0,
-          circuit_open: !@circuits[name]&.opened_at.nil?,
+          errors: @error_counts[key] || 0,
+          successes: @total_requests[key] || 0,
+          circuit_open: !@circuits[key]&.opened_at.nil?,
           last_success_at: last ? Time.at(last).iso8601 : nil,
           last_success_age_seconds: last ? (now - last).round(1) : nil,
           quota_paused: qp&.paused_until && now < qp.paused_until ? true : false,
@@ -368,7 +428,6 @@ class ProviderSelector
 
   def to_state
     @lock.synchronize do
-      Time.now.to_f
       {
         active_provider: @providers[@active_index]["provider"],
         samples: @samples.transform_values do |arr|
@@ -396,20 +455,25 @@ class ProviderSelector
         end
       end
 
+      # Persisted state may use bare provider-name keys while this selector
+      # uses name+model keys (or vice versa after a config change), so
+      # resolve each saved key through state_key before matching.
       if state["samples"].is_a?(Hash)
         state["samples"].each do |p_name, arr|
           next unless arr.is_a?(Array)
-          next unless @circuits.key?(p_name)
+          key = state_key(p_name)
+          next unless @circuits.key?(key)
           restored = arr.filter_map { |h| hash_to_sample(h, now) }
-          @samples[p_name] = restored unless restored.empty?
+          @samples[key] = restored unless restored.empty?
         end
       end
 
       if state["circuits"].is_a?(Hash)
         state["circuits"].each do |p_name, c|
           next unless c.is_a?(Hash)
-          next unless @circuits.key?(p_name)
-          circuit = @circuits[p_name]
+          key = state_key(p_name)
+          next unless @circuits.key?(key)
+          circuit = @circuits[key]
           circuit.failures = begin
             Integer(c["failures"])
           rescue ArgumentError, TypeError
@@ -435,11 +499,13 @@ class ProviderSelector
 
       if (qp_data = state["quota_pauses"] || state[:quota_pauses]).is_a?(Hash)
         qp_data.each do |p_name, qp|
-          next unless qp.is_a?(Hash) && @quota_pauses.key?(p_name)
+          next unless qp.is_a?(Hash)
+          key = state_key(p_name)
+          next unless @quota_pauses.key?(key)
           paused_until = (qp["paused_until"] || qp[:paused_until])&.to_f
           reason = qp["reason"] || qp[:reason]
           next unless paused_until && paused_until > now
-          @quota_pauses[p_name] = QuotaPause.new(paused_until: paused_until, reason: reason)
+          @quota_pauses[key] = QuotaPause.new(paused_until: paused_until, reason: reason)
         end
       end
 
@@ -460,22 +526,18 @@ class ProviderSelector
     return nil unless hash.is_a?(Hash) && hash["ttft"] && hash["ts"]
     ts = hash["ts"].to_f
     return nil if now - ts > @sample_window
-    sample = {ttft: hash["ttft"].to_f, timestamp: ts}
-    sample[:tps] = hash["tps"].to_f if hash["tps"]
+    ttft = hash["ttft"].to_f
+    ttft = FAILED_PROBE_TTFT unless ttft.finite?
+    sample = {ttft: ttft, timestamp: ts}
+    tps = hash["tps"]&.to_f
+    sample[:tps] = tps if tps&.finite?
     sample[:tokens] = hash["tokens"].to_i if hash["tokens"]
     sample
   end
 
-  # CALLER MUST HOLD @lock. This method mutates circuit state to
-  # auto-close after cooldown, so unsynchronized reads can race with
-  # concurrent record_failure / record_success calls.
-  def circuit_open?(provider_name)
-    @lock.synchronize { check_circuit_open(provider_name) }
-  end
-
   # CALLER MUST HOLD @lock. Auto-expires circuits past cooldown.
-  def check_circuit_open(provider_name)
-    circuit = @circuits[provider_name]
+  def check_circuit_open(key)
+    circuit = @circuits[key]
     return false unless circuit&.opened_at
     now = Time.now.to_f
     if now - circuit.opened_at > @circuit_cooldown
@@ -489,8 +551,8 @@ class ProviderSelector
   end
 
   # CALLER MUST HOLD @lock. Auto-expires past pauses.
-  def check_quota_paused(provider_name)
-    qp = @quota_pauses[provider_name]
+  def check_quota_paused(key)
+    qp = @quota_pauses[key]
     return false unless qp&.paused_until
     now = Time.now.to_f
     if now >= qp.paused_until
@@ -513,8 +575,8 @@ class ProviderSelector
     samples.delete_if { |s| now - s[:timestamp] > @sample_window }
   end
 
-  def average_metrics(provider_name)
-    samples = @samples[provider_name]
+  def average_metrics(key)
+    samples = @samples[key]
     return nil unless samples && !samples.empty?
     n = samples.length
     avg_ttft = samples.sum { |s| s[:ttft] } / n
@@ -528,8 +590,8 @@ class ProviderSelector
     {avg_ttft: avg_ttft, avg_tps: avg_tps, sample_count: n}
   end
 
-  def score_provider(provider_name)
-    avg = average_metrics(provider_name)
+  def score_provider(key)
+    avg = average_metrics(key)
     score_from_avg(avg)
   end
 

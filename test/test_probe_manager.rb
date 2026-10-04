@@ -22,8 +22,14 @@ class TestProbeManager < Minitest::Test
       @others
     end
 
-    def update_metrics(provider_name, ttft, tps)
-      @mutex.synchronize { @metrics_calls << [provider_name, ttft, tps] }
+    # Selector APIs receive the provider config hash (per-entry state keys);
+    # the fake records bare provider names so assertions stay readable.
+    def name_of(provider)
+      provider.is_a?(Hash) ? provider["provider"] : provider
+    end
+
+    def update_metrics(provider, ttft, tps)
+      @mutex.synchronize { @metrics_calls << [name_of(provider), ttft, tps] }
     end
 
     def evaluate_and_select(_logger, auto_switch:)
@@ -34,15 +40,16 @@ class TestProbeManager < Minitest::Test
       @probe_finished_called = true
     end
 
-    def quota_paused?(provider_name)
-      @paused.key?(provider_name)
+    def quota_paused?(provider)
+      @paused.key?(name_of(provider))
     end
 
-    def circuit_open?(_provider_name)
+    def circuit_open?(_provider)
       false
     end
 
-    def quota_pause!(name, time, reason: nil)
+    def quota_pause!(provider, time, reason: nil)
+      name = name_of(provider)
       @pauses << {name: name, time: time, reason: reason}
       @paused[name] = true
     end

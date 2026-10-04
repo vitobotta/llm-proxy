@@ -55,7 +55,7 @@ module Streaming
     response.output_item.added response.output_item.done response.content_part.added
   ].freeze
 
-  ChunkResult = Struct.new(:usage, :has_thinking, :has_content, :has_tool_call, :perf_metrics, :server_duration, :is_responses, :has_responses_delta, :responses_evidence)
+  ChunkResult = Struct.new(:usage, :has_thinking, :has_content, :has_tool_call, :perf_metrics, :server_duration, :is_responses, :has_responses_delta, :responses_evidence, :has_responses_terminal)
 
   # Single classifier shared by the event:-line scan and the data:-payload
   # scan so both agree on delta/content/thinking semantics. Returns :delta
@@ -65,7 +65,10 @@ module Streaming
   def self.classify_responses_type!(result, type)
     return unless type.is_a?(String) && type.start_with?("response.")
     result.responses_evidence = true
-    return :terminal if RESPONSES_RESPONSE_EVENT_TYPES.include?(type)
+    if RESPONSES_RESPONSE_EVENT_TYPES.include?(type)
+      result.has_responses_terminal = true
+      return :terminal
+    end
     return unless RESPONSES_NOTIFY_EVENT_TYPES.include?(type) || RESPONSES_DELTA_EVENT_TYPES.include?(type)
     case type
     when "response.output_text.delta", "response.output_text.done"
@@ -118,7 +121,7 @@ module Streaming
   ENERGY_COMMENT_PREFIX = ": energy"
 
   def self.parse_chunk(chunk)
-    result = ChunkResult.new(nil, false, false, false, nil, nil, false, false, nil)
+    result = ChunkResult.new(nil, false, false, false, nil, nil, false, false, nil, false)
 
     # vLLM energy comment line: ": energy {"duration_seconds": 1.234, ...}"
     # This is an SSE comment line (not a data: line) that contains the
@@ -168,9 +171,11 @@ module Streaming
           when :delta
             notify_seen = true
           end
-          # Last-seen-wins, but never clobber an already-parsed hash with
-          # the null you get from a terminal event that carried no usage.
-          if data.key?("usage") && (data["usage"].is_a?(Hash) || result.usage.nil?)
+          # Last-seen-wins for Hash usage blocks. Never store a non-Hash
+          # "usage" value (some providers emit `"usage": null` or a string):
+          # extract_token_counts would crash on it, and a Hash must never be
+          # clobbered by a later terminal event that carried no usage.
+          if data.key?("usage") && data["usage"].is_a?(Hash)
             result.usage = data["usage"]
           end
           if data.key?("perf_metrics")
@@ -210,11 +215,24 @@ module Streaming
   end
 
 
+  # Coerces provider-supplied usage fields to numbers. Some providers send
+  # token counts as strings ("completion_tokens": "42"); anything that is
+  # not a plain number is dropped rather than crashing the stream.
+  def self.coerce_number(value)
+    return value if value.is_a?(Numeric)
+    return nil unless value.is_a?(String) && /\A-?\d+(?:\.\d+)?\z/.match?(value.strip)
+    value.include?(".") ? value.to_f : value.to_i
+  end
+
   def self.extract_token_counts(usage_data, perf_metrics: nil, server_duration: nil)
-    completion = usage_data.dig("completion_tokens") || usage_data.dig("output_tokens")
-    thinking = usage_data.dig("completion_tokens_details", "reasoning_tokens") ||
+    unless usage_data.is_a?(Hash)
+      return {completion: nil, thinking: 0, content: nil, content_clamped: false,
+              server_tps: nil, server_ttft: nil}
+    end
+    completion = coerce_number(usage_data.dig("completion_tokens") || usage_data.dig("output_tokens"))
+    thinking = coerce_number(usage_data.dig("completion_tokens_details", "reasoning_tokens") ||
       usage_data.dig("output_tokens_details", "reasoning_tokens") ||
-      usage_data.dig("reasoning_tokens") || 0
+      usage_data.dig("reasoning_tokens")) || 0
     raw_content = completion ? completion - thinking : nil
     clamped = !raw_content.nil? && raw_content < 0
     content = clamped ? 0 : raw_content
@@ -388,7 +406,7 @@ module Streaming
     request_start ||= @request_start
     ttft = tracker.first_token ? (tracker.first_token - request_start).round(3) : nil
 
-    if usage_data
+    if usage_data.is_a?(Hash)
       tokens = Streaming.extract_token_counts(usage_data, perf_metrics: perf_metrics, server_duration: server_duration)
       if tokens[:content_clamped] && Streaming.note_negative_content_once(log_prefix)
         settings.logger.warn("#{log_prefix} provider reported reasoning_tokens (#{tokens[:thinking]}) > completion_tokens (#{tokens[:completion]}); clamping content to 0. This indicates a bug at the provider — please verify their usage accounting.")
