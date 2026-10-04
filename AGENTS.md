@@ -22,7 +22,8 @@ bundle exec ruby -I. test/test_provider_selector.rb
 Or all:
 
 ```bash
-source /opt/homebrew/opt/chruby/share/chruby/chruby.sh && chruby ruby-4.0.1 && bundle exec ruby -I. test/test_provider_selector.rb test/test_streaming.rb test/test_http_support.rb test/test_retry.rb
+export PATH=~/.local/share/mise/installs/ruby/4.0.5/bin:$PATH   # mise-managed Ruby 4.0.5
+bundle exec ruby -I. test/run_all.rb
 ```
 
 No CI workflows. No linter, no formatter, no typechecker.
@@ -52,6 +53,9 @@ curl -s http://localhost:9234/v1/models | python3 -m json.tool
 | `lib/config_watcher.rb` | Polls config content hash + SIGUSR1 handler, triggers `ConfigStore.reload!` |
 | `lib/probe_manager.rb` | Background probe logic |
 | `lib/metrics.rb` | Lightweight Prometheus-compatible counters/histograms |
+| `lib/routes/*.rb` | Sinatra route modules: `completions` (chat + streaming), `responses`, `models`, `health`, `admin` |
+| `lib/tps_reporter.rb` | Periodic per-model TPS reports over active providers |
+| `lib/state_persistence.rb` | Atomic persistence of selector state to `data/provider_state.json` |
 | `config/config.yaml.example` | Template config — reference for all valid keys |
 | `config.ru` | Rack entrypoint |
 | `puma.rb` | Puma config (threads 1–16, single worker, I/O-bound tuned, WRITE_TIMEOUT override) |
@@ -61,9 +65,9 @@ curl -s http://localhost:9234/v1/models | python3 -m json.tool
 - **Non-streaming is the default** — `stream: true` must be explicit in the request body. Omitted or false `stream` values return one complete JSON response.
 - **Responses API mode** — `POST /v1/responses` mirrors the OpenAI Responses API and is available for every configured model, no opt-in. Requests and SSE events are forwarded to upstream `/responses` verbatim — only `model` and `stream` are rewritten, never translated to/from chat format. `stream_options.include_usage` is never sent in Responses mode; usage arrives in the terminal `response.completed` event under its `response` field (or top-level — some providers diverge), which chunk parsing extracts for metrics. A Responses stream that ends without any `output_item.done`/`output_text.delta`/`reasoning_text.delta` events gets a synthetic `response.failed` (or `response.not_found`) event with `code: upstream_stopped` injected before `data: [DONE]`, so clients fail fast instead of hanging. Providers that do not serve `/responses` answer with their own upstream error, which the fallback loop surfaces. `tracking.enabled` stays chat-completions-only for Responses streams; reasoning deltas are only tracked with `RESPONSES_ENABLE_THINKING_TRACKING=1` (also the only condition that enables the TTFT gate in Responses mode).
 - **Provider auto-selection** happens per-request via `ProviderSelector#ordered_providers`. Active provider is first; others follow config order (when `auto_switch: false`) or are sorted by score (when `auto_switch: true`). Circuit-broken and quota-paused providers are skipped.
-- **Circuit breaker** — 3 consecutive failures opens a provider's circuit for 60s. Success resets it. Client disconnects (`client_disconnect` failure reason) do NOT count toward the circuit breaker — the provider didn't fail, the client just went away.
+- **Circuit breaker** — 3 consecutive failures opens a provider's circuit for 60s. Success resets it. Client disconnects (`client_disconnect` failure reason) do NOT count toward the circuit breaker — the provider didn't fail, the client just went away. Client-shape 4xx (`client_error`, e.g. 400/404/422) don't count either — a bad client request must not evict a healthy provider. 401/403 (`auth_error`, provider refusing our credentials) DO count.
 - **Quota pause** — 429, 402, and 403 (with quota body patterns like `insufficient_quota`, `billing limit`, `credit`, etc.) responses immediately pause the provider and fall through to the next one. The pause duration is extracted from `Retry-After`, `x-ratelimit-reset-requests/tokens` headers, or the response body. If none are available, `quota_pause_default_seconds` (default 60s) is used. Paused providers are skipped by requests and probes until the pause expires. `QuotaExhaustedError` is raised in `handle_upstream_error` and caught in `try_with_retries` which returns immediately (no retry on same provider). `with_auto_select` registers the pause via `selector.quota_pause!`. `quota_pause!` takes the `max` of the current and new `paused_until` so repeated requests can't extend a pause beyond the server-stated reset time.
-- **`ProviderSelector` mutates `config/config.yaml`** — when auto-switch fires, it writes `primary: true` back to the file. This is by design, not a side effect to "fix".
+- **`ProviderSelector` mutates `config/config.yaml`** — during graceful shutdown `persist_active_index` writes the active provider back to the file as `primary: true`. This is by design, not a side effect to "fix".
 - **Pre-warm** runs at boot: `HTTPSupport.prewarm_connections!` opens and keeps HTTP connections alive.
 - **Graceful shutdown** registered via `HTTPSupport.setup_graceful_shutdown!` — cleans connection pools on SIGINT/SIGTERM.
 - **No JSON parse for chunk tracking** — `Streaming.parse_chunk` uses fast string matching (`include?`) on SSE data lines to detect thinking/content/usage. Only the `usage` block gets `JSON.parse`. When `tracking.enabled: false`, all chunk parsing is skipped entirely.
@@ -99,6 +103,8 @@ curl -s http://localhost:9234/v1/models | python3 -m json.tool
 - **`parse_chunk` gating strings** — the SSE gate checks the quoted substring `'"response.'` **or** the `event: response.` line prefix (event-line semantics; real providers like Zhipu send types on `event:` lines solely). Never "simplify" the event strings to `type=response.…`-style forms: Responses event detection and the synthetic-error ordering logic both depend on the exact quoted type values. Usage detection must accept both nested (`response.usage`) and top-level (`usage`) placement. `response.output_text.done` and `response.reasoning_text.done` also count as deltas (some providers emit done-without-delta for the final flush). Container events (`response.created`, `response.output_item.added`, etc.) are recognized so their embedded `content`/`text` fields don't get misread as output tokens by the flat-line heuristics.
 - **`parse_chunk` requires whole JSON payload lines** — providers that split a single SSE event across network chunks evade per-chunk parsing. The accumulated-buffer fallback (`Streaming.parse_chunk(accumulated)`, only when tracking is enabled) re-parses the concatenated tail at stream end, and response-mode latch flags additionally re-parse it regardless of tracking. If terminal state (usage, `is_responses`) depends on a parse that only completed in the buffer, the flags must harvest from that fallback — see how `try_stream` recovers `is_responses` from `tail_cr`.
 - **Puma's `WRITE_TIMEOUT` is monkey-patched to 300s** — Puma's default 10s write timeout (`Puma::Const::WRITE_TIMEOUT`) kills long-lived streaming connections with "Socket timeout writing data". Overridden in `puma.rb` + `persistent_timeout 300`.
+- **The SIGUSR1 handler must stay trap-safe** — the trap block only sets a plain flag (`@usr1_requested`); the watcher thread picks it up inside `sleep_interruptible`. `Mutex#synchronize` raises `ThreadError: can't be called from trap context`, so never touch `@lock` from a trap.
+- **Sinatra `stream` blocks run lazily** — during response-body iteration, after the `after` filters. Streaming requests therefore defer request accounting (`finalize_request!`) to the stream block's `ensure`: that keeps `in_flight` covering the whole stream (the graceful-shutdown drain depends on it) and `request_duration_seconds` honest. Don't move that accounting back into `after`.
 
 ## Writing style for user-facing prose
 
