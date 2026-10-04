@@ -1,10 +1,20 @@
-# LLM Proxy
+<div align="center">
 
-Multi-provider LLM proxy that picks the fastest provider, retries on failure, and optionally streams tokens in real time.
+<img src="assets/banner.svg" alt="LLM Proxy — route every LLM request to the fastest provider, fall back automatically" width="100%">
 
-Drop-in OpenAI-compatible API. Configure once, let the proxy handle provider selection, circuit breaking, and fallback.
+**One OpenAI-compatible endpoint for every LLM provider you use.**
+The proxy measures who is fastest *right now*, routes there, and falls back automatically when a provider breaks.
 
-## Why LLM Proxy?
+[![Release](https://img.shields.io/github/v/release/vitobotta/llm-proxy?label=release)](https://github.com/vitobotta/llm-proxy/releases)
+[![Ruby](https://img.shields.io/badge/Ruby-4.0-e95420?logo=ruby&logoColor=white)](https://www.ruby-lang.org/)
+[![Docker ready](https://img.shields.io/badge/docker-ready-2496ed?logo=docker&logoColor=white)](#-quick-start)
+[![OpenAI-compatible](https://img.shields.io/badge/OpenAI-compatible-74aa9c?logo=openai&logoColor=white)](#-endpoints)
+
+</div>
+
+---
+
+## 🤔 Why LLM Proxy?
 
 Open-source models have changed the game — powerful LLMs are now available from dozens of providers at a fraction of the cost of closed-model APIs. But there's a catch: most of these providers are smaller companies. None of them offer the uptime or consistent inference speeds of the big incumbents. One goes down for maintenance, another starts rate-limiting at peak hours, a third is fast today but crawling tomorrow.
 
@@ -12,7 +22,18 @@ The cost isn't the problem — these providers are cheap. The problem is **orche
 
 LLM Proxy automates this. You list multiple providers for each model, and the proxy routes your requests to whichever one is performing best at that moment. If a provider goes down, it falls back to the next one — transparently, so your app keeps working. In most cases you won't notice individual provider outages unless *all* your configured providers for a model happen to be down at the same time.
 
-## How It Works
+## ⚙️ How It Works
+
+```mermaid
+flowchart LR
+    C([Client]) -->|"OpenAI-compatible request"| P["LLM Proxy<br/>(Sinatra)"]
+    P --> S{"ProviderSelector<br/>scores · probes ·<br/>circuit breakers"}
+    S -->|"best TTFT / TPS"| A[Provider A]
+    S --> B[Provider B]
+    S --> D[Provider C]
+    A -.->|"fail · quota"| B
+    B -.->|"fail · quota"| D
+```
 
 Every incoming request follows this path:
 
@@ -23,65 +44,46 @@ Every incoming request follows this path:
 5. **Auto-switch** — a background probe periodically compares providers on real TTFT/TPS data; if a non-primary provider consistently outperforms the active one, the proxy switches and persists the change to your config
 6. **Fallback** — if the chosen provider fails, the proxy retries it up to `max_attempts` times, then falls through to the next provider. After all providers in a round fail, the proxy starts a new round (up to `max_rounds`) with a backoff delay between rounds, re-walking the provider list. Circuit-broken and quota-paused providers are excluded from subsequent rounds.
 
-```
-┌──────────────┐
-│   Client     │
-└──────┬───────┘
-       │
-┌──────▼───────┐      ┌────────────────────┐
-│  LLMProxy    │─────▶│ ProviderSelector   │
-│  (Sinatra)   │      │  per model         │
-└──────┬───────┘      │  • scores providers│
-       │              │  • probes every N  │
-       │              │  • persists winner │
-       │              └────────────────────┘
-       │
-   ┌───┴───┬───┬────────┐
-   │       │   │        │
-   ▼       ▼   ▼        ▼
- Prov A  Prov B  Prov C  Prov D
-```
+## ✨ Key Capabilities
 
-## Key Capabilities
-
-### Smart Routing
+### 🧭 Smart Routing
 
 - Scores providers by real **TTFT** (time to first token) and **TPS** (tokens per second) — not guesswork
 - **Auto-switches** to the fastest provider after background probes compare performance
 - **Circuit breaker** opens after 3 consecutive failures on a provider (60s cooldown), so bad providers are skipped until they recover
-- **Quota pause** — 429, 402, and 403 (with quota body patterns) responses pause the provider until the reset time given by `Retry-After`, `x-ratelimit-reset-*` headers, structured JSON fields in the body, or human-readable durations parsed from the error message (e.g. "Resets in 1 day"). While paused, the provider is skipped and requests fall through to the next provider
+- **Quota pause** — 429, 402, and quota-flavoured 403 responses pause the provider until its stated reset time (`Retry-After`, `x-ratelimit-reset-*`, JSON reset fields, or durations parsed from the message). While paused, requests fall through to the next provider
 
-### Resilience
+### 🛡️ Resilience
 
-- **Exponential backoff** retry — configurable max attempts with `2^n` second delays, plus circular fallback rounds (`max_rounds`) that re-walk the provider list with inter-round backoff until success or circuit breakers open
+- **Exponential backoff** retry — configurable max attempts with `2^n` second delays, plus circular fallback rounds (`max_rounds`) that re-walk the provider list with inter-round backoff until success or circuits open
 - **Stale-connection recovery** — `EOFError` from idle connections gets 2 free retries that don't count against your attempt limit
-- **Quota-aware fallback** — 429/402/403 quota responses immediately fall through to the next provider instead of retrying the same one; the paused provider is skipped until its reset time expires
+- **Quota-aware fallback** — quota responses immediately fall through to the next provider instead of retrying the same one
 - **Request deadline** — 600s overall limit across all fallback rounds, so a cascade of slow providers can't hang your request forever
 
-### Performance
+### ⚡ Performance
 
 - **HTTP connection pool** — connections are pooled per (host, port) with 300s max-age and 60s max-idle eviction, eliminating TLS handshake overhead on subsequent requests
-- **Boot-time pre-warm** — background connections opened to all providers at startup and added to the pool, so the first real request skips the TCP/TLS handshake
+- **Boot-time pre-warm** — background connections opened to all providers at startup, so the first real request skips the TCP/TLS handshake
 - **Lock-free config reads** — config snapshot is swapped atomically; request-path accessors take no mutex
 - **Zero-overhead passthrough** — set `tracking.enabled: false` to skip all chunk parsing; raw bytes pass straight through with negligible CPU cost
 - **Bounded probe cost** — `performance.probe_max_per_minute` caps probe launches across all models with a sliding 60-second window
 
-### Observability
+### 📊 Observability
 
 - **Per-request streaming stats** — TTFT, content/thinking token counts, and tokens-per-second logged for every streaming response
-- **Periodic TPS logging** — a background thread prints a rolling TPS summary every 5 seconds for each provider with recent activity. The headline is a token-weighted aggregate (`sum(tokens*tps)/sum(tokens)`), with p50 and p90 for context. Short requests (< 50 tokens) are excluded from percentiles to avoid TTFT-dominated noise, and a cumulative token gate suppresses log lines until enough real generation has accumulated
+- **Periodic TPS logging** — rolling per-provider TPS summary every 5s (token-weighted aggregate, p50/p90)
 - **Prometheus `/metrics`** — request counts/durations, per-provider success/failure counters with a `reason` label, and a per-provider `upstream_ttft_seconds` histogram
 - **Structured JSON logs** — set `logging.format: json` to emit one JSON record per log line with `request_id` threaded through helper calls
 - **Per-provider detail endpoint** — `GET /v1/health/detail` returns per-model provider stats including active provider, TTFT/TPS metrics, quota pause state, and circuit breaker status
 
-### Operations
+### 🔧 Operations
 
 - **Config hot-reload** — edit `config.yaml` and the proxy picks up changes within seconds (polls every 2s); or send `kill -USR1 <pid>` for an instant reload
 - **Docker with live config** — mount `config/` from the host; edits apply without rebuild or restart
-- **Health check** — `GET /health` returns `{\"status\": \"ok\"}` for load balancers and monitors; `GET /v1/health/detail` returns full provider stats
-- **Optional incoming auth** — set `auth.token` in config to require `Authorization: Bearer <token>` on all requests
+- **Health check** — `GET /health` returns `{"status":"ok"}` for load balancers and monitors
+- **Incoming auth** — `auth.token` is required in production (the proxy refuses to boot without it) and optional in development
 
-## Use Cases
+## 🎯 Use Cases
 
 **Multi-provider redundancy** — The same open-source model is available via 3 providers. One goes down for maintenance? The proxy falls back to the next. Your app never notices.
 
@@ -91,7 +93,7 @@ Every incoming request follows this path:
 
 **Single endpoint for all models** — Front all your LLM calls through one URL. Swap providers, add models, change routing — all without touching client code.
 
-## Quick Start
+## 🚀 Quick Start
 
 ### Local
 
@@ -110,7 +112,7 @@ cp config/config.yaml.example config/config.yaml     # then edit with real keys
 docker compose up -d
 ```
 
-Exposes `http://localhost:9234`.
+Exposes `http://localhost:9234` (shows `(healthy)` in `docker compose ps` once ready).
 
 Config is mounted from host (`./config/:/app/config/`) so edits apply without rebuild. To rebuild after code changes:
 
@@ -118,7 +120,23 @@ Config is mounted from host (`./config/:/app/config/`) so edits apply without re
 docker compose up -d --build
 ```
 
-## Configuration
+## 📮 Usage
+
+```bash
+curl http://localhost:9234/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $AUTH_TOKEN" \
+  -d '{
+    "model": "glm-5",
+    "messages": [{"role": "user", "content": "Hello!"}]
+  }'
+```
+
+Set `"stream": true` in the body to receive server-sent events instead of one JSON document. `POST /v1/responses` serves the OpenAI Responses API with the same routing and fallback.
+
+Upstream authentication uses each provider's configured `api_key`: a bearer credential via the `Authorization` header by default, or the `x-api-key` header for `anthropic`. Incoming `Authorization` is never forwarded upstream; `OpenAI-Organization` and `OpenAI-Beta` are.
+
+## 📚 Configuration
 
 ### Providers
 
@@ -138,12 +156,12 @@ providers:
 ```
 
 Provider auth strategies:
-- Default: `Authorization: Bearer <api_key>`
+- Default: a bearer credential via the `Authorization` header
 - `anthropic`: `x-api-key` header
 
 ### Models
 
-Each model lists one or more providers. Optional `primary: true` on a provider sets the initial active choice. The proxy updates this field when it auto-switches.
+Each model lists one or more providers. Optional `primary: true` sets the initial active choice; the proxy persists its selection to `data/` and writes `primary` back to the config on shutdown.
 
 ```yaml
 models:
@@ -156,7 +174,7 @@ models:
         primary: true
 ```
 
-Provider entry can also override/extend headers:
+Provider entries can also override or extend headers:
 
 ```yaml
       - provider: "openrouter"
@@ -167,7 +185,8 @@ Provider entry can also override/extend headers:
 
 Per-model overrides — each model entry can set `probing_enabled`, `auto_switch`, and `probe_interval` to override the global `performance.*` values. When omitted, falls back to global defaults.
 
-### Timeouts
+<details>
+<summary><b>Timeouts</b></summary>
 
 ```yaml
 timeouts:
@@ -176,7 +195,10 @@ timeouts:
   write: 60   # request body send timeout
 ```
 
-### Retries
+</details>
+
+<details>
+<summary><b>Retries</b></summary>
 
 ```yaml
 retries:
@@ -186,6 +208,7 @@ retries:
 ```
 
 Retry behaviour:
+
 1. Within each round, attempt each provider up to `max_attempts` with exponential backoff.
 2. Fall through to the next provider (config order when auto_switch is off, by score when on) and retry there.
 3. After every provider in a round fails, start the next round — re-walking the provider list — with an inter-round backoff delay. This gives transient outages time to recover: `A×3 → B×3` ⟶ delay ⟶ `A×3 → B×3` ⟶ delay ⟶ `A×3 → B×3`.
@@ -193,10 +216,13 @@ Retry behaviour:
 5. The circuit breaker (3 consecutive failures, 60s cooldown) and quota pauses are re-evaluated each round. A provider that opens its circuit or hits quota is excluded from subsequent rounds, so the loop naturally narrows to providers that are still healthy. When every provider for a model is circuit-broken or quota-paused and no alternative exists, the proxy falls back to retrying the configured providers (active first) rather than aborting — so single-provider models keep retrying across `max_rounds` instead of stopping early.
 6. EOF on stale connection gets 2 fast retries that do **not** count against attempts; then counts as a normal failure.
 7. Timeouts count as failures and trigger retry/backoff.
-8. 429, 402, and 403 (with quota body patterns) immediately pause the provider and fall through to the next one — no retry on the same provider. The provider is skipped until its stated reset time expires.
+8. Quota responses (429, 402, and 403 with quota body patterns) immediately pause the provider and fall through to the next one — no retry on the same provider. The provider is skipped until its stated reset time expires.
 9. 600s overall request deadline across all rounds.
 
-### Logging
+</details>
+
+<details>
+<summary><b>Logging</b></summary>
 
 ```yaml
 logging:
@@ -204,16 +230,22 @@ logging:
   format: "json"       # json or text (default: text)
 ```
 
-### Tracking (TPS Stats)
+</details>
+
+<details>
+<summary><b>Tracking (TPS stats)</b></summary>
 
 ```yaml
 tracking:
   enabled: true        # false = zero-overhead passthrough
 ```
 
-When `enabled: false` the proxy skips all chunk parsing — no string matching, no JSON inspection. Raw bytes pass straight through. TPS logging suppressed. Use this for pure transparent proxy with negligible CPU overhead.
+When `enabled: false` the proxy skips all chunk parsing — no string matching, no JSON inspection. Raw bytes pass straight through and TPS logging is suppressed. Use this for pure transparent proxying with negligible CPU overhead.
 
-### Periodic TPS Logging
+</details>
+
+<details>
+<summary><b>Periodic TPS logging</b></summary>
 
 ```yaml
 metrics:
@@ -227,7 +259,10 @@ metrics:
 
 A background thread prints a rolling TPS summary for each provider with recent activity. The headline is a token-weighted aggregate (`sum(tokens*tps)/sum(tokens)`), with p50 and p90 for context. Short requests (< 50 tokens) are excluded from percentile computation to avoid TTFT-dominated noise inflating the distribution. The `min_tokens` gate suppresses log lines entirely until enough real generation has accumulated for the statistics to be meaningful.
 
-### Performance
+</details>
+
+<details>
+<summary><b>Performance</b></summary>
 
 ```yaml
 performance:
@@ -242,19 +277,22 @@ performance:
 
 `ConfigValidator` rejects out-of-range values for `retries.max_attempts`, `retries.backoff_base`, `retries.max_rounds`, `performance.probe_interval`, `performance.probe_max_per_minute`, `performance.sample_window`, `metrics.tps_log.{interval,activity_window,eval_window,min_tokens}`, `limits.max_request_body`, and `timeouts.{open,read,write}` at boot/reload, so a fat-fingered config can't silently DoS the proxy.
 
-### Authentication (optional)
+</details>
 
-Require an auth token on incoming `/v1/*` requests:
+<details>
+<summary><b>Authentication</b></summary>
 
 ```yaml
 auth:
-  token: "your-secret-token"           # Clients must send Authorization: Bearer <token>
+  token: "your-secret-token"           # Clients must send this token in the Authorization header
   metrics_token: "scrape-only-token"   # Optional separate token gating only /metrics
 ```
 
-`/health` is always public so load balancers can probe it. `/v1/health/detail` requires authentication and returns detailed per-provider stats. `/metrics` is public by default; set `auth.metrics_token` to require a separate bearer token for Prometheus scraping. Token comparison is constant-time.
+`auth.token` is required in production — the proxy refuses to start without it — and optional in development. `/health` is always public so load balancers can probe it. `/v1/health/detail` requires authentication and returns detailed per-provider stats. `/metrics` is public by default; set `auth.metrics_token` to require a separate bearer token for Prometheus scraping. Token comparison is constant-time.
 
-## Environment Variables
+</details>
+
+## 🌍 Environment Variables
 
 | Variable | Default | Description |
 |---|---|---|
@@ -269,7 +307,7 @@ auth:
 
 For high-concurrency I/O-bound workloads, raise `PUMA_MAX_THREADS` to `16–32` since most time is waiting on upstream providers.
 
-## Endpoints
+## 🔌 Endpoints
 
 | Endpoint | Method | Description |
 |---|---|---|
@@ -279,7 +317,7 @@ For high-concurrency I/O-bound workloads, raise `PUMA_MAX_THREADS` to `16–32` 
 | `/v1/embeddings` | POST | Embeddings (non-streaming) |
 | `/v1/models` | GET | List configured models |
 | `/v1/models/:name` | GET | Model details with provider routing |
-| `/health` | GET | Health check — returns `{\"status\":\"ok\"}` |
+| `/health` | GET | Health check — returns `{"status":"ok"}` |
 | `/v1/health/detail` | GET | Detailed provider stats (requires auth) |
 | `/metrics` | GET | Prometheus-compatible metrics |
 
@@ -287,21 +325,7 @@ Completion requests return one complete JSON response by default. Set `"stream":
 
 Requests to `/v1/responses` mirror the OpenAI Responses API: they are forwarded to the upstream `/responses` endpoint verbatim — only `model` and `stream` are rewritten — and are never translated to or from chat format. Chat-only injections like `stream_options.include_usage` are not sent. If a Responses stream ends without any output events, the proxy injects a `response.failed` (or `response.not_found`) event with `code: upstream_stopped` before `data: [DONE]`, so clients fail fast instead of hanging. Providers that do not serve `/responses` answer with their own upstream error, which the fallback loop surfaces.
 
-## Usage
-
-```bash
-curl http://localhost:9234/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer sk-proxy-key" \
-  -d '{
-    "model": "glm-5",
-    "messages": [{"role": "user", "content": "Hello!"}]
-  }'
-```
-
-The proxy passes `Authorization`, `OpenAI-Organization`, and `OpenAI-Beta` headers through to the upstream provider (except on `anthropic`, where `x-api-key` is used instead).
-
-## Streaming Stats
+## 📈 Streaming Stats
 
 Every streaming chat completion request logs token statistics:
 
@@ -316,7 +340,7 @@ Every streaming chat completion request logs token statistics:
 - **thinking_tps** — thinking tokens per second (measured from first thinking token to last thinking token)
 - **total_tps** — completion tokens per second. Uses server-side timing when reported by the provider (in priority order: `usage.tokens_per_second`, Groq's `usage.completion_time`, Fireworks' `perf_metrics.generation-duration`, or the vLLM `: energy` comment's `duration_seconds`); falls back to the arrival-window estimate (first token to last of any kind) when no server timing is available
 
-Responses API streams are not token-tracked by default — only chat completions feed these stats. Set `RESPONSES_ENABLE_THINKING_TRACKING=1` to also track Responses streams; without it, reasoning-delta detection and the TTFT timeout gate stay off (they are enabled only under that flag), so long reasoning-only Responses streams are not cut off by the first-token timeout.
+Responses API streams are not token-tracked by default — only chat completions feed these stats. Set `RESPONSES_ENABLE_THINKING_TRACKING=1` to also track Responses streams; without it, reasoning-delta detection and the TTFT timeout gate stay off, so long reasoning-only Responses streams are not cut off by the first-token timeout.
 
 In addition to per-request stats, a periodic TPS summary is logged every 5 seconds for each provider with recent activity:
 
@@ -329,7 +353,8 @@ In addition to per-request stats, a periodic TPS summary is logged every 5 secon
 - **n** — number of samples in the eval window
 - **tokens** — total tokens generated across all samples in the window
 
-## Docker Compose Reference
+<details>
+<summary><b>Docker Compose reference</b></summary>
 
 ```yaml
 services:
@@ -356,6 +381,8 @@ Editable fields:
 The image runs as a non-root user (UID 1000). Bind-mounted host directories must be writable by UID 1000, or set `user: "${UID}:${GID}"` in a `docker-compose.override.yml` to match the host UID.
 
 A `HEALTHCHECK` is built into the image that polls `/health` every 30 seconds (`docker compose ps` will show `(healthy)` when ready).
+
+</details>
 
 ---
 
