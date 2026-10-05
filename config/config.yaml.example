@@ -17,8 +17,21 @@ timeouts:
              # Set to null or omit to disable.
 
 # Provider definitions (referenced by name in models)
-# Each provider needs at least base_url and api_key
-# Optional: headers (merged into every request to this provider)
+# Each provider needs at least base_url and one API key.
+#
+# API keys — supply exactly one of:
+#   api_key: "..."        # a single key, or
+#   api_keys:             # an ordered list of keys for the same account/endpoint
+#     - "key-1"
+#     - "key-2"
+# With multiple keys, requests use the first key until it is rate-limited, then
+# rotate to the next in order, and so on. Only once every key is exhausted does
+# the proxy pause the provider and fall back to the next provider for a model.
+#
+# Optional: headers — a mapping merged into every request to this provider.
+#   Values are strings. A model's provider entry can add or override headers.
+#   Auth/host headers (Authorization, x-api-key, api-key, Host) are managed by
+#   the proxy and ignored here.
 providers:
   openai:
     base_url: "https://api.openai.com/v1"
@@ -60,6 +73,15 @@ providers:
   canopy_wave:
     base_url: "https://inference.canopywave.io/v1"
     api_key: "YOUR_CANOPY_WAVE_API_KEY"
+
+  # Example: one provider, several subscriptions/keys rotated in order.
+  # opencode:
+  #   base_url: "https://opencode.example.com/v1"
+  #   api_keys:
+  #     - "YOUR_OPENCODE_KEY_1"
+  #     - "YOUR_OPENCODE_KEY_2"
+  #   headers:
+  #     x-opencode-plan: "pro"
 
 
 # Model definitions

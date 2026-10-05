@@ -1,5 +1,8 @@
 # frozen_string_literal: true
 
+require "date"
+require_relative "key_rotator"
+
 module ConfigValidator
   MAX_MAX_ATTEMPTS = 10
   MAX_MAX_ROUNDS = 10
@@ -7,6 +10,9 @@ module ConfigValidator
   MAX_SAMPLE_WINDOW = 86_400      # 1 day
   MAX_BACKOFF_BASE = 60
   MAX_MAX_REQUEST_BODY = 100 * 1024 * 1024  # 100 MB
+  # Headers the proxy sets itself; configuring them has no effect because
+  # build_upstream_request strips them to keep auth strategy authoritative.
+  PROTECTED_HEADER_NAMES = %w[authorization x-api-key api-key host].freeze
 
   def self.validate!(config, log)
     errors, warnings = run_checks(config)
@@ -40,10 +46,23 @@ module ConfigValidator
 
     (config["providers"] || {}).each do |name, p|
       next unless p.is_a?(Hash)
-      api_key = p["api_key"]
-      if api_key.nil? || api_key.to_s.strip.empty?
-        errors << "Provider '#{name}' has no api_key (set api_key to a non-empty string)"
+      api_keys = p["api_keys"]
+      if !api_keys.nil? && !api_keys.is_a?(Array)
+        errors << "Provider '#{name}' api_keys must be a list of non-empty strings"
+      elsif api_keys.is_a?(Array)
+        # Require real non-empty strings before any normalisation, so a
+        # boolean/mapping/number can never silently become a credential.
+        if api_keys.any? { |k| !k.is_a?(String) || k.strip.empty? }
+          errors << "Provider '#{name}' api_keys entries must be non-empty strings"
+        elsif api_keys.any? && p["api_key"].to_s.strip != ""
+          warnings << "Provider '#{name}' sets both api_key and api_keys — api_keys takes precedence"
+        end
       end
+      if KeyRotator.extract_keys(p).empty?
+        errors << "Provider '#{name}' has no api_key (set api_key or a non-empty api_keys list)"
+      end
+      errors.concat(validate_headers(p["headers"], "Provider '#{name}'"))
+      warnings.concat(warn_protected_headers(p["headers"], "Provider '#{name}'"))
       if p["base_url"].nil? || p["base_url"].to_s.strip.empty?
         errors << "Provider '#{name}' has no base_url"
       elsif p["base_url"].is_a?(String)
@@ -82,6 +101,8 @@ module ConfigValidator
         unless provider_keys.include?(p["provider"])
           errors << "Model '#{m["name"]}' references unknown provider '#{p["provider"]}' (define it under 'providers')"
         end
+        errors.concat(validate_headers(p["headers"], "Model '#{m["name"]}' provider '#{p["provider"]}'"))
+        warnings.concat(warn_protected_headers(p["headers"], "Model '#{m["name"]}' provider '#{p["provider"]}'"))
       end
       if m.key?("probing_enabled") && ![true, false].include?(m["probing_enabled"])
         errors << "Model '#{m["name"]}' has invalid probing_enabled (must be true or false)"
@@ -190,5 +211,26 @@ module ConfigValidator
     [errors, warnings]
   end
 
-  private_class_method :run_checks
+  # Header values may be any YAML scalar — strings, numbers, booleans, and
+  # Date/Time (e.g. an unquoted `anthropic-version: 2023-06-01`). They are
+  # stringified when the upstream request is built. nil and containers
+  # (Hash/Array) are rejected.
+  def self.validate_headers(headers, where)
+    return [] if headers.nil?
+    return ["#{where} headers must be a mapping of header name to value"] unless headers.is_a?(Hash)
+    headers.each_with_object([]) do |(hk, hv), errs|
+      scalar = hv.is_a?(String) || hv.is_a?(Numeric) || hv == true || hv == false ||
+        hv.is_a?(Date) || hv.is_a?(Time) || hv.is_a?(Symbol)
+      errs << "#{where} header '#{hk}' value must be a scalar" unless scalar
+    end
+  end
+
+  def self.warn_protected_headers(headers, where)
+    return [] unless headers.is_a?(Hash)
+    headers.keys
+      .select { |hk| PROTECTED_HEADER_NAMES.include?(hk.to_s.downcase) }
+      .map { |hk| "#{where} header '#{hk}' is managed by the proxy and will be ignored" }
+  end
+
+  private_class_method :run_checks, :validate_headers, :warn_protected_headers
 end

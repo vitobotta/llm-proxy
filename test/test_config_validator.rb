@@ -166,4 +166,123 @@ class TestConfigValidator < Minitest::Test
     errors, _ = validate(cfg)
     assert(errors.any? { |e| e.include?("timeouts.ttft") }, errors.inspect)
   end
+
+  # -- api_keys (multiple keys per provider) -------------------------
+
+  def test_accepts_api_keys_without_api_key
+    cfg = base
+    cfg["providers"]["p_a"].delete("api_key")
+    cfg["providers"]["p_a"]["api_keys"] = %w[one two]
+    errors, _ = validate(cfg)
+    assert_empty errors, errors.inspect
+  end
+
+  def test_rejects_empty_api_keys_with_no_api_key
+    cfg = base
+    cfg["providers"]["p_a"].delete("api_key")
+    cfg["providers"]["p_a"]["api_keys"] = []
+    errors, _ = validate(cfg)
+    assert(errors.any? { |e| e.include?("p_a") && e.include?("api_key") }, errors.inspect)
+  end
+
+  def test_rejects_blank_api_keys_entries
+    cfg = base
+    cfg["providers"]["p_a"]["api_keys"] = ["ok", "  "]
+    errors, _ = validate(cfg)
+    assert(errors.any? { |e| e.include?("p_a") && e.include?("api_keys") }, errors.inspect)
+  end
+
+  def test_rejects_non_array_api_keys
+    cfg = base
+    cfg["providers"]["p_a"]["api_keys"] = "not-a-list"
+    errors, _ = validate(cfg)
+    assert(errors.any? { |e| e.include?("p_a") && e.include?("api_keys") }, errors.inspect)
+  end
+
+  def test_warns_when_both_api_key_and_api_keys
+    cfg = base
+    cfg["providers"]["p_a"]["api_key"] = "single"
+    cfg["providers"]["p_a"]["api_keys"] = %w[a b]
+    errors, warnings = validate(cfg)
+    assert_empty errors, errors.inspect
+    assert(warnings.any? { |w| w.include?("p_a") && w.include?("api_keys") }, warnings.inspect)
+  end
+
+  # -- headers (custom per-provider request headers) -----------------
+
+  def test_accepts_valid_headers
+    cfg = base
+    cfg["providers"]["p_a"]["headers"] = {"X-Custom" => "v"}
+    errors, _ = validate(cfg)
+    assert_empty errors, errors.inspect
+  end
+
+  def test_rejects_non_hash_headers
+    cfg = base
+    cfg["providers"]["p_a"]["headers"] = "oops"
+    errors, _ = validate(cfg)
+    assert(errors.any? { |e| e.include?("p_a") && e.include?("headers") }, errors.inspect)
+  end
+
+  def test_rejects_non_scalar_header_value
+    cfg = base
+    cfg["providers"]["p_a"]["headers"] = {"X-Custom" => ["a", "b"]}
+    errors, _ = validate(cfg)
+    assert(errors.any? { |e| e.include?("X-Custom") }, errors.inspect)
+  end
+
+  def test_warns_on_protected_header
+    cfg = base
+    cfg["providers"]["p_a"]["headers"] = {"Authorization" => "x"}
+    _, warnings = validate(cfg)
+    assert(warnings.any? { |w| w.include?("Authorization") && w.include?("managed by the proxy") }, warnings.inspect)
+  end
+
+  def test_model_provider_headers_validated
+    cfg = base
+    cfg["models"][0]["providers"][0]["headers"] = "bad"
+    errors, _ = validate(cfg)
+    assert(errors.any? { |e| e.include?("headers") }, errors.inspect)
+  end
+
+  # Date/Time header values (e.g. unquoted `anthropic-version: 2023-06-01`)
+  # must keep working — they are stringified on send, not rejected.
+
+  def test_accepts_date_header
+    cfg = base
+    cfg["providers"]["p_a"]["headers"] = {"anthropic-version" => Date.new(2023, 6, 1)}
+    errors, _ = validate(cfg)
+    assert_empty errors, errors.inspect
+  end
+
+  def test_accepts_time_header
+    cfg = base
+    cfg["providers"]["p_a"]["headers"] = {"X-Timestamp" => Time.at(0)}
+    errors, _ = validate(cfg)
+    assert_empty errors, errors.inspect
+  end
+
+  # api_keys must be an array of non-empty strings before normalisation, so a
+  # boolean/mapping/number can never silently become a credential.
+
+  def test_rejects_false_api_keys
+    cfg = base
+    cfg["providers"]["p_a"]["api_keys"] = false
+    errors, _ = validate(cfg)
+    assert(errors.any? { |e| e.include?("p_a") && e.include?("api_keys") }, errors.inspect)
+  end
+
+  def test_rejects_non_string_api_keys_entries
+    cfg = base
+    cfg["providers"]["p_a"]["api_keys"] = [false]
+    errors, _ = validate(cfg)
+    assert(errors.any? { |e| e.include?("p_a") && e.include?("api_keys") }, errors.inspect)
+  end
+
+  def test_rejects_mapping_api_keys
+    cfg = base
+    cfg["providers"]["p_a"]["api_keys"] = {"a" => 1}
+    errors, _ = validate(cfg)
+    assert(errors.any? { |e| e.include?("p_a") && e.include?("api_keys") }, errors.inspect)
+  end
 end

@@ -241,6 +241,7 @@ end
 
 class ProbeProviderTest < Minitest::Test
   def setup
+    KeyRotator.reset! # isolate shared key-pause state between tests
     @captured_logs = []
     @logger = Class.new(NullLogger) do
       attr_reader :messages
@@ -347,6 +348,53 @@ class ProbeProviderTest < Minitest::Test
       alias_method :create_http, :__orig_create_http
       remove_method :__orig_create_http
     end
+  end
+
+  def test_probe_provider_skips_when_all_keys_exhausted
+    # A shared account whose keys are all rate-limited (e.g. by another model):
+    # the probe must NOT fall back to the default key, and must propagate the
+    # shared cooldown to this model's selector.
+    rotator = KeyRotator.for(@provider_config)
+    rotator.pause("k", Time.now.to_f + 60)
+
+    built = false
+    http_mock = Object.new
+    http_mock.define_singleton_method(:started?) { true }
+    http_mock.define_singleton_method(:start) {}
+    HTTPSupport.singleton_class.class_eval do
+      alias_method :__orig_create_skip, :create_http
+      alias_method :__orig_build_skip, :build_upstream_request
+      define_method(:create_http) { |*_a, **_k| http_mock }
+      define_method(:build_upstream_request) { |*_a, **_k| built = true; [URI.parse("https://x"), Object.new] }
+    end
+
+    result = ProbeManager.probe_provider(@provider_config, "/chat/completions", {}, "m", {}, timeouts: {open: 1, read: 1, write: 1}, logger: @logger, selector: @selector)
+
+    refute built, "must not construct a request when every key is rate-limited"
+    assert_equal Float::INFINITY, result[:ttft]
+    assert_equal 1, @selector.pauses.size, "shared cooldown must be propagated to the selector"
+  ensure
+    HTTPSupport.singleton_class.class_eval do
+      alias_method :create_http, :__orig_create_skip
+      alias_method :build_upstream_request, :__orig_build_skip
+      remove_method :__orig_create_skip
+      remove_method :__orig_build_skip
+    end
+  end
+
+  def test_probe_provider_pause_uses_earliest_key_reset
+    pc = {"provider" => "multi", "model" => "m", "base_url" => "https://example.invalid/v1", "api_keys" => ["k1", "k2"]}
+    rotator = KeyRotator.for(pc)
+    soon = Time.now.to_f + 10
+    rotator.pause("k1", soon) # k1 resets in 10s
+    # k2 is the only usable key; the probe rate-limits it with a 1-hour reset.
+    later = Time.now.to_f + 3600
+    stub_streaming(error: "HTTP 429 " + JSON.generate({"reset" => later})) do
+      ProbeManager.probe_provider(pc, "/chat/completions", {}, "m", {}, timeouts: {open: 1, read: 1, write: 1}, logger: @logger, selector: @selector)
+    end
+    pause = @selector.pauses.first
+    refute_nil pause, "provider must be paused once every key is down"
+    assert_in_delta soon, pause[:time], 0.5, "provider must resume at the SOONEST key reset (k1's 10s), not the 1hr one"
   end
 
   private

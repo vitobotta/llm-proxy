@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require_relative "key_rotator"
+
 module RequestHandler
   # Failure reasons after which the provider/round walk must stop instead of
   # falling back: the client is gone (client_disconnect), or chunks have
@@ -192,9 +194,10 @@ module RequestHandler
   ACCUMULATED_TAIL_SIZE = 64 * 1024
   REQUEST_DEADLINE = 600
   def try_stream(provider_config, path, body, body_model, incoming_headers, out:, log_prefix:, deadline_remaining: nil, responses_api: false)
-    uri, request = HTTPSupport.build_upstream_request(provider_config, path, body, body_model, incoming_headers, stream: true, responses_api: responses_api)
+    rotator = KeyRotator.for(provider_config)
 
-    try_with_retries(log_prefix: log_prefix, body_model: body_model) do
+    try_with_retries(log_prefix: log_prefix, body_model: body_model, rotator: rotator) do |attempt_key|
+      uri, request = HTTPSupport.build_upstream_request(provider_config, path, body, body_model, incoming_headers, stream: true, responses_api: responses_api, api_key: attempt_key)
       attempt_start = Process.clock_gettime(Process::CLOCK_MONOTONIC)
       timeouts = ConfigStore.timeouts
       if deadline_remaining
@@ -401,9 +404,10 @@ module RequestHandler
   end
 
   def try_single_request(provider_config, path, body, body_model, incoming_headers, log_prefix:, deadline_remaining: nil, responses_api: false)
-    uri, request = HTTPSupport.build_upstream_request(provider_config, path, body, body_model, incoming_headers, stream: false, responses_api: responses_api)
+    rotator = KeyRotator.for(provider_config)
 
-    try_with_retries(log_prefix: log_prefix, body_model: body_model) do
+    try_with_retries(log_prefix: log_prefix, body_model: body_model, rotator: rotator) do |attempt_key|
+      uri, request = HTTPSupport.build_upstream_request(provider_config, path, body, body_model, incoming_headers, stream: false, responses_api: responses_api, api_key: attempt_key)
       timeouts = ConfigStore.timeouts
       if deadline_remaining
         timeouts = timeouts.merge(read: [timeouts[:read], deadline_remaining].min)

@@ -4,6 +4,7 @@ require "logger"
 require "yaml"
 require "date"
 require_relative "config_validator"
+require_relative "key_rotator"
 require_relative "tps_reporter"
 
 module ConfigStore
@@ -208,18 +209,24 @@ module ConfigStore
       o["provider"] == n["provider"] &&
         o["base_url"] == n["base_url"] &&
         o["model"] == n["model"] &&
-        o["api_key"] == n["api_key"]
+        o["api_keys"] == n["api_keys"]
     end
+  end
+
+  def self.resolve_keys(provider)
+    KeyRotator.extract_keys(provider)
   end
 
   def self.resolve_provider(providers, provider_name, model_id, model_headers = nil, primary: nil)
     provider = providers[provider_name]
     raise "Unknown provider '#{provider_name}'" unless provider
 
+    keys = resolve_keys(provider)
     {
       "provider" => provider_name,
       "base_url" => provider["base_url"],
-      "api_key" => provider["api_key"],
+      "api_key" => keys.first,
+      "api_keys" => keys,
       "model" => model_id,
       "headers" => provider["headers"]&.merge(model_headers || {}) || model_headers || {},
       "primary" => primary
@@ -231,5 +238,5 @@ module ConfigStore
     logger.level = levels.fetch(raw.dig("logging", "level"), Logger::INFO)
   end
 
-  private_class_method :build_data, :merge_selectors!, :provider_lists_match?, :resolve_provider, :update_logger_level!
+  private_class_method :build_data, :merge_selectors!, :provider_lists_match?, :resolve_keys, :resolve_provider, :update_logger_level!
 end

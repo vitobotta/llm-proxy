@@ -216,4 +216,37 @@ class TestConfigStore < Minitest::Test
       end
     end
   end
+
+  def test_provider_resolves_api_keys_and_merges_headers
+    cfg = {
+      "providers" => {
+        "multi" => {"base_url" => "https://m.example.com/v1", "api_keys" => %w[k1 k2 k3],
+                    "headers" => {"X-Base" => "b", "X-Override" => "provider"}},
+        "single" => {"base_url" => "https://s.example.com/v1", "api_key" => "only"}
+      },
+      "models" => [
+        {"name" => "mm", "providers" => [
+          {"provider" => "multi", "model" => "up", "headers" => {"X-Override" => "model", "X-Extra" => "e"}}
+        ]}
+      ]
+    }
+    ConfigStore.load!(cfg, logger: NullLogger.new)
+    prov = ConfigStore.models["mm"]["providers"].first
+    assert_equal %w[k1 k2 k3], prov["api_keys"]
+    assert_equal "k1", prov["api_key"]
+    assert_equal "b", prov["headers"]["X-Base"], "provider-level header should be present"
+    assert_equal "model", prov["headers"]["X-Override"], "model-level header should override provider-level"
+    assert_equal "e", prov["headers"]["X-Extra"], "model-level header should be added"
+  end
+
+  def test_provider_single_key_resolves_to_list_of_one
+    cfg = {
+      "providers" => {"single" => {"base_url" => "https://s.example.com/v1", "api_key" => "only"}},
+      "models" => [{"name" => "sm", "providers" => [{"provider" => "single", "model" => "up"}]}]
+    }
+    ConfigStore.load!(cfg, logger: NullLogger.new)
+    prov = ConfigStore.models["sm"]["providers"].first
+    assert_equal ["only"], prov["api_keys"]
+    assert_equal "only", prov["api_key"]
+  end
 end

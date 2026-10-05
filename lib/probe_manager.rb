@@ -1,5 +1,6 @@
 require "securerandom"
 require "timeout"
+require_relative "key_rotator"
 module ProbeManager
   PROBE_BODY = {
     "messages" => [{"role" => "user", "content" => "Write a brief paragraph about the weather"}],
@@ -88,7 +89,22 @@ module ProbeManager
 
   def self.probe_provider(provider_config, path, body, body_model, incoming_headers, timeouts:, logger:, selector: nil)
     pname = provider_config["provider"]
-    uri, request = HTTPSupport.build_upstream_request(provider_config, path, body, body_model, incoming_headers, stream: true)
+    rotator = KeyRotator.for(provider_config)
+    probe_key = rotator.acquire
+    if probe_key.nil?
+      # Every key for this account is currently rate-limited — possibly by
+      # another model sharing the account. Don't fall back to the default key
+      # (it is one of the paused ones); propagate the shared cooldown to this
+      # model's selector so it stops probing/trying until the earliest reset.
+      resume = rotator.resume_time
+      logger.debug("[probe] #{pname}: all API keys rate-limited, skipping probe")
+      if selector && resume
+        selector.quota_pause!(provider_config, resume, reason: "rate_limited")
+        Metrics.increment(:provider_quota_paused, labels: {provider: pname, model: provider_config["model"], reason: "rate_limited"})
+      end
+      return {ttft: Float::INFINITY, tps: nil}
+    end
+    uri, request = HTTPSupport.build_upstream_request(provider_config, path, body, body_model, incoming_headers, stream: true, api_key: probe_key)
 
     http = nil
     pooled = false
@@ -109,12 +125,22 @@ module ProbeManager
         if status_code && HTTPSupport.quota_exhausted?(status_code, error_body)
           reason = status_code == 402 ? "payment_required" : (status_code == 429 ? "rate_limited" : "quota_exhausted")
           default_secs = (defined?(ConfigStore) ? ConfigStore.quota_pause_default_seconds : nil) || HTTPSupport::DEFAULT_QUOTA_PAUSE_SECONDS
-          reset_time = HTTPSupport.extract_reset_time_from_error(error_str, status_code,
-            default_seconds: default_secs)
-          logger.warn("[probe] #{pname}: Quota exhausted (#{reason}), pausing until #{Time.at(reset_time).utc.iso8601}")
-          if selector
-            selector.quota_pause!(provider_config, reset_time, reason: reason)
+          reset_time = HTTPSupport.extract_reset_time_from_error(error_str, status_code, default_seconds: default_secs)
+          # Pause the key that was just rate-limited. Only pause the whole
+          # provider once no key remains available — single-key providers pause
+          # immediately, matching prior behaviour. With multiple keys the next
+          # probe/request simply rotates to the next key.
+          rotator.pause(probe_key, reset_time) if probe_key
+          keys_exhausted = !rotator.multiple? || rotator.acquire.nil?
+          if selector && keys_exhausted
+            # Pause the provider only until the SOONEST key reset (not this
+            # key's), so it recovers as early as any key frees up.
+            provider_resume = rotator.resume_time || reset_time
+            selector.quota_pause!(provider_config, provider_resume, reason: reason)
             Metrics.increment(:provider_quota_paused, labels: {provider: pname, model: provider_config["model"], reason: reason})
+            logger.warn("[probe] #{pname}: Quota exhausted (#{reason}), all keys down — pausing provider until #{Time.at(provider_resume).utc.iso8601}")
+          else
+            logger.warn("[probe] #{pname}: Quota exhausted (#{reason}) on current key — rotating to next")
           end
         end
 

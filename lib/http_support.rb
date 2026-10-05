@@ -356,19 +356,22 @@ module HTTPSupport
     URI_CACHE_LOCK.synchronize { URI_CACHE.clear }
   end
 
-  def self.build_upstream_request(provider_config, path, body, body_model, incoming_headers, stream: true, responses_api: false)
+  # `api_key` overrides the provider's configured key for this request. Used by
+  # the multi-key rotation path (see KeyRotator) to send a specific key; when
+  # nil the provider's default `api_key` is used.
+  def self.build_upstream_request(provider_config, path, body, body_model, incoming_headers, stream: true, responses_api: false, api_key: nil)
     uri = cached_uri(provider_config["base_url"], path)
 
     request = Net::HTTP::Post.new(uri.request_uri)
     request["Content-Type"] = "application/json"
 
-    (AUTH_STRATEGIES[provider_config["provider"]] || DEFAULT_AUTH).call(request, provider_config["api_key"])
+    (AUTH_STRATEGIES[provider_config["provider"]] || DEFAULT_AUTH).call(request, api_key || provider_config["api_key"])
 
     provider_config["headers"]&.each do |k, v|
       # PROTECTED_HEADERS are stripped from provider config too so a fat-fingered
-      # `Authorization:` or `Host:` in config can't override the auth strategy.
+      # auth or host header in config cannot override the auth strategy.
       next if PROTECTED_HEADERS.include?(k.to_s.downcase)
-      request[k] = v
+      request[k] = v.to_s
     end
 
     incoming_headers&.each do |key, value|
@@ -571,19 +574,51 @@ module HTTPSupport
     result
   end
 
-  def try_with_retries(log_prefix:, body_model:, &block)
+  # Retries a single provider entry. `rotator`, when given and multi-key, makes
+  # a quota/rate-limit error rotate to the provider's next API key instead of
+  # failing over to another provider — only once every key is exhausted does
+  # the provider report a quota pause. The block is invoked as `block.call(key)`
+  # where `key` is the API key to use for that attempt (nil for single-key
+  # providers, meaning "use the provider's default").
+  def try_with_retries(log_prefix:, body_model:, rotator: nil, &block)
     attempts = 0
     eof_retries = 0
+    use_rotation = rotator && rotator.multiple?
+    current_key = use_rotation ? rotator.acquire : nil
 
+    if use_rotation && current_key.nil?
+      resume = rotator.resume_time || (Time.now.to_f + HTTPSupport::DEFAULT_QUOTA_PAUSE_SECONDS)
+      settings.logger.warn("#{log_prefix} All #{rotator.keys.size} API key(s) rate-limited, pausing provider until #{Time.at(resume).utc.iso8601}")
+      return {success: false, error: "All API keys rate-limited", status: 429, quota_pause_until: resume, quota_pause_reason: "rate_limited"}
+    end
+
+    key_rotations = 0
+    exhausted_keys = [] # every key already tried and rate-limited in this request
     loop do
       attempts += 1
       settings.logger.info("#{log_prefix} Attempt #{attempts}/#{settings.max_attempts} (model: #{body_model})")
 
       begin
-        return block.call
+        return block.call(current_key)
       rescue QuotaExhaustedError => e
-        settings.logger.warn("#{log_prefix} Quota exhausted (#{e.reason}), pausing provider until #{Time.at(e.reset_time).utc.iso8601}")
-        return {success: false, error: e.message, status: e.status, quota_pause_until: e.reset_time, quota_pause_reason: e.reason}
+        if use_rotation && current_key
+          rotator.pause(current_key, e.reset_time)
+          exhausted_keys << current_key unless exhausted_keys.include?(current_key)
+          key_rotations += 1
+          # Exclude every key exhausted so far (not just the last), so an earlier
+          # key whose cooldown expires mid-rotation cannot be re-selected and
+          # starve a still-healthy key.
+          next_key = key_rotations < rotator.keys.size ? rotator.acquire(exclude: exhausted_keys) : nil
+          if next_key
+            settings.logger.warn("#{log_prefix} API key rate-limited (#{e.reason}), rotating to next key #{key_rotations + 1}/#{rotator.keys.size}")
+            current_key = next_key
+            attempts -= 1 # key rotation does not consume the retry budget
+            next
+          end
+        end
+        resume = use_rotation ? (rotator.resume_time || e.reset_time) : e.reset_time
+        settings.logger.warn("#{log_prefix} Quota exhausted (#{e.reason}), pausing provider until #{Time.at(resume).utc.iso8601}")
+        return {success: false, error: e.message, status: e.status, quota_pause_until: resume, quota_pause_reason: e.reason}
       rescue RetryableError => e
         return retry_or_fail(log_prefix, error_label: "Failed", detail: e.message) unless maybe_retry(attempts, retry_after: e.retry_after)
       rescue ClientDisconnected

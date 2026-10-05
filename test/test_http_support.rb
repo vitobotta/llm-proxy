@@ -84,6 +84,35 @@ class TestHTTPSupport < Minitest::Test
     assert_nil request["Authorization"]
   end
 
+  def test_build_upstream_request_api_key_override
+    provider_config = {
+      "provider" => "openai",
+      "base_url" => "https://api.openai.com/v1",
+      "api_key" => "default-key",
+      "model" => "gpt-4",
+      "headers" => nil
+    }
+    _uri, request = HTTPSupport.build_upstream_request(
+      provider_config, "chat/completions", {}, "gpt-4", nil, stream: true, api_key: "rotated-key"
+    )
+    assert_equal "Bearer rotated-key", request["Authorization"], "explicit api_key must win over the configured default"
+  end
+
+  def test_build_upstream_request_api_key_override_anthropic
+    provider_config = {
+      "provider" => "anthropic",
+      "base_url" => "https://api.anthropic.com/v1",
+      "api_key" => "default-key",
+      "model" => "claude-4",
+      "headers" => nil
+    }
+    _uri, request = HTTPSupport.build_upstream_request(
+      provider_config, "messages", {}, "claude-4", nil, stream: true, api_key: "rotated-key"
+    )
+    assert_equal "rotated-key", request["x-api-key"]
+    assert_nil request["Authorization"]
+  end
+
   def test_build_upstream_request_includes_stream_options
     provider_config = {
       "provider" => "openai",
