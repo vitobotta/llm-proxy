@@ -183,7 +183,7 @@ Provider entries can also override or extend headers:
           HTTP-Referer: "https://example.com"
 ```
 
-Per-model overrides — each model entry can set `probing_enabled`, `auto_switch`, and `probe_interval` to override the global `performance.*` values. When omitted, falls back to global defaults.
+Per-model overrides — each model entry can set `probing_enabled`, `auto_switch`, `probe_interval`, and `ttft_timeout` to override the global `performance.*` / `timeouts.ttft` values. When omitted, falls back to global defaults. Set `ttft_timeout: false` to disable the TTFT gate for one model.
 
 <details>
 <summary><b>Timeouts</b></summary>
@@ -193,7 +193,10 @@ timeouts:
   open: 30    # connection open (seconds)
   read: 300   # per-chunk read timeout for streaming
   write: 60   # request body send timeout
+  ttft: 15    # max seconds to wait for the first token before falling back (streaming only; omit to disable)
 ```
+
+Models can override `ttft` with their own `ttft_timeout` — useful when one model's reasoning phase legitimately delays the first content token while others must fail fast.
 
 </details>
 
@@ -275,7 +278,7 @@ performance:
   config_poll_interval: 2     # seconds between config.yaml change checks (set 0 to disable hot-reload)
 ```
 
-`ConfigValidator` rejects out-of-range values for `retries.max_attempts`, `retries.backoff_base`, `retries.max_rounds`, `performance.probe_interval`, `performance.probe_max_per_minute`, `performance.sample_window`, `metrics.tps_log.{interval,activity_window,eval_window,min_tokens}`, `limits.max_request_body`, and `timeouts.{open,read,write}` at boot/reload, so a fat-fingered config can't silently DoS the proxy.
+`ConfigValidator` rejects out-of-range values for `retries.max_attempts`, `retries.backoff_base`, `retries.max_rounds`, `performance.probe_interval`, `performance.probe_max_per_minute`, `performance.sample_window`, `metrics.tps_log.{interval,activity_window,eval_window,min_tokens}`, `limits.max_request_body`, `timeouts.{open,read,write,ttft}`, and per-model `ttft_timeout` at boot/reload, so a fat-fingered config can't silently DoS the proxy.
 
 </details>
 

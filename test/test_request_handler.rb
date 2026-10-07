@@ -1179,4 +1179,51 @@ class TTFTTimeoutTest < Minitest::Test
     refute result[:success], "should fail — proactive timer must fire when no data arrives"
     assert result[:error].include?("TTFT"), "error should mention TTFT: #{result[:error]}"
   end
+
+  def test_try_stream_per_model_ttft_override_widens_gate
+    # Global ttft is 0.05 and the slow ping sleeps 0.1 — the global gate
+    # would fire. The per-model override (5s) must win.
+    ConfigStore.instance_variable_get(:@data)[:models]["test-model"] = {"ttft_timeout" => 5}
+    mock_http!(TTFTSlowPingResponse.new)
+
+    out = []
+    result = @app.try_stream(
+      {"base_url" => "https://upstream.example.com/v1", "api_key" => "k"},
+      "/chat/completions", {}, "m", {},
+      out: out, log_prefix: "[test]", deadline_remaining: 60, model_name: "test-model"
+    )
+
+    assert result[:success], "per-model ttft_timeout should override the global default"
+  end
+
+  def test_try_stream_per_model_ttft_false_disables_gate
+    ConfigStore.instance_variable_get(:@data)[:models]["test-model"] = {"ttft_timeout" => false}
+    mock_http!(TTFTSlowPingResponse.new)
+
+    out = []
+    result = @app.try_stream(
+      {"base_url" => "https://upstream.example.com/v1", "api_key" => "k"},
+      "/chat/completions", {}, "m", {},
+      out: out, log_prefix: "[test]", deadline_remaining: 60, model_name: "test-model"
+    )
+
+    assert result[:success], "ttft_timeout: false should disable the TTFT gate for one model"
+  end
+
+  def test_try_stream_per_model_ttft_falls_back_to_global
+    # Model entry without a ttft_timeout key — the global 0.05 must apply
+    # and the slow ping must trip it.
+    ConfigStore.instance_variable_get(:@data)[:models]["test-model"] = {"probing_enabled" => true}
+    mock_http!(TTFTSlowPingResponse.new)
+
+    out = []
+    result = @app.try_stream(
+      {"base_url" => "https://upstream.example.com/v1", "api_key" => "k"},
+      "/chat/completions", {}, "m", {},
+      out: out, log_prefix: "[test]", deadline_remaining: 60, model_name: "test-model"
+    )
+
+    refute result[:success], "model without ttft_timeout should fall back to the global default"
+    assert result[:error].include?("TTFT"), "error should mention TTFT: #{result[:error]}"
+  end
 end

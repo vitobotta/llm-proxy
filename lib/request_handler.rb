@@ -193,7 +193,7 @@ module RequestHandler
   MAX_ACCUMULATED_SIZE = 512 * 1024
   ACCUMULATED_TAIL_SIZE = 64 * 1024
   REQUEST_DEADLINE = 600
-  def try_stream(provider_config, path, body, body_model, incoming_headers, out:, log_prefix:, deadline_remaining: nil, responses_api: false)
+  def try_stream(provider_config, path, body, body_model, incoming_headers, out:, log_prefix:, deadline_remaining: nil, responses_api: false, model_name: nil)
     rotator = KeyRotator.for(provider_config)
 
     try_with_retries(log_prefix: log_prefix, body_model: body_model, rotator: rotator) do |attempt_key|
@@ -264,7 +264,10 @@ module RequestHandler
       # data for ttft_timeout seconds). read_timeout is NOT lowered.
       # Requires tracking enabled — chunk parsing is needed to detect the
       # first token. When tracking is off the feature is skipped.
-      ttft_timeout = tracking && timeouts[:ttft]
+      # Per-model ttft_timeout overrides the global timeouts.ttft value
+      # (false disables the gate for one model); models without the key fall
+      # back to the global default. Resolved per attempt like timeouts above.
+      ttft_timeout = tracking && ConfigStore.ttft_timeout_for(model_name)
       # In Responses mode the first-token gate only sees reasoning deltas
       # when RESPONSES_ENABLE_THINKING_TRACKING is enabled; without it the
       # TTFT timer would kill healthy long-reasoning streams whose content

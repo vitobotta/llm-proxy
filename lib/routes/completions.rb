@@ -28,7 +28,7 @@ module Routes
               result = with_auto_select(
                 model: req[:model], model_name: req[:model_name],
                 path: endpoint, body: req[:body], headers: req[:headers]
-              ) { |pc, p, b, pm, h, lp, dr| try_stream(pc, p, b, pm, h, out: out, log_prefix: lp, deadline_remaining: dr, responses_api: responses_api) }
+              ) { |pc, p, b, pm, h, lp, dr| try_stream(pc, p, b, pm, h, out: out, log_prefix: lp, deadline_remaining: dr, responses_api: responses_api, model_name: req[:model_name]) }
               handle_streaming_error(result, out, is_responses: responses_api)
             rescue HTTPSupport::ClientDisconnected
               settings.logger.info("[#{@request_id}] Client disconnected mid-stream")

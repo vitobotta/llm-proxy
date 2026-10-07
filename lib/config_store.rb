@@ -118,6 +118,16 @@ module ConfigStore
   def self.tps_log_min_tokens = @data[:tps_log_min_tokens]
 
   def self.model(name) = @data[:models][name]
+
+  # Resolved TTFT timeout for a model: the per-model `ttft_timeout` when the
+  # entry carries one (false = disabled for this model), else the global
+  # `timeouts.ttft` (nil = disabled). Lock-free — see the @data comment.
+  def self.ttft_timeout_for(name)
+    entry = @data.dig(:models, name)
+    return @data.dig(:timeouts, :ttft) unless entry&.key?("ttft_timeout")
+    entry["ttft_timeout"]
+  end
+
   def self.selector(name) = @data[:selectors][name]
   def self.update_settings!(app)
     snapshot = @data
@@ -147,13 +157,20 @@ module ConfigStore
       m_probing = m.key?("probing_enabled") ? (m["probing_enabled"] != false) : probing_enabled
       m_auto_switch = m_probing && (m.key?("auto_switch") ? m["auto_switch"] == true : auto_switch)
       m_probe_interval = m["probe_interval"] || probe_interval
+      # ttft_timeout: per-model override of the global timeouts.ttft. An
+      # explicit blank/false disables the TTFT gate for just this model —
+      # normalized to false so the key survives Hash#compact (a plain nil
+      # would be dropped and silently fall back to the global value).
+      m_ttft = m["ttft_timeout"]
+      m_ttft = false if m.key?("ttft_timeout") && m_ttft.nil?
       model_entry = {
         "name" => m["name"],
         "providers" => provider_list.freeze,
         "context_length" => m["context_length"],
         "probing_enabled" => m_probing,
         "auto_switch" => m_auto_switch,
-        "probe_interval" => m_probe_interval
+        "probe_interval" => m_probe_interval,
+        "ttft_timeout" => m_ttft
       }.compact.freeze
       models[m["name"]] = model_entry
       selectors[m["name"]] = ProviderSelector.new(m["name"], provider_list, model_config: m, sample_window: sample_window)

@@ -249,4 +249,51 @@ class TestConfigStore < Minitest::Test
     assert_equal ["only"], prov["api_keys"]
     assert_equal "only", prov["api_key"]
   end
+
+  # -- per-model ttft_timeout -----------------------------------------
+
+  def test_model_ttft_timeout_falls_back_to_global
+    cfg = MOCK_CONFIG.merge("timeouts" => {"open" => 5, "read" => 10, "write" => 5, "ttft" => 15})
+    ConfigStore.load!(cfg, logger: NullLogger.new)
+    assert_equal 15, ConfigStore.ttft_timeout_for("test-model")
+  end
+
+  def test_model_ttft_timeout_disabled_when_global_disabled
+    ConfigStore.load!(MOCK_CONFIG, logger: NullLogger.new) # no timeouts.ttft
+    assert_nil ConfigStore.ttft_timeout_for("test-model")
+  end
+
+  def test_model_ttft_timeout_override_wins
+    models = Marshal.load(Marshal.dump(MOCK_CONFIG["models"]))
+    models[0]["ttft_timeout"] = 45
+    cfg = MOCK_CONFIG.merge("models" => models,
+      "timeouts" => {"open" => 5, "read" => 10, "write" => 5, "ttft" => 15})
+    ConfigStore.load!(cfg, logger: NullLogger.new)
+    assert_equal 45, ConfigStore.ttft_timeout_for("test-model")
+  end
+
+  def test_model_ttft_timeout_false_disables_gate
+    models = Marshal.load(Marshal.dump(MOCK_CONFIG["models"]))
+    models[0]["ttft_timeout"] = false
+    cfg = MOCK_CONFIG.merge("models" => models,
+      "timeouts" => {"open" => 5, "read" => 10, "write" => 5, "ttft" => 15})
+    ConfigStore.load!(cfg, logger: NullLogger.new)
+    assert_equal false, ConfigStore.ttft_timeout_for("test-model")
+  end
+
+  def test_model_ttft_timeout_blank_disables_gate
+    models = Marshal.load(Marshal.dump(MOCK_CONFIG["models"]))
+    models[0]["ttft_timeout"] = nil
+    cfg = MOCK_CONFIG.merge("models" => models,
+      "timeouts" => {"open" => 5, "read" => 10, "write" => 5, "ttft" => 15})
+    ConfigStore.load!(cfg, logger: NullLogger.new)
+    assert_equal false, ConfigStore.ttft_timeout_for("test-model")
+  end
+
+  def test_ttft_timeout_for_unknown_model_returns_global
+    cfg = MOCK_CONFIG.merge("timeouts" => {"open" => 5, "read" => 10, "write" => 5, "ttft" => 15})
+    ConfigStore.load!(cfg, logger: NullLogger.new)
+    assert_equal 15, ConfigStore.ttft_timeout_for("no-such-model")
+    assert_equal 15, ConfigStore.ttft_timeout_for(nil)
+  end
 end

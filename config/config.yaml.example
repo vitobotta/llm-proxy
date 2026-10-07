@@ -14,7 +14,8 @@ timeouts:
   write: 60
   ttft: 15   # Max seconds to wait for the first token before falling back to
              # the next provider (streaming only, requires tracking.enabled).
-             # Set to null or omit to disable.
+             # Set to null or omit to disable. A model can override this with
+             # its own ttft_timeout (false disables it for that model).
 
 # Provider definitions (referenced by name in models)
 # Each provider needs at least base_url and one API key.
@@ -89,8 +90,8 @@ providers:
 # based on real-time TTFT and TPS metrics.
 # The first provider in the list is used for the initial request.
 # Optional: headers on a provider entry override/extend the provider's headers
-# Per-model overrides: probing_enabled, auto_switch, probe_interval
-#   (fall back to global performance.* values when omitted)
+# Per-model overrides: probing_enabled, auto_switch, probe_interval, ttft_timeout
+#   (fall back to global performance.* / timeouts.ttft values when omitted)
 models:
 - name: glm-5.1
   context_length: 131072
@@ -116,6 +117,7 @@ models:
     model: Qwen/Qwen3.5-397B-A17B-FP8
 - name: kimi-k2.6
   probing_enabled: false       # Disable probing for this model
+  ttft_timeout: 30             # Per-model override of timeouts.ttft (false = disabled)
   providers:
   - provider: neuralwatt
     model: moonshotai/Kimi-K2.6

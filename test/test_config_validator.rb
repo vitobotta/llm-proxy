@@ -81,6 +81,44 @@ class TestConfigValidator < Minitest::Test
     assert(errors.any? { |e| e.include?("probe_interval") }, errors.inspect)
   end
 
+  def test_accepts_valid_model_ttft_timeout
+    cfg = base
+    cfg["models"][0]["ttft_timeout"] = 30
+    errors, _ = validate(cfg)
+    assert_empty errors, errors.inspect
+  end
+
+  def test_accepts_model_ttft_timeout_false_to_disable
+    cfg = base
+    cfg["models"][0]["ttft_timeout"] = false
+    errors, _ = validate(cfg)
+    assert_empty errors, errors.inspect
+  end
+
+  def test_accepts_blank_model_ttft_timeout
+    cfg = base
+    cfg["models"][0]["ttft_timeout"] = nil
+    errors, _ = validate(cfg)
+    assert_empty errors, errors.inspect
+  end
+
+  def test_rejects_invalid_model_ttft_timeout
+    cfg = base
+    cfg["models"][0]["ttft_timeout"] = "fast"
+    errors, _ = validate(cfg)
+    assert(errors.any? { |e| e.include?("ttft_timeout") }, errors.inspect)
+
+    cfg = base
+    cfg["models"][0]["ttft_timeout"] = 0
+    errors, _ = validate(cfg)
+    assert(errors.any? { |e| e.include?("ttft_timeout") }, errors.inspect)
+
+    cfg = base
+    cfg["models"][0]["ttft_timeout"] = 86_401
+    errors, _ = validate(cfg)
+    assert(errors.any? { |e| e.include?("ttft_timeout") }, errors.inspect)
+  end
+
   def test_rejects_excessive_max_attempts
     cfg = base.merge("retries" => {"max_attempts" => 1_000_000})
     errors, _ = validate(cfg)

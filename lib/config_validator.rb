@@ -113,6 +113,12 @@ module ConfigValidator
       if m.key?("probe_interval") && (!m["probe_interval"].is_a?(Integer) || m["probe_interval"] <= 0)
         errors << "Model '#{m["name"]}' has invalid probe_interval (must be positive integer)"
       end
+      if m.key?("ttft_timeout") && !m["ttft_timeout"].nil? && m["ttft_timeout"] != false
+        n = m["ttft_timeout"]
+        unless n.is_a?(Numeric) && n >= 1 && n <= 86_400
+          errors << "Model '#{m["name"]}' has invalid ttft_timeout (must be 1..86400 seconds, or false to disable)"
+        end
+      end
     end
 
     unless config["providers"]&.any?

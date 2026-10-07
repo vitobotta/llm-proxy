@@ -83,7 +83,7 @@ curl -s http://localhost:9234/v1/models | python3 -m json.tool
 - **Prometheus metrics** at `/metrics` — request counts/durations, per-provider success/failure counters.
 - **Config hot-reload** — `ConfigWatcher` polls config content hash every 2s (configurable via `config_poll_interval`). Also supports `kill -USR1 <pid>` for manual reload. Invalid config on reload is skipped (keeps last good config, logs errors). Config path is configurable via `CONFIG_FILE` env var (default: `config/config.yaml`).
 - **`ConfigStore`** replaces frozen constants — all config reads go through thread-safe accessors (`ConfigStore.providers`, `ConfigStore.model(name)`, `ConfigStore.selector(name)`, etc.). Selector state (circuit breaker, metrics) is preserved across reloads when provider lists match.
-- **Per-model probe/autoswitch overrides** — each model entry can set `probing_enabled`, `auto_switch`, and `probe_interval` to override the global `performance.*` values. When omitted, falls back to global defaults.
+- **Per-model overrides** — each model entry can set `probing_enabled`, `auto_switch`, `probe_interval`, and `ttft_timeout` to override the global `performance.*` / `timeouts.ttft` values. When omitted, falls back to global defaults. `ttft_timeout: false` (or blank) disables the TTFT gate for that model only. The resolved value lives on the model entry (`ConfigStore.ttft_timeout_for`); `try_stream` takes `model_name:` to look it up.
 - **`ConfigWatcher.expecting_write!`** — `ProviderSelector` calls this before writing `config.yaml` so the watcher ignores its own write.
 - **Docker mounts `config/` directory**, not the single file — avoids inode breakage when editors do atomic writes (write-to-temp → rename) on Linux.
 
